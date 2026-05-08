@@ -544,9 +544,7 @@ def build(info, figs, out_path):
         cols=len(present)
         col_cm = 8.5 if cols==3 else 12.8   # landscape content 25.7 cm
         img_cm = 8.2 if cols==3 else 12.5
-        # 3-col: 6.0 cm keeps total row height ~9 cm, well inside the ~13 cm available after header
-        # 2-col: 8.0 cm, wider column so aspect ratio rarely triggers height cap
-        max_h  = 6.0 if cols==3 else 8.0
+        max_h  = 8.5 if cols==3 else 10.5
 
         # Single row: image + caption stacked in each cell.
         # cantSplit prevents the row splitting if content is unexpectedly tall.
