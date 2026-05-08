@@ -544,7 +544,7 @@ def build(info, figs, out_path):
         cols=len(present)
         col_cm = 8.5 if cols==3 else 12.8   # landscape content 25.7 cm
         img_cm = 8.2 if cols==3 else 12.5
-        max_h  = 8.5 if cols==3 else 10.5
+        max_h  = 7.5 if cols==3 else 9.5
 
         # Single row: image + caption stacked in each cell.
         # cantSplit prevents the row splitting if content is unexpectedly tall.
