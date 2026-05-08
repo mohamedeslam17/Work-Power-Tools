@@ -50,6 +50,17 @@ def _new_portrait_page(doc):
     new_sec.top_margin = new_sec.bottom_margin = Cm(2)
     # footer.is_linked_to_previous defaults to True → inherits PAGE field from first section
 
+def _new_landscape_page(doc):
+    """Start a new landscape A4 page using a proper next-page section break."""
+    new_sec = doc.add_section(WD_SECTION_START.NEW_PAGE)
+    new_sec.page_width = Cm(29.7)
+    new_sec.page_height = Cm(21)
+    new_sec.left_margin = new_sec.right_margin = Cm(2)
+    new_sec.top_margin = new_sec.bottom_margin = Cm(2)
+    pgSz = new_sec._sectPr.find(qn('w:pgSz'))
+    if pgSz is not None:
+        pgSz.set(qn('w:orient'), 'landscape')
+
 def _toc_entry(doc, label, pg):
     """TOC line with right-aligned page number and dot leader via tab stop."""
     p = doc.add_paragraph()
@@ -382,7 +393,7 @@ def build(info, figs, out_path):
                      ('SUMMARY OF γ′ PRECIPITATE MEASUREMENTS','9'),('CONCLUSION','9')]:
         _toc_entry(doc, label, pg)
 
-    _new_portrait_page(doc)
+    _new_landscape_page(doc)
 
     # ══ PAGE 3: INTRO + RECAP (left) | FIG 1.1 (right) ══════
     add_page_hdr(doc,3)
@@ -410,7 +421,7 @@ def build(info, figs, out_path):
     else:
         left_p3_para=doc.add_paragraph(); left_p3(left_p3_para)
 
-    _new_portrait_page(doc)
+    _new_landscape_page(doc)
 
     # ══ PAGE 4: MICROSTRUCTURE (left) | FIG 1.2 (right) ═════
     add_page_hdr(doc,4)
@@ -441,10 +452,10 @@ def build(info, figs, out_path):
 
     if '2' in figs:
         add_two_col(doc,left_p4,figs['2']['bytes'],right_w=Cm(7.5),caption=caps.get('2','Fig 1.2'))
-    _new_portrait_page(doc)
+    _new_landscape_page(doc)
 
     # ══ PAGES 5-8: SEM IMAGE GRIDS ═══════════════════════════
-    def sem_page(nums, loc_lbl, page_num):
+    def sem_page(nums, loc_lbl, page_num, next_portrait=False):
         add_page_hdr(doc, page_num)
         present=[(n,figs[n]) for n in nums if n in figs]
         if not present:return
@@ -466,15 +477,18 @@ def build(info, figs, out_path):
         ll=doc.add_paragraph();ll.alignment=WD_ALIGN_PARAGRAPH.CENTER
         ll.paragraph_format.space_before=Pt(8)
         R(ll,loc_lbl,bold=True,size=12)
-        _new_portrait_page(doc)
+        if next_portrait:
+            _new_portrait_page(doc)
+        else:
+            _new_landscape_page(doc)
 
     sem_page(['3','4','5'],'Location 1',5)
     sem_page(['6','7'],'Location 1',6)
     sem_page(['8','9','10'],'Location 2',7)
     if '13' in figs:
-        sem_page(['11','12','13'],'Location 2',8)
+        sem_page(['11','12','13'],'Location 2',8,next_portrait=True)
     else:
-        sem_page(['11','12'],'Location 2',8)
+        sem_page(['11','12'],'Location 2',8,next_portrait=True)
 
     # ══ PAGE 9: SUMMARY + CONCLUSION ═════════════════════════
     add_page_hdr(doc,9)
