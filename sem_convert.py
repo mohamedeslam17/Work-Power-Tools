@@ -544,21 +544,21 @@ def build(info, figs, out_path):
         cols=len(present)
         col_cm = 8.5 if cols==3 else 12.8   # landscape content 25.7 cm
         img_cm = 8.2 if cols==3 else 12.5
-        max_h  = 8.5                          # cap image height so captions stay on same page
+        max_h  = 8.0                          # cap image height so captions stay on same page
 
-        t=doc.add_table(rows=2,cols=cols);t.alignment=WD_TABLE_ALIGNMENT.CENTER
+        # Single row: image + caption stacked in each cell — _cantSplit keeps entire row on one page
+        t=doc.add_table(rows=1,cols=cols);t.alignment=WD_TABLE_ALIGNMENT.CENTER
         _fix_table(t, cols * col_cm)
+        _cantSplit(t.rows[0])
         for ci,(fn,f) in enumerate(present):
-            ic=t.rows[0].cells[ci];ic.width=Cm(col_cm);_nobdr(ic)
-            _cantSplit(t.rows[0])
-            ip=ic.paragraphs[0];ip.alignment=WD_ALIGN_PARAGRAPH.CENTER
+            cell=t.rows[0].cells[ci];cell.width=Cm(col_cm);_nobdr(cell)
+            ip=cell.paragraphs[0];ip.alignment=WD_ALIGN_PARAGRAPH.CENTER
             ip.paragraph_format.space_before=Pt(6)
+            ip.paragraph_format.keep_with_next=True
             w_px,h_px=f['w'],f['h']
             pic_kw=dict(height=Cm(max_h)) if (img_cm*h_px/w_px)>max_h else dict(width=Cm(img_cm))
             ip.add_run().add_picture(io.BytesIO(f['bytes']),**pic_kw)
-            cc=t.rows[1].cells[ci];cc.width=Cm(col_cm);_nobdr(cc)
-            _cantSplit(t.rows[1])
-            cp=cc.paragraphs[0];cp.alignment=WD_ALIGN_PARAGRAPH.JUSTIFY
+            cp=cell.add_paragraph();cp.alignment=WD_ALIGN_PARAGRAPH.JUSTIFY
             cp.paragraph_format.space_after=Pt(6)
             cp.paragraph_format.keep_together=True
             _R_cap(cp,_clean_caption(caps.get(fn,f'Fig 1.{fn}')),size=11,color=GRAY,italic=True)
