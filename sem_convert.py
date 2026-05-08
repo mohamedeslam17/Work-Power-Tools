@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
 SEM Report Converter - Ansaldo Energia
-Usage: python3 sem_convert_final.py vendor.pdf [output.docx]
-Place the companion _R.pdf in the same folder for best results (heat treatment field).
+Usage: python3 sem_convert.py vendor.pdf [output.docx]
 """
 import sys, os, re, io
 from pathlib import Path
 import fitz
 from docx import Document
-from docx.shared import Pt, RGBColor, Cm, Inches
+from docx.shared import Pt, RGBColor, Cm
 from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.enum.table import WD_TABLE_ALIGNMENT, WD_CELL_VERTICAL_ALIGNMENT
+from docx.enum.table import WD_TABLE_ALIGNMENT
+from docx.enum.section import WD_SECTION_START
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 
@@ -40,6 +40,78 @@ def R(p,text,bold=False,size=10,color=None,italic=False):
     return r
 def SP(doc,h=2):
     p=doc.add_paragraph();p.paragraph_format.space_before=Pt(h);p.paragraph_format.space_after=Pt(h)
+
+def _new_portrait_page(doc):
+    """Start a new portrait A4 page using a proper next-page section break."""
+    new_sec = doc.add_section(WD_SECTION_START.NEW_PAGE)
+    new_sec.page_width = Cm(21)
+    new_sec.page_height = Cm(29.7)
+    new_sec.left_margin = new_sec.right_margin = Cm(2)
+    new_sec.top_margin = new_sec.bottom_margin = Cm(2)
+    # footer.is_linked_to_previous defaults to True → inherits PAGE field from first section
+
+def _new_landscape_page(doc):
+    """Start a new landscape A4 page using a proper next-page section break."""
+    new_sec = doc.add_section(WD_SECTION_START.NEW_PAGE)
+    new_sec.page_width = Cm(29.7)
+    new_sec.page_height = Cm(21)
+    new_sec.left_margin = new_sec.right_margin = Cm(2)
+    new_sec.top_margin = new_sec.bottom_margin = Cm(2)
+    pgSz = new_sec._sectPr.find(qn('w:pgSz'))
+    if pgSz is not None:
+        pgSz.set(qn('w:orient'), 'landscape')
+
+def _toc_entry(doc, label, pg):
+    """TOC line with right-aligned page number and dot leader via tab stop."""
+    p = doc.add_paragraph()
+    p.paragraph_format.space_before = Pt(5)
+    p.paragraph_format.space_after = Pt(5)
+    pPr = p._p.get_or_add_pPr()
+    tabs = OxmlElement('w:tabs')
+    tab = OxmlElement('w:tab')
+    tab.set(qn('w:val'), 'right')
+    tab.set(qn('w:pos'), '9638')   # 17 cm content width in twips
+    tab.set(qn('w:leader'), 'dot')
+    tabs.append(tab)
+    pPr.append(tabs)
+    R(p, label, size=10)
+    R(p, f'\t{pg}', size=10)
+
+def _setup_footer(section):
+    """Place an auto PAGE field in the section footer, right-aligned."""
+    footer = section.footer
+    footer.is_linked_to_previous = False
+    for p in footer.paragraphs:
+        p.clear()
+    fp = footer.paragraphs[0]
+    fp.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    r1 = fp.add_run()
+    r1.font.size = Pt(10); r1.font.name = 'Calibri'; r1.font.color.rgb = GRAY
+    fld1 = OxmlElement('w:fldChar')
+    fld1.set(qn('w:fldCharType'), 'begin')
+    r1._r.append(fld1)
+    r2 = fp.add_run()
+    r2.font.size = Pt(10); r2.font.name = 'Calibri'; r2.font.color.rgb = GRAY
+    instr = OxmlElement('w:instrText')
+    instr.set(qn('xml:space'), 'preserve')
+    instr.text = ' PAGE '
+    r2._r.append(instr)
+    r3 = fp.add_run()
+    r3.font.size = Pt(10); r3.font.name = 'Calibri'; r3.font.color.rgb = GRAY
+    fld2 = OxmlElement('w:fldChar')
+    fld2.set(qn('w:fldCharType'), 'end')
+    r3._r.append(fld2)
+
+def _add_carbide(p, formula='M23C6', size=10):
+    """Write a chemical formula with proper Word subscript for digit sequences."""
+    for part in re.split(r'(\d+)', formula):
+        if part.isdigit():
+            r = p.add_run(part)
+            r.font.subscript = True
+            r.font.size = Pt(size)
+            r.font.name = 'Calibri'
+        elif part:
+            R(p, part, size=size)
 
 # ── PDF helpers ───────────────────────────────────────────────
 def page_text(page):
@@ -73,7 +145,7 @@ def is_image_page(page,pdf):
         if b.get("type")!=0:continue
         for line in b.get("lines",[]):
             lt=' '.join(s["text"] for s in line.get("spans",[]))
-            if re.search(r'As-received Sample|SEM Analysis\s*[\u2013\u2014-]',lt):
+            if re.search(r'As-received Sample|SEM Analysis\s*[–—-]',lt):
                 return any(pdf.extract_image(img[0]).get('width',0)>500 for img in page.get_images())
     return False
 
@@ -105,9 +177,9 @@ def parse(pdf_path):
         if os.path.exists(r_path):
             rpdf=fitz.open(r_path)
             rf='\n'.join(page_text(p) for p in rpdf); rpdf.close()
-            ht_m=re.search(r'Heat Treatment Condition[:\s]+([^\n•\u2022]+)',rf,re.I)
+            ht_m=re.search(r'Heat Treatment Condition[:\s]+([^\n••]+)',rf,re.I)
             if ht_m:ht=ht_m.group(1).strip()
-            ia_m=re.search(r'Incoming Assessment[:\s]+([^\n•\u2022]+)',rf,re.I)
+            ia_m=re.search(r'Incoming Assessment[:\s]+([^\n••]+)',rf,re.I)
             if ia_m:ia=ia_m.group(1).strip()
             break
 
@@ -116,7 +188,6 @@ def parse(pdf_path):
     l2=sizes[1] if len(sizes)>1 else 'N/A'
     no_anom=bool(re.search(r'No (evidence|indications) of.*(needle|sigma|eta)',full,re.I))
     rts=bool(re.search(r'suitable for return to service',full,re.I))
-    # Conclusion from _R pdf (not in vendor pdf)
     conclusion=''
     for r_path in [base.replace('.pdf','_R.pdf'),
                    str(Path(pdf_path).parent/f"{Path(pdf_path).stem}_R.pdf")]:
@@ -125,13 +196,12 @@ def parse(pdf_path):
             rlast=rpdf2[-1].get_text("text")
             rpdf2.close()
             cm=re.search(r'CONCLUSION\s*\n+(.*?)(?:Location\s*\nMorphology|$)',rlast,re.DOTALL|re.I)
-            if cm:conclusion=cm.group(1).strip()  # keep newlines for paragraph splitting
+            if cm:conclusion=cm.group(1).strip()
             break
     if not conclusion:
         cm=re.search(r'(The metallurgical evaluation.+?NDT inspections\.)',full,re.DOTALL|re.I)
         if cm:conclusion=re.sub(r'\s+',' ',cm.group(1)).strip()
 
-    # captions — from image pages only
     captions={}
     for page in vendor:
         if not is_image_page(page,vendor):continue
@@ -142,7 +212,6 @@ def parse(pdf_path):
         if fn in captions:continue
         captions[fn]=caption_from_page(page,fn)
 
-    # Fig 1.1 caption — from the right-side text box on the As-received page
     for page in vendor:
         if 'As-received' not in page_text(page):continue
         d=page.get_text("dict");spans=[]
@@ -178,26 +247,34 @@ def extract_figures(pdf_path):
         fn=m.group(1)
         if fn in figs:continue
 
-        # Fig 1.1 special case — get just the specimen photo (second embedded image)
+        # Fig 1.1 — render full page image area (bag + specimen together),
+        # then white out any text overlaid within that area (removes embedded caption box)
         if fn=='1':
-            imgs=page.get_image_info(xrefs=True)
-            # Sort images by y position; take the LAST large one (specimen, not bag)
-            large=[img for img in imgs if img.get('width',0)>300 and img.get('height',0)>200
-                   and img.get('xref',0)!=19]  # skip logo
-            large.sort(key=lambda img:img['bbox'][1])  # sort by top y
-            if len(large)>=2:
-                # Take the second image (specimen), crop exactly its bbox
-                bbox=large[1]['bbox']
-                crop=fitz.Rect(bbox[0],bbox[1],bbox[2],bbox[3])
-                pix=page.get_pixmap(dpi=180,clip=crop)
-                figs[fn]={'bytes':pix.tobytes('jpeg'),'w':pix.width,'h':pix.height}
-                continue
-            elif large:
-                bbox=large[-1]['bbox']
-                crop=fitz.Rect(bbox[0],bbox[1],bbox[2],bbox[3])
-                pix=page.get_pixmap(dpi=180,clip=crop)
-                figs[fn]={'bytes':pix.tobytes('jpeg'),'w':pix.width,'h':pix.height}
-                continue
+            pw=page.rect.width;ph=page.rect.height
+            d1=page.get_text("dict");hdr_bot=80.0;cap_top=ph-220.0
+            for b in d1["blocks"]:
+                if b.get("type")!=0:continue
+                for line in b.get("lines",[]):
+                    lt=' '.join(s["text"] for s in line.get("spans",[]))
+                    bb=line["bbox"]
+                    if re.search(r'As-received|SEM Analysis',lt):
+                        if bb[3]>hdr_bot:hdr_bot=bb[3]
+                    if re.match(r'\s*Fig(?:ure)?\s+1\.\d+\s+shows',lt) and bb[1]>400:
+                        if bb[1]<cap_top:cap_top=bb[1]
+            crop_rect=fitz.Rect(18,hdr_bot+5,pw-18,cap_top-4)
+            shape=page.new_shape()
+            hit=False
+            for block in d1["blocks"]:
+                if block.get("type")==0:
+                    br=fitz.Rect(block["bbox"])
+                    if crop_rect.intersects(br):
+                        shape.draw_rect(br);hit=True
+            if hit:
+                shape.finish(fill=(1,1,1),color=(1,1,1),width=0)
+                shape.commit()
+            pix=page.get_pixmap(dpi=180,clip=crop_rect)
+            figs[fn]={'bytes':pix.tobytes('jpeg'),'w':pix.width,'h':pix.height}
+            continue
 
         # All other figures — crop from header to just above caption
         pw=page.rect.width;ph=page.rect.height
@@ -207,7 +284,7 @@ def extract_figures(pdf_path):
             for line in b.get("lines",[]):
                 lt=' '.join(s["text"] for s in line.get("spans",[]))
                 bb=line["bbox"]
-                if re.search(r'SEM Analysis\s*[\u2013\u2014-]|As-received|Location Mapping',lt):
+                if re.search(r'SEM Analysis\s*[–—-]|As-received|Location Mapping',lt):
                     if bb[3]>hdr_bot:hdr_bot=bb[3]
                 if re.match(r'\s*Fig(?:ure)?\s+1\.\d+\s+shows',lt) and bb[1]>400:
                     if bb[1]<cap_top:cap_top=bb[1]
@@ -220,60 +297,15 @@ def extract_figures(pdf_path):
     return figs
 
 # ══════════════════════════════════════════════════════════════
-# BUILD DOCX  — matching _R.pdf layout exactly
+# BUILD DOCX
 # ══════════════════════════════════════════════════════════════
-def page_header_table(doc, info, page_num, total_pages=9):
-    """Full-width header table: ansaldo logo row + info row"""
-    # Logo paragraph  
-    logo_p = doc.add_paragraph()
-    logo_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    logo_p.paragraph_format.space_before = Pt(0)
-    logo_p.paragraph_format.space_after = Pt(6)
-    r = logo_p.add_run("ansaldo"); r.bold=True; r.font.size=Pt(24); r.font.name="Calibri"; r.font.color.rgb=RGBColor(0x8B,0x8B,0x8B)
-    r2 = logo_p.add_run("|"); r2.font.size=Pt(24); r2.font.name="Calibri"; r2.font.color.rgb=RED
-    r3 = logo_p.add_run("energia"); r3.font.size=Pt(24); r3.font.name="Calibri"; r3.font.color.rgb=RGBColor(0x8B,0x8B,0x8B)
-
-    # Info table
-    tbl = doc.add_table(rows=2, cols=5)
-    tbl.style = 'Table Grid'
-    ws = [Cm(7.5), Cm(3.8), Cm(1.5), Cm(1.5), Cm(1.2)]
-
-    # Row 0: labels
-    for j,(h,w) in enumerate(zip(['Project / Title','Job Number.','Rev.','page','Of'],ws)):
-        c=tbl.rows[0].cells[j]; c.width=w; _bdr(c,'888888',2)
-        p=c.paragraphs[0]; p.paragraph_format.space_before=Pt(1); p.paragraph_format.space_after=Pt(1)
-        R(p,h,size=8,color=GRAY)
-
-    # Row 1: values
-    vals=[
-        ('SEM Metallurgical Evaluation Report',False,10),
-        (f"JC. {info['job']}",True,11),
-        ('0',False,10),
-        (str(page_num),False,10),
-        (str(total_pages),False,10)
-    ]
-    for j,((val,bold,sz),w) in enumerate(zip(vals,ws)):
-        c=tbl.rows[1].cells[j]; c.width=w; _bdr(c,'888888',2)
-        p=c.paragraphs[0]; p.paragraph_format.space_before=Pt(2); p.paragraph_format.space_after=Pt(2)
-        if j==1:
-            R(p,val,bold=True,size=sz)
-            p2=c.add_paragraph(); R(p2,info['stage'],size=8,color=GRAY)
-        else:
-            R(p,val,bold=bold,size=sz)
-    return tbl
-
 def add_two_col(doc, left_content_fn, right_bytes, right_w=Cm(7.5), caption=''):
-    """Add a two-column table: left=text, right=image+caption"""
     t = doc.add_table(rows=1, cols=2)
     t.alignment = WD_TABLE_ALIGNMENT.LEFT
     lc = t.rows[0].cells[0]; lc.width = Cm(8.0); _nobdr(lc)
     rc = t.rows[0].cells[1]; rc.width = right_w;  _nobdr(rc)
-    lc._tc.get_or_add_tcPr()  # needed for vertical align
-
-    # Fill left cell
+    lc._tc.get_or_add_tcPr()
     left_content_fn(lc)
-
-    # Fill right cell: image + caption
     ip = rc.add_paragraph(); ip.alignment = WD_ALIGN_PARAGRAPH.CENTER
     ip.add_run().add_picture(io.BytesIO(right_bytes), width=right_w - Cm(0.3))
     if caption:
@@ -287,43 +319,44 @@ def build(info, figs, out_path):
     sec.page_width=Cm(21); sec.page_height=Cm(29.7)
     sec.left_margin=sec.right_margin=Cm(2)
     sec.top_margin=sec.bottom_margin=Cm(2)
-    # Remove default header/footer
     sec.header.is_linked_to_previous = False
     for p in sec.header.paragraphs: p.clear()
-    for p in sec.footer.paragraphs: p.clear()
+    _setup_footer(sec)
     doc.styles['Normal'].font.name='Calibri'; doc.styles['Normal'].font.size=Pt(10)
 
     caps = info['captions']
-    total = 9  # total pages
+    total = 9
 
-    def page_num_footer(doc, page_num):
-        p = doc.add_paragraph()
-        p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-        p.paragraph_format.space_before = Pt(8)
-        R(p, str(page_num), size=10, color=GRAY)
+    # ── shared logo+header table ──────────────────────────────
+    ws=[Cm(7.5),Cm(3.8),Cm(1.5),Cm(1.5),Cm(1.2)]
+
+    def add_logo(doc):
+        lp=doc.add_paragraph(); lp.alignment=WD_ALIGN_PARAGRAPH.CENTER
+        lp.paragraph_format.space_before=Pt(0); lp.paragraph_format.space_after=Pt(4)
+        R(lp,"ansaldo",bold=True,size=24,color=RGBColor(0x8B,0x8B,0x8B))
+        R(lp,"|",size=24,color=RED); R(lp,"energia",size=24,color=RGBColor(0x8B,0x8B,0x8B))
+
+    def add_info_table(doc, page_num):
+        t=doc.add_table(rows=2,cols=5);t.style='Table Grid'
+        for j,h in enumerate(['Project / Title','Job Number.','Rev.','page','Of']):
+            c=t.rows[0].cells[j];c.width=ws[j];_bdr(c,'888888',2)
+            R(c.paragraphs[0],h,size=8,color=GRAY)
+        for j,(val,bold,sz) in enumerate([
+            ('SEM Metallurgical Evaluation Report',False,10),(f"JC. {info['job']}",True,11),
+            ('0',False,10),(str(page_num),False,10),(str(total),False,10)]):
+            c=t.rows[1].cells[j];c.width=ws[j];_bdr(c,'888888',2)
+            p=c.paragraphs[0];p.paragraph_format.space_before=Pt(2);p.paragraph_format.space_after=Pt(2)
+            if j==1:R(p,val,bold=True,size=sz);pp=c.add_paragraph();R(pp,info['stage'],size=8,color=GRAY)
+            else:R(p,val,bold=bold,size=sz)
+
+    def add_page_hdr(doc, page_num):
+        add_logo(doc)
+        add_info_table(doc, page_num)
+        SP(doc,6)
 
     # ══ PAGE 1: COVER ════════════════════════════════════════
-    logo_p = doc.add_paragraph()
-    logo_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    logo_p.paragraph_format.space_before = Pt(4)
-    logo_p.paragraph_format.space_after = Pt(6)
-    R(logo_p,"ansaldo",bold=True,size=24,color=RGBColor(0x8B,0x8B,0x8B))
-    R(logo_p,"|",size=24,color=RED); R(logo_p,"energia",size=24,color=RGBColor(0x8B,0x8B,0x8B))
-
-    tbl=doc.add_table(rows=2,cols=5); tbl.style='Table Grid'
-    ws=[Cm(7.5),Cm(3.8),Cm(1.5),Cm(1.5),Cm(1.2)]
-    for j,h in enumerate(['Project / Title','Job Number.','Rev.','page','Of']):
-        c=tbl.rows[0].cells[j];c.width=ws[j];_bdr(c,'888888',2)
-        R(c.paragraphs[0],h,size=8,color=GRAY)
-    for j,(val,bold,sz) in enumerate([
-        ('SEM Metallurgical Evaluation Report',False,10),
-        (f"JC. {info['job']}",True,11),('0',False,10),('1',False,10),(str(total),False,10)]):
-        c=tbl.rows[1].cells[j];c.width=ws[j];_bdr(c,'888888',2)
-        p=c.paragraphs[0];p.paragraph_format.space_before=Pt(2);p.paragraph_format.space_after=Pt(2)
-        if j==1:
-            R(p,val,bold=True,size=sz)
-            pp=c.add_paragraph();R(pp,info['stage'],size=8,color=GRAY)
-        else:R(p,val,bold=bold,size=sz)
+    add_logo(doc)
+    add_info_table(doc, 1)
 
     SP(doc,12)
     t1=doc.add_paragraph(); t1.alignment=WD_ALIGN_PARAGRAPH.CENTER
@@ -343,50 +376,24 @@ def build(info, figs, out_path):
             if ri==0:_bg(c,'F0F0F0')
             R(c.paragraphs[0],val,bold=(ri==0),size=9)
 
-    page_num_footer(doc,1)
-    doc.add_page_break()
+    _new_portrait_page(doc)
 
     # ══ PAGE 2: TOC ══════════════════════════════════════════
-    logo_p=doc.add_paragraph(); logo_p.alignment=WD_ALIGN_PARAGRAPH.CENTER
-    R(logo_p,"ansaldo",bold=True,size=24,color=RGBColor(0x8B,0x8B,0x8B))
-    R(logo_p,"|",size=24,color=RED); R(logo_p,"energia",size=24,color=RGBColor(0x8B,0x8B,0x8B))
-    # header table
-    tbl2=doc.add_table(rows=2,cols=5); tbl2.style='Table Grid'
-    for j,h in enumerate(['Project / Title','Job Number.','Rev.','page','Of']):
-        c=tbl2.rows[0].cells[j];c.width=ws[j];_bdr(c,'888888',2);R(c.paragraphs[0],h,size=8,color=GRAY)
-    for j,(val,bold,sz) in enumerate([('SEM Metallurgical Evaluation Report',False,10),(f"JC. {info['job']}",True,11),('0',False,10),('2',False,10),(str(total),False,10)]):
-        c=tbl2.rows[1].cells[j];c.width=ws[j];_bdr(c,'888888',2)
-        p=c.paragraphs[0];p.paragraph_format.space_before=Pt(2);p.paragraph_format.space_after=Pt(2)
-        if j==1:R(p,val,bold=True,size=sz);pp=c.add_paragraph();R(pp,info['stage'],size=8,color=GRAY)
-        else:R(p,val,bold=bold,size=sz)
-    SP(doc,8)
-    h=doc.add_paragraph();h.paragraph_format.space_before=Pt(10);h.paragraph_format.space_after=Pt(8)
-    R(h,'TABLE OF CONTENTS',bold=True,size=11,color=NAVY)
+    add_page_hdr(doc, 2)
+    SP(doc,4)
+    h=doc.add_paragraph();h.paragraph_format.space_before=Pt(6);h.paragraph_format.space_after=Pt(10)
+    R(h,'TABLE OF CONTENTS',bold=True,size=13,color=NAVY)
+    # Horizontal rule under heading
+    pPr=h._p.get_or_add_pPr();pBdr=OxmlElement('w:pBdr')
+    bot=OxmlElement('w:bottom');bot.set(qn('w:val'),'single');bot.set(qn('w:sz'),'6')
+    bot.set(qn('w:space'),'1');bot.set(qn('w:color'),'C8102E');pBdr.append(bot);pPr.append(pBdr)
+
     for label,pg in [('TABLE OF CONTENTS','2'),('INTRODUCTION','3'),('RECAPITULATION','3'),
                      ('MICROSTRUCTURE ANALYSIS','4'),
-                     ('SUMMARY OF \u03b3\u2032 PRECIPITATE MEASUREMENTS','9'),('CONCLUSION','9')]:
-        p=doc.add_paragraph();p.paragraph_format.space_before=Pt(4);p.paragraph_format.space_after=Pt(4)
-        R(p,label,size=10);dots='.'*max(5,62-len(label));R(p,f' {dots} {pg}',size=10,color=GRAY)
-    page_num_footer(doc,2)
-    doc.add_page_break()
+                     ('SUMMARY OF γ′ PRECIPITATE MEASUREMENTS','9'),('CONCLUSION','9')]:
+        _toc_entry(doc, label, pg)
 
-    # ══ PAGES 3-9: helper to add the logo+header to each ════
-    def add_page_hdr(doc, page_num):
-        lp=doc.add_paragraph(); lp.alignment=WD_ALIGN_PARAGRAPH.CENTER
-        lp.paragraph_format.space_before=Pt(0); lp.paragraph_format.space_after=Pt(4)
-        R(lp,"ansaldo",bold=True,size=24,color=RGBColor(0x8B,0x8B,0x8B))
-        R(lp,"|",size=24,color=RED); R(lp,"energia",size=24,color=RGBColor(0x8B,0x8B,0x8B))
-        t=doc.add_table(rows=2,cols=5);t.style='Table Grid'
-        for j,h in enumerate(['Project / Title','Job Number.','Rev.','page','Of']):
-            c=t.rows[0].cells[j];c.width=ws[j];_bdr(c,'888888',2);R(c.paragraphs[0],h,size=8,color=GRAY)
-        for j,(val,bold,sz) in enumerate([
-            ('SEM Metallurgical Evaluation Report',False,10),(f"JC. {info['job']}",True,11),
-            ('0',False,10),(str(page_num),False,10),(str(total),False,10)]):
-            c=t.rows[1].cells[j];c.width=ws[j];_bdr(c,'888888',2)
-            p=c.paragraphs[0];p.paragraph_format.space_before=Pt(2);p.paragraph_format.space_after=Pt(2)
-            if j==1:R(p,val,bold=True,size=sz);pp=c.add_paragraph();R(pp,info['stage'],size=8,color=GRAY)
-            else:R(p,val,bold=bold,size=sz)
-        SP(doc,6)
+    _new_landscape_page(doc)
 
     # ══ PAGE 3: INTRO + RECAP (left) | FIG 1.1 (right) ══════
     add_page_hdr(doc,3)
@@ -398,7 +405,7 @@ def build(info, figs, out_path):
         R(p2,f"This report presents the metallurgical evaluation of a {info['stage']} using "
             f"Scanning Electron Microscopy (SEM). The analysis was performed on the specimen in the "
             f"{info['ht']} condition. The objective is to evaluate microstructural integrity, "
-            f"focusing on the Y\u2032 morphology and the presence of any degradation phases such as "
+            f"focusing on the γ′ morphology and the presence of any degradation phases such as "
             f"brittle needle-shaped precipitates.",size=10)
         p3=cell.add_paragraph(); p3.paragraph_format.space_before=Pt(10); p3.paragraph_format.space_after=Pt(8)
         R(p3,'RECAPITULATION',bold=True,size=11,color=NAVY)
@@ -407,15 +414,14 @@ def build(info, figs, out_path):
                         ('Heat Treatment Condition',info['ht']),('Serial Number',info['serial'])]:
             pb=cell.add_paragraph(); pb.paragraph_format.space_before=Pt(2); pb.paragraph_format.space_after=Pt(2)
             pb.paragraph_format.left_indent=Cm(0.3)
-            R(pb,'\u2022 ',bold=True); R(pb,lbl+': ',bold=True); R(pb,val)
+            R(pb,'• ',bold=True); R(pb,lbl+': ',bold=True); R(pb,val)
 
     if '1' in figs:
         add_two_col(doc,left_p3,figs['1']['bytes'],right_w=Cm(7.5),caption=caps.get('1','Fig 1.1'))
     else:
         left_p3_para=doc.add_paragraph(); left_p3(left_p3_para)
 
-    page_num_footer(doc,3)
-    doc.add_page_break()
+    _new_landscape_page(doc)
 
     # ══ PAGE 4: MICROSTRUCTURE (left) | FIG 1.2 (right) ═════
     add_page_hdr(doc,4)
@@ -424,30 +430,32 @@ def build(info, figs, out_path):
         p=cell.add_paragraph();p.paragraph_format.space_before=Pt(4);p.paragraph_format.space_after=Pt(8)
         R(p,'MICROSTRUCTURE ANALYSIS',bold=True,size=11,color=NAVY)
         p2=cell.add_paragraph();p2.paragraph_format.space_after=Pt(8)
-        R(p2,'The analysis focused on two representative locations, revealing a matrix of Y\u2032 precipitates and various carbide phases.')
+        R(p2,'The analysis focused on two representative locations, revealing a matrix of '
+             'γ′ precipitates and various carbide phases.')
         pb=cell.add_paragraph();pb.paragraph_format.left_indent=Cm(0.3)
-        R(pb,'\u2022 ');R(pb,'Y Matrix: ',bold=True)
-        R(pb,'Both locations showed a typical distribution of primary and secondary Y\u2032 precipitates.')
+        R(pb,'• ');R(pb,'γ Matrix: ',bold=True)
+        R(pb,'Both locations showed a typical distribution of primary and secondary γ′ precipitates.')
         pb=cell.add_paragraph();pb.paragraph_format.left_indent=Cm(0.3)
-        R(pb,'\u2022 ');R(pb,'Precipitates:',bold=True)
+        R(pb,'• ');R(pb,'Precipitates:',bold=True)
         pb=cell.add_paragraph();pb.paragraph_format.left_indent=Cm(0.8)
         R(pb,'o ');R(pb,'Grain Boundaries: ',bold=True)
-        R(pb,'Fine and coarse precipitates, identified as likely M\u2082\u2083C\u2086 and MC-type carbides, were observed along the grain boundaries.')
+        R(pb,'Fine and coarse precipitates, identified as likely ')
+        _add_carbide(pb)
+        R(pb,' and MC-type carbides, were observed along the grain boundaries.')
         pb=cell.add_paragraph();pb.paragraph_format.left_indent=Cm(0.8)
         R(pb,'o ');R(pb,'Intra-granular: ',bold=True)
         R(pb,'Coarse, blocky MC-type precipitates were found within the grains.')
         if info['no_anom']:
             pb=cell.add_paragraph();pb.paragraph_format.left_indent=Cm(0.3)
-            R(pb,'\u2022 ');R(pb,'Anomalies: ',bold=True)
+            R(pb,'• ');R(pb,'Anomalies: ',bold=True)
             R(pb,'No evidence of detrimental needle-shaped (sigma or eta) precipitates were found at any examined location.')
 
     if '2' in figs:
         add_two_col(doc,left_p4,figs['2']['bytes'],right_w=Cm(7.5),caption=caps.get('2','Fig 1.2'))
-    page_num_footer(doc,4)
-    doc.add_page_break()
+    _new_landscape_page(doc)
 
     # ══ PAGES 5-8: SEM IMAGE GRIDS ═══════════════════════════
-    def sem_page(nums, loc_lbl, page_num):
+    def sem_page(nums, loc_lbl, page_num, next_portrait=False):
         add_page_hdr(doc, page_num)
         present=[(n,figs[n]) for n in nums if n in figs]
         if not present:return
@@ -469,29 +477,31 @@ def build(info, figs, out_path):
         ll=doc.add_paragraph();ll.alignment=WD_ALIGN_PARAGRAPH.CENTER
         ll.paragraph_format.space_before=Pt(8)
         R(ll,loc_lbl,bold=True,size=12)
-        page_num_footer(doc,page_num)
-        doc.add_page_break()
+        if next_portrait:
+            _new_portrait_page(doc)
+        else:
+            _new_landscape_page(doc)
 
     sem_page(['3','4','5'],'Location 1',5)
     sem_page(['6','7'],'Location 1',6)
     sem_page(['8','9','10'],'Location 2',7)
     if '13' in figs:
-        sem_page(['11','12','13'],'Location 2',8)
+        sem_page(['11','12','13'],'Location 2',8,next_portrait=True)
     else:
-        sem_page(['11','12'],'Location 2',8)
+        sem_page(['11','12'],'Location 2',8,next_portrait=True)
 
     # ══ PAGE 9: SUMMARY + CONCLUSION ═════════════════════════
     add_page_hdr(doc,9)
 
     h=doc.add_paragraph();h.paragraph_format.space_before=Pt(10);h.paragraph_format.space_after=Pt(6)
-    R(h,'SUMMARY OF \u03b3\u2032 PRECIPITATE MEASUREMENTS',bold=True,size=11,color=NAVY)
+    R(h,'SUMMARY OF γ′ PRECIPITATE MEASUREMENTS',bold=True,size=11,color=NAVY)
     p=doc.add_paragraph();p.paragraph_format.space_after=Pt(8)
-    R(p,'To consolidate the observations from both examined locations, the measured sizes of primary \u03b3\u2032 precipitates are summarized in the table below:')
+    R(p,'To consolidate the observations from both examined locations, the measured sizes of primary γ′ precipitates are summarized in the table below:')
     SP(doc,4)
 
     gt=doc.add_table(rows=3,cols=3);gt.alignment=WD_TABLE_ALIGNMENT.CENTER;gt.style='Table Grid'
     gw=[Cm(5.0),Cm(5.0),Cm(5.0)]
-    for j,h in enumerate(['Location','Morphology','Average Size (\u03bcm)']):
+    for j,h in enumerate(['Location','Morphology','Average Size (μm)']):
         c=gt.rows[0].cells[j];c.width=gw[j];_bg(c,'1A1A2E');_bdr(c)
         cp=c.paragraphs[0];cp.alignment=WD_ALIGN_PARAGRAPH.CENTER
         R(cp,h,bold=True,size=10,color=WHITE)
@@ -502,20 +512,17 @@ def build(info, figs, out_path):
             cp=c.paragraphs[0];cp.alignment=WD_ALIGN_PARAGRAPH.CENTER;R(cp,val,size=10)
     tp=doc.add_paragraph();tp.alignment=WD_ALIGN_PARAGRAPH.CENTER
     tp.paragraph_format.space_before=Pt(6);tp.paragraph_format.space_after=Pt(12)
-    R(tp,'Table 1 Primary \u03b3\u2032 Precipitate Size Measurements',italic=True,size=9,color=GRAY)
+    R(tp,'Table 1 Primary γ′ Precipitate Size Measurements',italic=True,size=9,color=GRAY)
 
     h=doc.add_paragraph();h.paragraph_format.space_before=Pt(10);h.paragraph_format.space_after=Pt(6)
     R(h,'CONCLUSION',bold=True,size=11,color=NAVY)
     if info['conclusion']:
-        # Split on blank lines (each paragraph preserved as-is from _R pdf)
-        import re as _re
-        parts=_re.split(r'\n\s*\n',info['conclusion'])
+        parts=re.split(r'\n\s*\n',info['conclusion'])
         for part in parts:
-            clean=_re.sub(r'\s+',' ',part).strip()
+            clean=re.sub(r'\s+',' ',part).strip()
             if clean:
                 p=doc.add_paragraph();p.paragraph_format.space_after=Pt(8);R(p,clean)
 
-    page_num_footer(doc,9)
     doc.save(out_path)
 
 # ══════════════════════════════════════════════════════════════
