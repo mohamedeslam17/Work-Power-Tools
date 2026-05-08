@@ -349,7 +349,7 @@ def _fix_table(t, total_cm):
     tblPr.extend([W, L])
 
 def add_two_col(doc, left_content_fn, right_bytes, right_cm=13.5, left_cm=12.0,
-                caption='', img_pix=None, max_h_cm=12.5):
+                caption='', img_pix=None, max_h_cm=10.5):
     t = doc.add_table(rows=1, cols=2)
     t.alignment = WD_TABLE_ALIGNMENT.CENTER
     _fix_table(t, left_cm + right_cm)
@@ -368,7 +368,7 @@ def add_two_col(doc, left_content_fn, right_bytes, right_cm=13.5, left_cm=12.0,
     if caption:
         clean = _clean_caption(caption)
         if clean:
-            cp = rc.add_paragraph(); cp.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            cp = rc.add_paragraph(); cp.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
             cp.paragraph_format.space_before = Pt(4)
             _R_cap(cp, clean, size=10, color=RED, italic=True)
 
@@ -528,6 +528,7 @@ def build(info, figs, out_path):
         cols=len(present)
         col_cm = 8.5 if cols==3 else 12.8   # landscape content 25.7 cm
         img_cm = 8.2 if cols==3 else 12.5
+        max_h  = 9.5                          # cap image height so captions stay on same page
 
         t=doc.add_table(rows=2,cols=cols);t.alignment=WD_TABLE_ALIGNMENT.CENTER
         _fix_table(t, cols * col_cm)
@@ -535,9 +536,11 @@ def build(info, figs, out_path):
             ic=t.rows[0].cells[ci];ic.width=Cm(col_cm);_nobdr(ic)
             ip=ic.paragraphs[0];ip.alignment=WD_ALIGN_PARAGRAPH.CENTER
             ip.paragraph_format.space_before=Pt(6)
-            ip.add_run().add_picture(io.BytesIO(f['bytes']),width=Cm(img_cm))
+            w_px,h_px=f['w'],f['h']
+            pic_kw=dict(height=Cm(max_h)) if (img_cm*h_px/w_px)>max_h else dict(width=Cm(img_cm))
+            ip.add_run().add_picture(io.BytesIO(f['bytes']),**pic_kw)
             cc=t.rows[1].cells[ci];cc.width=Cm(col_cm);_nobdr(cc)
-            cp=cc.paragraphs[0];cp.alignment=WD_ALIGN_PARAGRAPH.LEFT
+            cp=cc.paragraphs[0];cp.alignment=WD_ALIGN_PARAGRAPH.JUSTIFY
             cp.paragraph_format.space_after=Pt(6)
             _R_cap(cp,_clean_caption(caps.get(fn,f'Fig 1.{fn}')),size=11,color=GRAY,italic=True)
 
