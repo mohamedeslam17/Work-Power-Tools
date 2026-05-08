@@ -119,7 +119,7 @@ def _add_carbide(p, formula='M23C6', size=10):
 
 def _clean_caption(text):
     """Strip unwanted phrases and replace ASCII symbols with Unicode in caption text."""
-    text = re.sub(r'\s*No indications? of needle[- ]?shaped precipitates[^.]*\.', '', text, flags=re.I)
+    text = re.sub(r'\s*No indications? of[^.]*precipitates[^.]*\.', '', text, flags=re.I)
     text = re.sub(r'\bsecond[- ]?phase\s+', '', text, flags=re.I)
     text = re.sub(r'\bgamma[- ]prime\b', 'γ′', text, flags=re.I)
     text = re.sub(r'\bgamma\b', 'γ', text, flags=re.I)
