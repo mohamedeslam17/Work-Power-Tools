@@ -41,25 +41,29 @@ def R(p,text,bold=False,size=10,color=None,italic=False):
 def SP(doc,h=2):
     p=doc.add_paragraph();p.paragraph_format.space_before=Pt(h);p.paragraph_format.space_after=Pt(h)
 
+def _set_page_size(new_sec, w_twips, h_twips, landscape=False):
+    """Write w:pgSz directly into a section's sectPr with explicit twip values."""
+    sectPr = new_sec._sectPr
+    for old in sectPr.findall(qn('w:pgSz')):
+        sectPr.remove(old)
+    pgSz = OxmlElement('w:pgSz')
+    pgSz.set(qn('w:w'), str(w_twips))
+    pgSz.set(qn('w:h'), str(h_twips))
+    if landscape:
+        pgSz.set(qn('w:orient'), 'landscape')
+    sectPr.append(pgSz)
+
 def _new_portrait_page(doc):
-    """Start a new portrait A4 page using a proper next-page section break."""
     new_sec = doc.add_section(WD_SECTION_START.NEW_PAGE)
-    new_sec.page_width = Cm(21)
-    new_sec.page_height = Cm(29.7)
+    _set_page_size(new_sec, 11906, 16838)          # A4 portrait  21 × 29.7 cm
     new_sec.left_margin = new_sec.right_margin = Cm(2)
-    new_sec.top_margin = new_sec.bottom_margin = Cm(2)
-    # footer.is_linked_to_previous defaults to True → inherits PAGE field from first section
+    new_sec.top_margin  = new_sec.bottom_margin = Cm(2)
 
 def _new_landscape_page(doc):
-    """Start a new landscape A4 page using a proper next-page section break."""
     new_sec = doc.add_section(WD_SECTION_START.NEW_PAGE)
-    new_sec.page_width = Cm(29.7)
-    new_sec.page_height = Cm(21)
+    _set_page_size(new_sec, 16838, 11906, landscape=True)  # A4 landscape 29.7 × 21 cm
     new_sec.left_margin = new_sec.right_margin = Cm(2)
-    new_sec.top_margin = new_sec.bottom_margin = Cm(2)
-    pgSz = new_sec._sectPr.find(qn('w:pgSz'))
-    if pgSz is not None:
-        pgSz.set(qn('w:orient'), 'landscape')
+    new_sec.top_margin  = new_sec.bottom_margin = Cm(2)
 
 def _toc_entry(doc, label, pg):
     """TOC line with right-aligned page number and dot leader via tab stop."""
