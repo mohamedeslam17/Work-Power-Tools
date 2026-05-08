@@ -544,18 +544,20 @@ def build(info, figs, out_path):
         cols=len(present)
         col_cm = 8.5 if cols==3 else 12.8   # landscape content 25.7 cm
         img_cm = 8.2 if cols==3 else 12.5
-        max_h  = 8.0                          # cap image height so captions stay on same page
+        # 3-col: 6.0 cm keeps total row height ~9 cm, well inside the ~13 cm available after header
+        # 2-col: 8.0 cm, wider column so aspect ratio rarely triggers height cap
+        max_h  = 6.0 if cols==3 else 8.0
 
         # Single row: image + caption stacked in each cell.
-        # No cantSplit on the row (that pushes the whole table off the header page).
-        # keep_with_next on image paragraphs keeps each image with its own caption.
+        # cantSplit prevents the row splitting if content is unexpectedly tall.
+        # No keep_with_next — that caused Word to push the whole row past the header.
         t=doc.add_table(rows=1,cols=cols);t.alignment=WD_TABLE_ALIGNMENT.CENTER
         _fix_table(t, cols * col_cm)
+        _cantSplit(t.rows[0])
         for ci,(fn,f) in enumerate(present):
             cell=t.rows[0].cells[ci];cell.width=Cm(col_cm);_nobdr(cell)
             ip=cell.paragraphs[0];ip.alignment=WD_ALIGN_PARAGRAPH.CENTER
             ip.paragraph_format.space_before=Pt(6)
-            ip.paragraph_format.keep_with_next=True
             w_px,h_px=f['w'],f['h']
             pic_kw=dict(height=Cm(max_h)) if (img_cm*h_px/w_px)>max_h else dict(width=Cm(img_cm))
             ip.add_run().add_picture(io.BytesIO(f['bytes']),**pic_kw)
