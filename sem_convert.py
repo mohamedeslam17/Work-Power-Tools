@@ -303,11 +303,11 @@ def extract_figures(pdf_path):
 # ══════════════════════════════════════════════════════════════
 # BUILD DOCX
 # ══════════════════════════════════════════════════════════════
-def add_two_col(doc, left_content_fn, right_bytes, right_w=Cm(7.5), caption=''):
+def add_two_col(doc, left_content_fn, right_bytes, right_w=Cm(13.5), left_w=Cm(12.0), caption=''):
     t = doc.add_table(rows=1, cols=2)
-    t.alignment = WD_TABLE_ALIGNMENT.LEFT
-    lc = t.rows[0].cells[0]; lc.width = Cm(8.0); _nobdr(lc)
-    rc = t.rows[0].cells[1]; rc.width = right_w;  _nobdr(rc)
+    t.alignment = WD_TABLE_ALIGNMENT.CENTER
+    lc = t.rows[0].cells[0]; lc.width = left_w;  _nobdr(lc)
+    rc = t.rows[0].cells[1]; rc.width = right_w; _nobdr(rc)
     lc._tc.get_or_add_tcPr()
     left_content_fn(lc)
     ip = rc.add_paragraph(); ip.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -315,7 +315,7 @@ def add_two_col(doc, left_content_fn, right_bytes, right_w=Cm(7.5), caption=''):
     if caption:
         cp = rc.add_paragraph(); cp.alignment = WD_ALIGN_PARAGRAPH.CENTER
         cp.paragraph_format.space_before = Pt(4)
-        R(cp, caption, italic=True, size=8, color=RED)
+        R(cp, caption, italic=True, size=10, color=RED)
 
 def build(info, figs, out_path):
     doc = Document()
@@ -332,7 +332,9 @@ def build(info, figs, out_path):
     total = 9
 
     # ── shared logo+header table ──────────────────────────────
-    ws=[Cm(7.5),Cm(3.8),Cm(1.5),Cm(1.5),Cm(1.2)]
+    # Portrait (17 cm content) and landscape (25.7 cm content) header column widths
+    ws_p  = [Cm(8.2), Cm(4.2), Cm(1.6), Cm(1.6), Cm(1.4)]   # total 17.0 cm
+    ws_ls = [Cm(12.4), Cm(6.3), Cm(2.4), Cm(2.4), Cm(2.2)]  # total 25.7 cm
 
     def add_logo(doc):
         lp=doc.add_paragraph(); lp.alignment=WD_ALIGN_PARAGRAPH.CENTER
@@ -340,8 +342,10 @@ def build(info, figs, out_path):
         R(lp,"ansaldo",bold=True,size=24,color=RGBColor(0x8B,0x8B,0x8B))
         R(lp,"|",size=24,color=RED); R(lp,"energia",size=24,color=RGBColor(0x8B,0x8B,0x8B))
 
-    def add_info_table(doc, page_num):
+    def add_info_table(doc, page_num, landscape=False):
+        ws = ws_ls if landscape else ws_p
         t=doc.add_table(rows=2,cols=5);t.style='Table Grid'
+        t.alignment=WD_TABLE_ALIGNMENT.CENTER
         for j,h in enumerate(['Project / Title','Job Number.','Rev.','page','Of']):
             c=t.rows[0].cells[j];c.width=ws[j];_bdr(c,'888888',2)
             R(c.paragraphs[0],h,size=8,color=GRAY)
@@ -353,9 +357,9 @@ def build(info, figs, out_path):
             if j==1:R(p,val,bold=True,size=sz);pp=c.add_paragraph();R(pp,info['stage'],size=8,color=GRAY)
             else:R(p,val,bold=bold,size=sz)
 
-    def add_page_hdr(doc, page_num):
+    def add_page_hdr(doc, page_num, landscape=False):
         add_logo(doc)
-        add_info_table(doc, page_num)
+        add_info_table(doc, page_num, landscape=landscape)
         SP(doc,6)
 
     # ══ PAGE 1: COVER ════════════════════════════════════════
@@ -400,72 +404,72 @@ def build(info, figs, out_path):
     _new_landscape_page(doc)
 
     # ══ PAGE 3: INTRO + RECAP (left) | FIG 1.1 (right) ══════
-    add_page_hdr(doc,3)
+    add_page_hdr(doc,3,landscape=True)
 
     def left_p3(cell):
         p=cell.add_paragraph(); p.paragraph_format.space_before=Pt(4); p.paragraph_format.space_after=Pt(8)
-        R(p,'INTRODUCTION',bold=True,size=11,color=NAVY)
+        R(p,'INTRODUCTION',bold=True,size=12,color=NAVY)
         p2=cell.add_paragraph(); p2.paragraph_format.space_after=Pt(10)
         R(p2,f"This report presents the metallurgical evaluation of a {info['stage']} using "
             f"Scanning Electron Microscopy (SEM). The analysis was performed on the specimen in the "
             f"{info['ht']} condition. The objective is to evaluate microstructural integrity, "
             f"focusing on the γ′ morphology and the presence of any degradation phases such as "
-            f"brittle needle-shaped precipitates.",size=10)
+            f"brittle needle-shaped precipitates.",size=11)
         p3=cell.add_paragraph(); p3.paragraph_format.space_before=Pt(10); p3.paragraph_format.space_after=Pt(8)
-        R(p3,'RECAPITULATION',bold=True,size=11,color=NAVY)
+        R(p3,'RECAPITULATION',bold=True,size=12,color=NAVY)
         for lbl,val in [('Job Number',info['job']),('Alloy',info['material']),
                         ('Incoming Assessment',info['ia']),
                         ('Heat Treatment Condition',info['ht']),('Serial Number',info['serial'])]:
             pb=cell.add_paragraph(); pb.paragraph_format.space_before=Pt(2); pb.paragraph_format.space_after=Pt(2)
             pb.paragraph_format.left_indent=Cm(0.3)
-            R(pb,'• ',bold=True); R(pb,lbl+': ',bold=True); R(pb,val)
+            R(pb,'• ',bold=True,size=11); R(pb,lbl+': ',bold=True,size=11); R(pb,val,size=11)
 
     if '1' in figs:
-        add_two_col(doc,left_p3,figs['1']['bytes'],right_w=Cm(7.5),caption=caps.get('1','Fig 1.1'))
+        add_two_col(doc,left_p3,figs['1']['bytes'],right_w=Cm(13.5),left_w=Cm(12.0),caption=caps.get('1','Fig 1.1'))
     else:
         left_p3_para=doc.add_paragraph(); left_p3(left_p3_para)
 
     _new_landscape_page(doc)
 
     # ══ PAGE 4: MICROSTRUCTURE (left) | FIG 1.2 (right) ═════
-    add_page_hdr(doc,4)
+    add_page_hdr(doc,4,landscape=True)
 
     def left_p4(cell):
         p=cell.add_paragraph();p.paragraph_format.space_before=Pt(4);p.paragraph_format.space_after=Pt(8)
-        R(p,'MICROSTRUCTURE ANALYSIS',bold=True,size=11,color=NAVY)
+        R(p,'MICROSTRUCTURE ANALYSIS',bold=True,size=12,color=NAVY)
         p2=cell.add_paragraph();p2.paragraph_format.space_after=Pt(8)
         R(p2,'The analysis focused on two representative locations, revealing a matrix of '
-             'γ′ precipitates and various carbide phases.')
+             'γ′ precipitates and various carbide phases.',size=11)
         pb=cell.add_paragraph();pb.paragraph_format.left_indent=Cm(0.3)
-        R(pb,'• ');R(pb,'γ Matrix: ',bold=True)
-        R(pb,'Both locations showed a typical distribution of primary and secondary γ′ precipitates.')
+        R(pb,'• ',size=11);R(pb,'γ Matrix: ',bold=True,size=11)
+        R(pb,'Both locations showed a typical distribution of primary and secondary γ′ precipitates.',size=11)
         pb=cell.add_paragraph();pb.paragraph_format.left_indent=Cm(0.3)
-        R(pb,'• ');R(pb,'Precipitates:',bold=True)
+        R(pb,'• ',size=11);R(pb,'Precipitates:',bold=True,size=11)
         pb=cell.add_paragraph();pb.paragraph_format.left_indent=Cm(0.8)
-        R(pb,'o ');R(pb,'Grain Boundaries: ',bold=True)
-        R(pb,'Fine and coarse precipitates, identified as likely ')
-        _add_carbide(pb)
-        R(pb,' and MC-type carbides, were observed along the grain boundaries.')
+        R(pb,'o ',size=11);R(pb,'Grain Boundaries: ',bold=True,size=11)
+        R(pb,'Fine and coarse precipitates, identified as likely ',size=11)
+        _add_carbide(pb,size=11)
+        R(pb,' and MC-type carbides, were observed along the grain boundaries.',size=11)
         pb=cell.add_paragraph();pb.paragraph_format.left_indent=Cm(0.8)
-        R(pb,'o ');R(pb,'Intra-granular: ',bold=True)
-        R(pb,'Coarse, blocky MC-type precipitates were found within the grains.')
+        R(pb,'o ',size=11);R(pb,'Intra-granular: ',bold=True,size=11)
+        R(pb,'Coarse, blocky MC-type precipitates were found within the grains.',size=11)
         if info['no_anom']:
             pb=cell.add_paragraph();pb.paragraph_format.left_indent=Cm(0.3)
-            R(pb,'• ');R(pb,'Anomalies: ',bold=True)
-            R(pb,'No evidence of detrimental needle-shaped (sigma or eta) precipitates were found at any examined location.')
+            R(pb,'• ',size=11);R(pb,'Anomalies: ',bold=True,size=11)
+            R(pb,'No evidence of detrimental needle-shaped (sigma or eta) precipitates were found at any examined location.',size=11)
 
     if '2' in figs:
-        add_two_col(doc,left_p4,figs['2']['bytes'],right_w=Cm(7.5),caption=caps.get('2','Fig 1.2'))
+        add_two_col(doc,left_p4,figs['2']['bytes'],right_w=Cm(13.5),left_w=Cm(12.0),caption=caps.get('2','Fig 1.2'))
     _new_landscape_page(doc)
 
     # ══ PAGES 5-8: SEM IMAGE GRIDS ═══════════════════════════
     def sem_page(nums, loc_lbl, page_num, next_portrait=False):
-        add_page_hdr(doc, page_num)
+        add_page_hdr(doc, page_num, landscape=True)
         present=[(n,figs[n]) for n in nums if n in figs]
         if not present:return
         cols=len(present)
-        img_w=Cm(5.2) if cols==3 else Cm(7.8)
-        col_w=Cm(5.5) if cols==3 else Cm(8.2)
+        img_w=Cm(8.2) if cols==3 else Cm(12.2)   # landscape content 25.7 cm
+        col_w=Cm(8.5) if cols==3 else Cm(12.5)
 
         t=doc.add_table(rows=2,cols=cols);t.alignment=WD_TABLE_ALIGNMENT.CENTER
         for ci,(fn,f) in enumerate(present):
@@ -476,7 +480,7 @@ def build(info, figs, out_path):
             cc=t.rows[1].cells[ci];cc.width=col_w;_nobdr(cc)
             cp=cc.paragraphs[0];cp.alignment=WD_ALIGN_PARAGRAPH.LEFT
             cp.paragraph_format.space_after=Pt(6)
-            R(cp,caps.get(fn,f'Fig 1.{fn}'),italic=True,size=9,color=GRAY)
+            R(cp,caps.get(fn,f'Fig 1.{fn}'),italic=True,size=11,color=GRAY)
 
         ll=doc.add_paragraph();ll.alignment=WD_ALIGN_PARAGRAPH.CENTER
         ll.paragraph_format.space_before=Pt(8)
