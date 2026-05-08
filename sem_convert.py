@@ -318,7 +318,7 @@ def extract_figures(pdf_path):
                 if re.match(r'\s*Fig(?:ure)?\s+1\.\d+\s+shows',lt) and bb[1]>400:
                     if bb[1]<cap_top:cap_top=bb[1]
 
-        crop=fitz.Rect(18,hdr_bot+5,pw-18,cap_top-4)
+        crop=fitz.Rect(18,hdr_bot+5,pw-18,cap_top+8)
         pix=page.get_pixmap(dpi=180,clip=crop)
         figs[fn]={'bytes':pix.tobytes('jpeg'),'w':pix.width,'h':pix.height}
 
@@ -546,10 +546,11 @@ def build(info, figs, out_path):
         img_cm = 8.2 if cols==3 else 12.5
         max_h  = 8.0                          # cap image height so captions stay on same page
 
-        # Single row: image + caption stacked in each cell — _cantSplit keeps entire row on one page
+        # Single row: image + caption stacked in each cell.
+        # No cantSplit on the row (that pushes the whole table off the header page).
+        # keep_with_next on image paragraphs keeps each image with its own caption.
         t=doc.add_table(rows=1,cols=cols);t.alignment=WD_TABLE_ALIGNMENT.CENTER
         _fix_table(t, cols * col_cm)
-        _cantSplit(t.rows[0])
         for ci,(fn,f) in enumerate(present):
             cell=t.rows[0].cells[ci];cell.width=Cm(col_cm);_nobdr(cell)
             ip=cell.paragraphs[0];ip.alignment=WD_ALIGN_PARAGRAPH.CENTER
