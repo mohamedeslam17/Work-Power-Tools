@@ -117,6 +117,31 @@ def _add_carbide(p, formula='M23C6', size=10):
         elif part:
             R(p, part, size=size)
 
+def _clean_caption(text):
+    """Strip unwanted phrases and replace ASCII symbols with Unicode in caption text."""
+    text = re.sub(r'\s*No indications? of needle[- ]?shaped precipitates[^.]*\.', '', text, flags=re.I)
+    text = re.sub(r'\bsecond[- ]?phase\s+', '', text, flags=re.I)
+    text = re.sub(r'\bgamma[- ]prime\b', 'γ′', text, flags=re.I)
+    text = re.sub(r'\bgamma\b', 'γ', text, flags=re.I)
+    return re.sub(r'\s+', ' ', text).strip()
+
+def _R_cap(p, text, size=11, color=None, italic=False, bold=False):
+    """Render caption text, subscripting digit sequences in M-type carbide formulas."""
+    for part in re.split(r'(M\d+C\d*)', text):
+        if re.fullmatch(r'M\d+C\d*', part):
+            for seg in re.split(r'(\d+)', part):
+                if not seg:
+                    continue
+                r = p.add_run(seg)
+                if seg.isdigit():
+                    r.font.subscript = True
+                r.font.size = Pt(size); r.font.name = 'Calibri'
+                r.bold = bold; r.italic = italic
+                if color:
+                    r.font.color.rgb = color
+        elif part:
+            R(p, part, size=size, color=color, italic=italic, bold=bold)
+
 # ── PDF helpers ───────────────────────────────────────────────
 def page_text(page):
     d=page.get_text("dict");spans=[]
@@ -323,7 +348,8 @@ def _fix_table(t, total_cm):
     L.set(qn('w:type'), 'fixed')
     tblPr.extend([W, L])
 
-def add_two_col(doc, left_content_fn, right_bytes, right_cm=13.5, left_cm=12.0, caption=''):
+def add_two_col(doc, left_content_fn, right_bytes, right_cm=13.5, left_cm=12.0,
+                caption='', img_pix=None, max_h_cm=12.5):
     t = doc.add_table(rows=1, cols=2)
     t.alignment = WD_TABLE_ALIGNMENT.CENTER
     _fix_table(t, left_cm + right_cm)
@@ -332,11 +358,19 @@ def add_two_col(doc, left_content_fn, right_bytes, right_cm=13.5, left_cm=12.0, 
     lc._tc.get_or_add_tcPr()
     left_content_fn(lc)
     ip = rc.add_paragraph(); ip.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    ip.add_run().add_picture(io.BytesIO(right_bytes), width=Cm(right_cm - 0.3))
+    max_w = right_cm - 0.3
+    if img_pix:
+        w_px, h_px = img_pix
+        pic_kw = dict(height=Cm(max_h_cm)) if (max_w * h_px / w_px) > max_h_cm else dict(width=Cm(max_w))
+    else:
+        pic_kw = dict(width=Cm(max_w))
+    ip.add_run().add_picture(io.BytesIO(right_bytes), **pic_kw)
     if caption:
-        cp = rc.add_paragraph(); cp.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        cp.paragraph_format.space_before = Pt(4)
-        R(cp, caption, italic=True, size=10, color=RED)
+        clean = _clean_caption(caption)
+        if clean:
+            cp = rc.add_paragraph(); cp.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            cp.paragraph_format.space_before = Pt(4)
+            _R_cap(cp, clean, size=10, color=RED, italic=True)
 
 def build(info, figs, out_path):
     doc = Document()
@@ -396,13 +430,15 @@ def build(info, figs, out_path):
     t2.paragraph_format.space_after=Pt(80)
     R(t2,'METALLURGICAL EVALUATION REPORT',bold=True,size=14,color=GRAY)
 
+    SW=[3.2, 5.1, 5.1, 2.6]   # total 16.0 cm, centred on 17 cm portrait
     sig=doc.add_table(rows=3,cols=4); sig.style='Table Grid'
-    sw=[Cm(3.0),Cm(4.8),Cm(4.8),Cm(2.4)]
+    sig.alignment=WD_TABLE_ALIGNMENT.CENTER
+    _fix_table(sig, sum(SW))
     for ri,row in enumerate([['','Name','Title','Date'],
         ['Submitted','Eslam Abdelmawla','Materials Engineer',info['date']],
         ['Approved','Khemichi Badri','Sr. Materials Engineer',info['date']]]):
         for ci,val in enumerate(row):
-            c=sig.rows[ri].cells[ci];c.width=sw[ci];_bdr(c)
+            c=sig.rows[ri].cells[ci];c.width=Cm(SW[ci]);_bdr(c)
             if ri==0:_bg(c,'F0F0F0')
             R(c.paragraphs[0],val,bold=(ri==0),size=9)
 
@@ -447,7 +483,9 @@ def build(info, figs, out_path):
             R(pb,'• ',bold=True,size=11); R(pb,lbl+': ',bold=True,size=11); R(pb,val,size=11)
 
     if '1' in figs:
-        add_two_col(doc,left_p3,figs['1']['bytes'],right_cm=13.5,left_cm=12.0,caption=caps.get('1','Fig 1.1'))
+        f1=figs['1']
+        add_two_col(doc,left_p3,f1['bytes'],right_cm=13.5,left_cm=12.0,
+                    caption=caps.get('1','Fig 1.1'),img_pix=(f1['w'],f1['h']))
     else:
         left_p3_para=doc.add_paragraph(); left_p3(left_p3_para)
 
@@ -475,13 +513,11 @@ def build(info, figs, out_path):
         pb=cell.add_paragraph();pb.paragraph_format.left_indent=Cm(0.8)
         R(pb,'o ',size=11);R(pb,'Intra-granular: ',bold=True,size=11)
         R(pb,'Coarse, blocky MC-type precipitates were found within the grains.',size=11)
-        if info['no_anom']:
-            pb=cell.add_paragraph();pb.paragraph_format.left_indent=Cm(0.3)
-            R(pb,'• ',size=11);R(pb,'Anomalies: ',bold=True,size=11)
-            R(pb,'No evidence of detrimental needle-shaped (sigma or eta) precipitates were found at any examined location.',size=11)
 
     if '2' in figs:
-        add_two_col(doc,left_p4,figs['2']['bytes'],right_cm=13.5,left_cm=12.0,caption=caps.get('2','Fig 1.2'))
+        f2=figs['2']
+        add_two_col(doc,left_p4,f2['bytes'],right_cm=13.5,left_cm=12.0,
+                    caption=caps.get('2','Fig 1.2'),img_pix=(f2['w'],f2['h']))
     _new_landscape_page(doc)
 
     # ══ PAGES 5-8: SEM IMAGE GRIDS ═══════════════════════════
@@ -503,7 +539,7 @@ def build(info, figs, out_path):
             cc=t.rows[1].cells[ci];cc.width=Cm(col_cm);_nobdr(cc)
             cp=cc.paragraphs[0];cp.alignment=WD_ALIGN_PARAGRAPH.LEFT
             cp.paragraph_format.space_after=Pt(6)
-            R(cp,caps.get(fn,f'Fig 1.{fn}'),italic=True,size=11,color=GRAY)
+            _R_cap(cp,_clean_caption(caps.get(fn,f'Fig 1.{fn}')),size=11,color=GRAY,italic=True)
 
         ll=doc.add_paragraph();ll.alignment=WD_ALIGN_PARAGRAPH.CENTER
         ll.paragraph_format.space_before=Pt(8)
