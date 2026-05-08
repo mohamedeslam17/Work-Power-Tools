@@ -303,15 +303,36 @@ def extract_figures(pdf_path):
 # ══════════════════════════════════════════════════════════════
 # BUILD DOCX
 # ══════════════════════════════════════════════════════════════
-def add_two_col(doc, left_content_fn, right_bytes, right_w=Cm(13.5), left_w=Cm(12.0), caption=''):
+def tw(cm):
+    """Centimetres → OOXML twips (twentieths of a point)."""
+    return round(cm * 1440 / 2.54)
+
+def _fix_table(t, total_cm):
+    """Force fixed total width + disable Word auto-fit on a table."""
+    tbl = t._tbl
+    tblPr = tbl.find(qn('w:tblPr'))
+    if tblPr is None:
+        tblPr = OxmlElement('w:tblPr')
+        tbl.insert(0, tblPr)
+    for tag in (qn('w:tblW'), qn('w:tblLayout')):
+        for old in tblPr.findall(tag):
+            tblPr.remove(old)
+    W = OxmlElement('w:tblW')
+    W.set(qn('w:w'), str(tw(total_cm))); W.set(qn('w:type'), 'dxa')
+    L = OxmlElement('w:tblLayout')
+    L.set(qn('w:type'), 'fixed')
+    tblPr.extend([W, L])
+
+def add_two_col(doc, left_content_fn, right_bytes, right_cm=13.5, left_cm=12.0, caption=''):
     t = doc.add_table(rows=1, cols=2)
     t.alignment = WD_TABLE_ALIGNMENT.CENTER
-    lc = t.rows[0].cells[0]; lc.width = left_w;  _nobdr(lc)
-    rc = t.rows[0].cells[1]; rc.width = right_w; _nobdr(rc)
+    _fix_table(t, left_cm + right_cm)
+    lc = t.rows[0].cells[0]; lc.width = Cm(left_cm);  _nobdr(lc)
+    rc = t.rows[0].cells[1]; rc.width = Cm(right_cm); _nobdr(rc)
     lc._tc.get_or_add_tcPr()
     left_content_fn(lc)
     ip = rc.add_paragraph(); ip.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    ip.add_run().add_picture(io.BytesIO(right_bytes), width=right_w - Cm(0.3))
+    ip.add_run().add_picture(io.BytesIO(right_bytes), width=Cm(right_cm - 0.3))
     if caption:
         cp = rc.add_paragraph(); cp.alignment = WD_ALIGN_PARAGRAPH.CENTER
         cp.paragraph_format.space_before = Pt(4)
@@ -332,9 +353,9 @@ def build(info, figs, out_path):
     total = 9
 
     # ── shared logo+header table ──────────────────────────────
-    # Portrait (17 cm content) and landscape (25.7 cm content) header column widths
-    ws_p  = [Cm(8.2), Cm(4.2), Cm(1.6), Cm(1.6), Cm(1.4)]   # total 17.0 cm
-    ws_ls = [Cm(12.4), Cm(6.3), Cm(2.4), Cm(2.4), Cm(2.2)]  # total 25.7 cm
+    # Portrait (17 cm content) and landscape (25.7 cm content) header column widths (plain cm)
+    WS_P  = [8.2, 4.2, 1.6, 1.6, 1.4]    # total 17.0 cm
+    WS_LS = [12.4, 6.3, 2.4, 2.4, 2.2]   # total 25.7 cm
 
     def add_logo(doc):
         lp=doc.add_paragraph(); lp.alignment=WD_ALIGN_PARAGRAPH.CENTER
@@ -343,16 +364,17 @@ def build(info, figs, out_path):
         R(lp,"|",size=24,color=RED); R(lp,"energia",size=24,color=RGBColor(0x8B,0x8B,0x8B))
 
     def add_info_table(doc, page_num, landscape=False):
-        ws = ws_ls if landscape else ws_p
+        ws = WS_LS if landscape else WS_P
         t=doc.add_table(rows=2,cols=5);t.style='Table Grid'
         t.alignment=WD_TABLE_ALIGNMENT.CENTER
+        _fix_table(t, sum(ws))
         for j,h in enumerate(['Project / Title','Job Number.','Rev.','page','Of']):
-            c=t.rows[0].cells[j];c.width=ws[j];_bdr(c,'888888',2)
+            c=t.rows[0].cells[j];c.width=Cm(ws[j]);_bdr(c,'888888',2)
             R(c.paragraphs[0],h,size=8,color=GRAY)
         for j,(val,bold,sz) in enumerate([
             ('SEM Metallurgical Evaluation Report',False,10),(f"JC. {info['job']}",True,11),
             ('0',False,10),(str(page_num),False,10),(str(total),False,10)]):
-            c=t.rows[1].cells[j];c.width=ws[j];_bdr(c,'888888',2)
+            c=t.rows[1].cells[j];c.width=Cm(ws[j]);_bdr(c,'888888',2)
             p=c.paragraphs[0];p.paragraph_format.space_before=Pt(2);p.paragraph_format.space_after=Pt(2)
             if j==1:R(p,val,bold=True,size=sz);pp=c.add_paragraph();R(pp,info['stage'],size=8,color=GRAY)
             else:R(p,val,bold=bold,size=sz)
@@ -425,7 +447,7 @@ def build(info, figs, out_path):
             R(pb,'• ',bold=True,size=11); R(pb,lbl+': ',bold=True,size=11); R(pb,val,size=11)
 
     if '1' in figs:
-        add_two_col(doc,left_p3,figs['1']['bytes'],right_w=Cm(13.5),left_w=Cm(12.0),caption=caps.get('1','Fig 1.1'))
+        add_two_col(doc,left_p3,figs['1']['bytes'],right_cm=13.5,left_cm=12.0,caption=caps.get('1','Fig 1.1'))
     else:
         left_p3_para=doc.add_paragraph(); left_p3(left_p3_para)
 
@@ -459,7 +481,7 @@ def build(info, figs, out_path):
             R(pb,'No evidence of detrimental needle-shaped (sigma or eta) precipitates were found at any examined location.',size=11)
 
     if '2' in figs:
-        add_two_col(doc,left_p4,figs['2']['bytes'],right_w=Cm(13.5),left_w=Cm(12.0),caption=caps.get('2','Fig 1.2'))
+        add_two_col(doc,left_p4,figs['2']['bytes'],right_cm=13.5,left_cm=12.0,caption=caps.get('2','Fig 1.2'))
     _new_landscape_page(doc)
 
     # ══ PAGES 5-8: SEM IMAGE GRIDS ═══════════════════════════
@@ -468,16 +490,17 @@ def build(info, figs, out_path):
         present=[(n,figs[n]) for n in nums if n in figs]
         if not present:return
         cols=len(present)
-        img_w=Cm(8.2) if cols==3 else Cm(12.2)   # landscape content 25.7 cm
-        col_w=Cm(8.5) if cols==3 else Cm(12.5)
+        col_cm = 8.5 if cols==3 else 12.8   # landscape content 25.7 cm
+        img_cm = 8.2 if cols==3 else 12.5
 
         t=doc.add_table(rows=2,cols=cols);t.alignment=WD_TABLE_ALIGNMENT.CENTER
+        _fix_table(t, cols * col_cm)
         for ci,(fn,f) in enumerate(present):
-            ic=t.rows[0].cells[ci];ic.width=col_w;_nobdr(ic)
+            ic=t.rows[0].cells[ci];ic.width=Cm(col_cm);_nobdr(ic)
             ip=ic.paragraphs[0];ip.alignment=WD_ALIGN_PARAGRAPH.CENTER
             ip.paragraph_format.space_before=Pt(6)
-            ip.add_run().add_picture(io.BytesIO(f['bytes']),width=img_w)
-            cc=t.rows[1].cells[ci];cc.width=col_w;_nobdr(cc)
+            ip.add_run().add_picture(io.BytesIO(f['bytes']),width=Cm(img_cm))
+            cc=t.rows[1].cells[ci];cc.width=Cm(col_cm);_nobdr(cc)
             cp=cc.paragraphs[0];cp.alignment=WD_ALIGN_PARAGRAPH.LEFT
             cp.paragraph_format.space_after=Pt(6)
             R(cp,caps.get(fn,f'Fig 1.{fn}'),italic=True,size=11,color=GRAY)
