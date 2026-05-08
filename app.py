@@ -12,17 +12,31 @@ st.set_page_config(
 
 st.title("SEM Metallurgical Report Converter")
 st.markdown(
-    "Upload the vendor SEM PDF to generate a formatted **Ansaldo Energia** Word report. "
-    "Optionally add the companion `_R.pdf` for heat treatment condition and conclusion text."
+    "Upload the vendor SEM PDF and fill in the fields below, "
+    "then click **Convert** to download the formatted Ansaldo Energia Word report."
 )
 
 st.divider()
 
 vendor_file = st.file_uploader("Vendor PDF *(required)*", type=["pdf"])
-r_file = st.file_uploader(
-    "Companion `_R.pdf` *(optional — heat treatment & conclusion)*",
-    type=["pdf"]
+
+st.subheader("Report Fields")
+col1, col2 = st.columns(2)
+ht_input = col1.text_input(
+    "Heat Treatment Condition",
+    placeholder="e.g. Aged / Solution Treated / Over-aged"
 )
+ia_input = col2.text_input(
+    "Incoming Assessment",
+    placeholder="e.g. Heavy Repair / Light Repair / Serviceable"
+)
+conclusion_input = st.text_area(
+    "Conclusion",
+    placeholder="Enter the conclusion text for the report...",
+    height=160
+)
+
+st.divider()
 
 if vendor_file:
     if st.button("Convert to Word Report", type="primary", use_container_width=True):
@@ -32,17 +46,20 @@ if vendor_file:
                 with open(vendor_path, "wb") as f:
                     f.write(vendor_file.read())
 
-                if r_file:
-                    stem = Path(vendor_file.name).stem
-                    r_path = os.path.join(tmp, f"{stem}_R.pdf")
-                    with open(r_path, "wb") as f:
-                        f.write(r_file.read())
-
                 out_name = f"Ansaldo_{Path(vendor_file.name).stem}.docx"
                 out_path = os.path.join(tmp, out_name)
 
                 try:
                     info = parse(vendor_path)
+
+                    # Manual fields override PDF-extracted values
+                    if ht_input.strip():
+                        info['ht'] = ht_input.strip()
+                    if ia_input.strip():
+                        info['ia'] = ia_input.strip()
+                    if conclusion_input.strip():
+                        info['conclusion'] = conclusion_input.strip()
+
                     figs = extract_figures(vendor_path)
                     build(info, figs, out_path)
 
