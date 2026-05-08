@@ -10,6 +10,7 @@ from docx import Document
 from docx.shared import Pt, RGBColor, Cm
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.table import WD_TABLE_ALIGNMENT
+from docx.enum.section import WD_SECTION_START
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 
@@ -40,24 +41,14 @@ def R(p,text,bold=False,size=10,color=None,italic=False):
 def SP(doc,h=2):
     p=doc.add_paragraph();p.paragraph_format.space_before=Pt(h);p.paragraph_format.space_after=Pt(h)
 
-def _portrait_section_break(doc):
-    """End current section with explicit portrait A4 settings, starting a new page."""
-    p = doc.add_paragraph()
-    p.paragraph_format.space_before = Pt(0)
-    p.paragraph_format.space_after = Pt(0)
-    pPr = p._p.get_or_add_pPr()
-    sectPr = OxmlElement('w:sectPr')
-    pgSz = OxmlElement('w:pgSz')
-    pgSz.set(qn('w:w'), '11906')   # 21 cm in twips
-    pgSz.set(qn('w:h'), '16838')   # 29.7 cm in twips
-    sectPr.append(pgSz)
-    pgMar = OxmlElement('w:pgMar')
-    pgMar.set(qn('w:top'), '1134')
-    pgMar.set(qn('w:right'), '1134')
-    pgMar.set(qn('w:bottom'), '1134')
-    pgMar.set(qn('w:left'), '1134')
-    sectPr.append(pgMar)
-    pPr.append(sectPr)
+def _new_portrait_page(doc):
+    """Start a new portrait A4 page using a proper next-page section break."""
+    new_sec = doc.add_section(WD_SECTION_START.NEW_PAGE)
+    new_sec.page_width = Cm(21)
+    new_sec.page_height = Cm(29.7)
+    new_sec.left_margin = new_sec.right_margin = Cm(2)
+    new_sec.top_margin = new_sec.bottom_margin = Cm(2)
+    # footer.is_linked_to_previous defaults to True → inherits PAGE field from first section
 
 def _toc_entry(doc, label, pg):
     """TOC line with right-aligned page number and dot leader via tab stop."""
@@ -245,29 +236,34 @@ def extract_figures(pdf_path):
         fn=m.group(1)
         if fn in figs:continue
 
-        # Fig 1.1 — full as-received image (bag + specimen), white out any text overlay
+        # Fig 1.1 — render full page image area (bag + specimen together),
+        # then white out any text overlaid within that area (removes embedded caption box)
         if fn=='1':
-            imgs=page.get_image_info(xrefs=True)
-            large=[img for img in imgs if img.get('width',0)>300 and img.get('height',0)>200
-                   and img.get('xref',0)!=19]   # skip logo
-            large.sort(key=lambda img:img['bbox'][1])
-            if large:
-                bbox=large[0]['bbox']
-                img_rect=fitz.Rect(bbox[0],bbox[1],bbox[2],bbox[3])
-                # White out any text blocks overlaid on the image
-                shape=page.new_shape()
-                hit=False
-                for block in page.get_text("dict")["blocks"]:
-                    if block.get("type")==0:
-                        br=fitz.Rect(block["bbox"])
-                        if img_rect.intersects(br):
-                            shape.draw_rect(br);hit=True
-                if hit:
-                    shape.finish(fill=(1,1,1),color=(1,1,1),width=0)
-                    shape.commit()
-                pix=page.get_pixmap(dpi=180,clip=img_rect)
-                figs[fn]={'bytes':pix.tobytes('jpeg'),'w':pix.width,'h':pix.height}
-                continue
+            pw=page.rect.width;ph=page.rect.height
+            d1=page.get_text("dict");hdr_bot=80.0;cap_top=ph-220.0
+            for b in d1["blocks"]:
+                if b.get("type")!=0:continue
+                for line in b.get("lines",[]):
+                    lt=' '.join(s["text"] for s in line.get("spans",[]))
+                    bb=line["bbox"]
+                    if re.search(r'As-received|SEM Analysis',lt):
+                        if bb[3]>hdr_bot:hdr_bot=bb[3]
+                    if re.match(r'\s*Fig(?:ure)?\s+1\.\d+\s+shows',lt) and bb[1]>400:
+                        if bb[1]<cap_top:cap_top=bb[1]
+            crop_rect=fitz.Rect(18,hdr_bot+5,pw-18,cap_top-4)
+            shape=page.new_shape()
+            hit=False
+            for block in d1["blocks"]:
+                if block.get("type")==0:
+                    br=fitz.Rect(block["bbox"])
+                    if crop_rect.intersects(br):
+                        shape.draw_rect(br);hit=True
+            if hit:
+                shape.finish(fill=(1,1,1),color=(1,1,1),width=0)
+                shape.commit()
+            pix=page.get_pixmap(dpi=180,clip=crop_rect)
+            figs[fn]={'bytes':pix.tobytes('jpeg'),'w':pix.width,'h':pix.height}
+            continue
 
         # All other figures — crop from header to just above caption
         pw=page.rect.width;ph=page.rect.height
@@ -369,7 +365,7 @@ def build(info, figs, out_path):
             if ri==0:_bg(c,'F0F0F0')
             R(c.paragraphs[0],val,bold=(ri==0),size=9)
 
-    _portrait_section_break(doc)
+    _new_portrait_page(doc)
 
     # ══ PAGE 2: TOC ══════════════════════════════════════════
     add_page_hdr(doc, 2)
@@ -386,7 +382,7 @@ def build(info, figs, out_path):
                      ('SUMMARY OF γ′ PRECIPITATE MEASUREMENTS','9'),('CONCLUSION','9')]:
         _toc_entry(doc, label, pg)
 
-    _portrait_section_break(doc)
+    _new_portrait_page(doc)
 
     # ══ PAGE 3: INTRO + RECAP (left) | FIG 1.1 (right) ══════
     add_page_hdr(doc,3)
@@ -414,7 +410,7 @@ def build(info, figs, out_path):
     else:
         left_p3_para=doc.add_paragraph(); left_p3(left_p3_para)
 
-    _portrait_section_break(doc)
+    _new_portrait_page(doc)
 
     # ══ PAGE 4: MICROSTRUCTURE (left) | FIG 1.2 (right) ═════
     add_page_hdr(doc,4)
@@ -445,7 +441,7 @@ def build(info, figs, out_path):
 
     if '2' in figs:
         add_two_col(doc,left_p4,figs['2']['bytes'],right_w=Cm(7.5),caption=caps.get('2','Fig 1.2'))
-    _portrait_section_break(doc)
+    _new_portrait_page(doc)
 
     # ══ PAGES 5-8: SEM IMAGE GRIDS ═══════════════════════════
     def sem_page(nums, loc_lbl, page_num):
@@ -470,7 +466,7 @@ def build(info, figs, out_path):
         ll=doc.add_paragraph();ll.alignment=WD_ALIGN_PARAGRAPH.CENTER
         ll.paragraph_format.space_before=Pt(8)
         R(ll,loc_lbl,bold=True,size=12)
-        _portrait_section_break(doc)
+        _new_portrait_page(doc)
 
     sem_page(['3','4','5'],'Location 1',5)
     sem_page(['6','7'],'Location 1',6)
