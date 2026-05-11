@@ -22,13 +22,21 @@ vendor_file = st.file_uploader("Vendor PDF *(required)*", type=["pdf"])
 
 st.subheader("Report Fields")
 col1, col2 = st.columns(2)
-ht_input = col1.text_input(
+ht_input = col1.selectbox(
     "Heat Treatment Condition",
-    placeholder="e.g. Aged / Solution Treated / Over-aged"
+    [
+        "Full reheat treated condition, including aging.",
+        "Solution treated",
+        "Aged",
+        "Over-aged",
+        "As-received",
+    ],
+    index=0
 )
-ia_input = col2.text_input(
+ia_input = col2.selectbox(
     "Incoming Assessment",
-    placeholder="e.g. Heavy Repair / Light Repair / Serviceable"
+    ["Medium Repair", "Heavy Repair", "Light Repair"],
+    index=0
 )
 conclusion_input = st.text_area(
     "Conclusion",
@@ -52,11 +60,9 @@ if vendor_file:
                 try:
                     info = parse(vendor_path)
 
-                    # Manual fields override PDF-extracted values
-                    if ht_input.strip():
-                        info['ht'] = ht_input.strip()
-                    if ia_input.strip():
-                        info['ia'] = ia_input.strip()
+                    # Dropdown selections always override PDF-extracted values
+                    info['ht'] = ht_input
+                    info['ia'] = ia_input
                     if conclusion_input.strip():
                         info['conclusion'] = conclusion_input.strip()
 

@@ -19,7 +19,7 @@ NAVY = RGBColor(0x1A,0x1A,0x2E)
 GRAY = RGBColor(0x55,0x55,0x55)
 WHITE= RGBColor(0xFF,0xFF,0xFF)
 
-# ── helpers ───────────────────────────────────────────────────
+# ── helpers ─────────────────────────────────────────────
 def _bg(c,h):
     tc=c._tc;p=tc.get_or_add_tcPr();s=OxmlElement("w:shd")
     s.set(qn("w:val"),"clear");s.set(qn("w:color"),"auto");s.set(qn("w:fill"),h);p.append(s)
@@ -56,14 +56,14 @@ def _set_page_size(new_sec, w_twips, h_twips, landscape=False):
 def _new_portrait_page(doc):
     new_sec = doc.add_section(WD_SECTION_START.NEW_PAGE)
     _set_page_size(new_sec, 11906, 16838)          # A4 portrait  21 × 29.7 cm
-    new_sec.left_margin = new_sec.right_margin = Cm(2)
-    new_sec.top_margin  = new_sec.bottom_margin = Cm(2)
+    new_sec.left_margin = new_sec.right_margin = Cm(1.5)
+    new_sec.top_margin  = new_sec.bottom_margin = Cm(1.5)
 
 def _new_landscape_page(doc):
     new_sec = doc.add_section(WD_SECTION_START.NEW_PAGE)
     _set_page_size(new_sec, 16838, 11906, landscape=True)  # A4 landscape 29.7 × 21 cm
-    new_sec.left_margin = new_sec.right_margin = Cm(2)
-    new_sec.top_margin  = new_sec.bottom_margin = Cm(2)
+    new_sec.left_margin = new_sec.right_margin = Cm(1.5)
+    new_sec.top_margin  = new_sec.bottom_margin = Cm(1.5)
 
 def _toc_entry(doc, label, pg):
     """TOC line with right-aligned page number and dot leader via tab stop."""
@@ -74,7 +74,7 @@ def _toc_entry(doc, label, pg):
     tabs = OxmlElement('w:tabs')
     tab = OxmlElement('w:tab')
     tab.set(qn('w:val'), 'right')
-    tab.set(qn('w:pos'), '9638')   # 17 cm content width in twips
+    tab.set(qn('w:pos'), '10205')  # 18 cm content width in twips
     tab.set(qn('w:leader'), 'dot')
     tabs.append(tab)
     pPr.append(tabs)
@@ -142,7 +142,7 @@ def _R_cap(p, text, size=11, color=None, italic=False, bold=False):
         elif part:
             R(p, part, size=size, color=color, italic=italic, bold=bold)
 
-# ── PDF helpers ───────────────────────────────────────────────
+# ── PDF helpers ─────────────────────────────────────────────
 def page_text(page):
     d=page.get_text("dict");spans=[]
     for b in d["blocks"]:
@@ -361,8 +361,8 @@ def _cantSplit(row):
     cs.set(qn('w:val'), '1')
     trPr.append(cs)
 
-def add_two_col(doc, left_content_fn, right_bytes, right_cm=13.5, left_cm=12.0,
-                caption='', img_pix=None, max_h_cm=8.0):
+def add_two_col(doc, left_content_fn, right_bytes, right_cm=14.0, left_cm=12.5,
+                caption='', img_pix=None, max_h_cm=10.0):
     t = doc.add_table(rows=1, cols=2)
     t.alignment = WD_TABLE_ALIGNMENT.CENTER
     _fix_table(t, left_cm + right_cm)
@@ -384,16 +384,16 @@ def add_two_col(doc, left_content_fn, right_bytes, right_cm=13.5, left_cm=12.0,
         clean = _clean_caption(caption)
         if clean:
             cp = rc.add_paragraph(); cp.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-            cp.paragraph_format.space_before = Pt(4)
+            cp.paragraph_format.space_before = Pt(6)
             cp.paragraph_format.keep_together = True
-            _R_cap(cp, clean, size=10, color=RED, italic=True)
+            _R_cap(cp, clean, size=11, color=RED, italic=True)
 
 def build(info, figs, out_path):
     doc = Document()
     sec = doc.sections[0]
     sec.page_width=Cm(21); sec.page_height=Cm(29.7)
-    sec.left_margin=sec.right_margin=Cm(2)
-    sec.top_margin=sec.bottom_margin=Cm(2)
+    sec.left_margin=sec.right_margin=Cm(1.5)
+    sec.top_margin=sec.bottom_margin=Cm(1.5)
     sec.header.is_linked_to_previous = False
     for p in sec.header.paragraphs: p.clear()
     _setup_footer(sec)
@@ -402,10 +402,10 @@ def build(info, figs, out_path):
     caps = info['captions']
     total = 9
 
-    # ── shared logo+header table ──────────────────────────────
-    # Portrait (17 cm content) and landscape (25.7 cm content) header column widths (plain cm)
-    WS_P  = [8.2, 4.2, 1.6, 1.6, 1.4]    # total 17.0 cm
-    WS_LS = [12.4, 6.3, 2.4, 2.4, 2.2]   # total 25.7 cm
+    # ── shared logo+header table ──────────────────────────────────────────
+    # Portrait (18 cm content) and landscape (26.7 cm content) header column widths (plain cm)
+    WS_P  = [9.2, 4.2, 1.7, 1.6, 1.3]    # total 18.0 cm
+    WS_LS = [13.4, 6.3, 2.4, 2.4, 2.2]   # total 26.7 cm
 
     def add_logo(doc):
         lp=doc.add_paragraph(); lp.alignment=WD_ALIGN_PARAGRAPH.CENTER
@@ -430,20 +430,19 @@ def build(info, figs, out_path):
             else:R(p,val,bold=bold,size=sz)
 
     def add_page_hdr(doc, page_num, landscape=False):
-        add_logo(doc)
         add_info_table(doc, page_num, landscape=landscape)
         SP(doc,6)
 
-    # ══ PAGE 1: COVER ════════════════════════════════════════
+    # ══ PAGE 1: COVER ════════════════════════════════════════════════
     add_logo(doc)
     add_info_table(doc, 1)
 
     SP(doc,12)
     t1=doc.add_paragraph(); t1.alignment=WD_ALIGN_PARAGRAPH.CENTER
-    t1.paragraph_format.space_before=Pt(60)
+    t1.paragraph_format.space_before=Pt(100)
     R(t1,'SCANNING ELECTRON MICROSCOPY',bold=True,size=20,color=NAVY)
     t2=doc.add_paragraph(); t2.alignment=WD_ALIGN_PARAGRAPH.CENTER
-    t2.paragraph_format.space_after=Pt(80)
+    t2.paragraph_format.space_after=Pt(220)
     R(t2,'METALLURGICAL EVALUATION REPORT',bold=True,size=14,color=GRAY)
 
     SW=[3.2, 5.1, 5.1, 2.6]   # total 16.0 cm, centred on 17 cm portrait
@@ -460,7 +459,7 @@ def build(info, figs, out_path):
 
     _new_portrait_page(doc)
 
-    # ══ PAGE 2: TOC ══════════════════════════════════════════
+    # ══ PAGE 2: TOC ══════════════════════════════════════════════════
     add_page_hdr(doc, 2)
     SP(doc,4)
     h=doc.add_paragraph();h.paragraph_format.space_before=Pt(6);h.paragraph_format.space_after=Pt(10)
@@ -500,7 +499,7 @@ def build(info, figs, out_path):
 
     if '1' in figs:
         f1=figs['1']
-        add_two_col(doc,left_p3,f1['bytes'],right_cm=13.5,left_cm=12.0,
+        add_two_col(doc,left_p3,f1['bytes'],right_cm=14.0,left_cm=12.5,
                     caption=caps.get('1','Fig 1.1'),img_pix=(f1['w'],f1['h']))
     else:
         left_p3_para=doc.add_paragraph(); left_p3(left_p3_para)
@@ -532,19 +531,19 @@ def build(info, figs, out_path):
 
     if '2' in figs:
         f2=figs['2']
-        add_two_col(doc,left_p4,f2['bytes'],right_cm=13.5,left_cm=12.0,
+        add_two_col(doc,left_p4,f2['bytes'],right_cm=14.0,left_cm=12.5,
                     caption=caps.get('2','Fig 1.2'),img_pix=(f2['w'],f2['h']))
     _new_landscape_page(doc)
 
-    # ══ PAGES 5-8: SEM IMAGE GRIDS ═══════════════════════════
+    # ══ PAGES 5-8: SEM IMAGE GRIDS ═════════════════════
     def sem_page(nums, loc_lbl, page_num, next_portrait=False):
         add_page_hdr(doc, page_num, landscape=True)
         present=[(n,figs[n]) for n in nums if n in figs]
         if not present:return
         cols=len(present)
-        col_cm = 8.5 if cols==3 else 12.8   # landscape content 25.7 cm
-        img_cm = 8.2 if cols==3 else 12.5
-        max_h  = 7.5 if cols==3 else 9.5
+        col_cm = 8.85 if cols==3 else 13.3   # landscape content 26.7 cm
+        img_cm = 8.55 if cols==3 else 13.0
+        max_h  = 8.5  if cols==3 else 10.5
 
         # Single row: image + caption stacked in each cell.
         # cantSplit prevents the row splitting if content is unexpectedly tall.
@@ -560,9 +559,10 @@ def build(info, figs, out_path):
             pic_kw=dict(height=Cm(max_h)) if (img_cm*h_px/w_px)>max_h else dict(width=Cm(img_cm))
             ip.add_run().add_picture(io.BytesIO(f['bytes']),**pic_kw)
             cp=cell.add_paragraph();cp.alignment=WD_ALIGN_PARAGRAPH.JUSTIFY
-            cp.paragraph_format.space_after=Pt(6)
+            cp.paragraph_format.space_before=Pt(5)
+            cp.paragraph_format.space_after=Pt(8)
             cp.paragraph_format.keep_together=True
-            _R_cap(cp,_clean_caption(caps.get(fn,f'Fig 1.{fn}')),size=11,color=GRAY,italic=True)
+            _R_cap(cp,_clean_caption(caps.get(fn,f'Fig 1.{fn}')),size=12,color=GRAY,italic=True)
 
         ll=doc.add_paragraph();ll.alignment=WD_ALIGN_PARAGRAPH.CENTER
         ll.paragraph_format.space_before=Pt(8)
@@ -580,7 +580,7 @@ def build(info, figs, out_path):
     else:
         sem_page(['11','12'],'Location 2',8,next_portrait=True)
 
-    # ══ PAGE 9: SUMMARY + CONCLUSION ═════════════════════════
+    # ══ PAGE 9: SUMMARY + CONCLUSION ═════════════════
     add_page_hdr(doc,9)
 
     h=doc.add_paragraph();h.paragraph_format.space_before=Pt(10);h.paragraph_format.space_after=Pt(6)
