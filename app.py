@@ -40,7 +40,12 @@ ia_input = col2.selectbox(
 )
 conclusion_input = st.text_area(
     "Conclusion",
-    placeholder="Enter the conclusion text for the report...",
+    placeholder=(
+        "Leave blank to use an auto-generated conclusion based on the extracted "
+        "Job Number and Serial Number (e.g. 'Based on these findings, the examined "
+        "bucket (Job XXXX, S/N: YYYY) is considered suitable for reconditioning…'). "
+        "Enter text here to override."
+    ),
     height=160
 )
 

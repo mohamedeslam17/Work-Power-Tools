@@ -119,7 +119,7 @@ def _add_carbide(p, formula='M23C6', size=10):
 
 def _clean_caption(text):
     """Strip unwanted phrases and replace ASCII symbols with Unicode in caption text."""
-    text = re.sub(r'\s*No indications? of[^.]*precipitates[^.]*\.', '', text, flags=re.I)
+    text = re.sub(r'\s*No indications? of[^.]*(?:eutectic|precipitat(?:es|ions))[^.]*\.', '', text, flags=re.I)
     text = re.sub(r'\bsecond[- ]?phase\s+', '', text, flags=re.I)
     text = re.sub(r'\bgamma[- ]prime\b', 'γ′', text, flags=re.I)
     text = re.sub(r'\bgamma\b', 'γ', text, flags=re.I)
@@ -230,6 +230,12 @@ def parse(pdf_path):
     if not conclusion:
         cm=re.search(r'(The metallurgical evaluation.+?NDT inspections\.)',full,re.DOTALL|re.I)
         if cm:conclusion=re.sub(r'\s+',' ',cm.group(1)).strip()
+    if not conclusion:
+        conclusion=(
+            f"Based on these findings, the examined bucket (Job {job}, S/N: {serial}) "
+            f"is considered suitable for reconditioning, subject to completion of standard "
+            f"NDT inspection prior to return to service."
+        )
 
     captions={}
     for page in vendor:
@@ -543,7 +549,7 @@ def build(info, figs, out_path):
         cols=len(present)
         col_cm = 8.85 if cols==3 else 13.3   # landscape content 26.7 cm
         img_cm = 8.55 if cols==3 else 13.0
-        max_h  = 8.5  if cols==3 else 10.5
+        max_h  = 7.5  if cols==3 else 9.0
 
         # Single row: image + caption stacked in each cell.
         # cantSplit prevents the row splitting if content is unexpectedly tall.
@@ -562,7 +568,7 @@ def build(info, figs, out_path):
             cp.paragraph_format.space_before=Pt(5)
             cp.paragraph_format.space_after=Pt(8)
             cp.paragraph_format.keep_together=True
-            _R_cap(cp,_clean_caption(caps.get(fn,f'Fig 1.{fn}')),size=12,color=GRAY,italic=True)
+            _R_cap(cp,_clean_caption(caps.get(fn,f'Fig 1.{fn}')),size=11,color=GRAY,italic=True)
 
         ll=doc.add_paragraph();ll.alignment=WD_ALIGN_PARAGRAPH.CENTER
         ll.paragraph_format.space_before=Pt(8)
