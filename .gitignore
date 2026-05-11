@@ -1,5 +1,6 @@
 __pycache__/
-*.pyc
+*.py[cod]
 *.pyo
 .env
-*.tmp
+*.docx
+*.pdf
