@@ -1,6 +1,8 @@
 import streamlit as st
 import tempfile
 import os
+import zipfile
+import io
 from pathlib import Path
 from sem_convert import parse, extract_figures, build
 
@@ -12,13 +14,17 @@ st.set_page_config(
 
 st.title("SEM Metallurgical Report Converter")
 st.markdown(
-    "Upload the vendor SEM PDF and fill in the fields below, "
-    "then click **Convert** to download the formatted Ansaldo Energia Word report."
+    "Upload one or more vendor SEM PDFs and fill in the fields below, "
+    "then click **Generate** to build the Ansaldo Energia Word report(s)."
 )
 
 st.divider()
 
-vendor_file = st.file_uploader("Vendor PDF *(required)*", type=["pdf"])
+vendor_files = st.file_uploader(
+    "Vendor PDF(s) *(required)*",
+    type=["pdf"],
+    accept_multiple_files=True,
+)
 
 st.subheader("Report Fields")
 col1, col2 = st.columns(2)
@@ -46,52 +52,88 @@ conclusion_input = st.text_area(
 
 st.divider()
 
-if vendor_file:
-    if st.button("Convert to Word Report", type="primary", use_container_width=True):
-        with st.spinner("Parsing PDF and extracting figures..."):
-            with tempfile.TemporaryDirectory() as tmp:
-                vendor_path = os.path.join(tmp, vendor_file.name)
-                with open(vendor_path, "wb") as f:
-                    f.write(vendor_file.read())
+if vendor_files:
+    btn_col1, btn_col2 = st.columns(2)
 
-                out_name = f"Ansaldo_{Path(vendor_file.name).stem}.docx"
-                out_path = os.path.join(tmp, out_name)
+    if btn_col1.button("⚙ Generate Report(s)", type="primary"):
+        results = []
+        errors  = []
 
-                try:
-                    info = parse(vendor_path)
+        with st.spinner(f"Processing {len(vendor_files)} PDF(s)…"):
+            for vendor_file in vendor_files:
+                with tempfile.TemporaryDirectory() as tmp:
+                    vendor_path = os.path.join(tmp, vendor_file.name)
+                    with open(vendor_path, "wb") as f:
+                        f.write(vendor_file.getvalue())
 
-                    # Dropdown selections always override PDF-extracted values
-                    info['ht'] = ht_input
-                    info['ia'] = ia_input
-                    if conclusion_input.strip():
-                        info['conclusion'] = conclusion_input.strip()
+                    out_name = f"Ansaldo_{Path(vendor_file.name).stem}.docx"
+                    out_path = os.path.join(tmp, out_name)
 
-                    figs = extract_figures(vendor_path)
-                    build(info, figs, out_path)
+                    try:
+                        info = parse(vendor_path)
+                        info['ht'] = ht_input
+                        info['ia'] = ia_input
+                        if conclusion_input.strip():
+                            info['conclusion'] = conclusion_input.strip()
 
-                    with open(out_path, "rb") as f:
-                        docx_bytes = f.read()
+                        figs = extract_figures(vendor_path)
+                        build(info, figs, out_path)
 
-                    st.success(f"Done! Extracted **{len(figs)} figures**.")
+                        with open(out_path, "rb") as f:
+                            docx_bytes = f.read()
 
-                    col1, col2 = st.columns(2)
-                    col1.metric("Job Number", f"JC. {info['job']}")
-                    col2.metric("Stage", info['stage'])
-                    col1.metric("γ′ Size — Location 1", f"{info['l1']} µm")
-                    col2.metric("γ′ Size — Location 2", f"{info['l2']} µm")
-                    col1.metric("Heat Treatment", info['ht'])
-                    col2.metric("Material", info['material'])
+                        results.append({
+                            'name':      out_name,
+                            'bytes':     docx_bytes,
+                            'info':      info,
+                            'fig_count': len(figs),
+                        })
+                    except Exception as e:
+                        errors.append(f"{vendor_file.name}: {e}")
 
-                    st.divider()
-                    st.download_button(
-                        label="⬇ Download Word Report",
-                        data=docx_bytes,
-                        file_name=out_name,
-                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                        use_container_width=True,
-                        type="primary"
-                    )
-                except Exception as e:
-                    st.error(f"Conversion failed: {e}")
+        if errors:
+            for err in errors:
+                st.error(f"Conversion failed — {err}")
+
+        st.session_state['results'] = results
+
+    # ── Download button (appears in btn_col2 once results are ready) ──
+    results = st.session_state.get('results', [])
+
+    if results:
+        if len(results) == 1:
+            r = results[0]
+            btn_col2.download_button(
+                label="⬇ Download Report",
+                data=r['bytes'],
+                file_name=r['name'],
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                type="primary",
+            )
+        else:
+            zip_buf = io.BytesIO()
+            with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for r in results:
+                    zf.writestr(r['name'], r['bytes'])
+            zip_buf.seek(0)
+            btn_col2.download_button(
+                label=f"⬇ Download All ({len(results)} reports)",
+                data=zip_buf.getvalue(),
+                file_name="Ansaldo_Reports.zip",
+                mime="application/zip",
+                type="primary",
+            )
+
+        st.divider()
+        for r in results:
+            st.success(f"**{r['name']}** — {r['fig_count']} figures extracted")
+            m1, m2 = st.columns(2)
+            m1.metric("Job Number", f"JC. {r['info']['job']}")
+            m2.metric("Stage", r['info']['stage'])
+            m1.metric("γ′ Size — Location 1", f"{r['info']['l1']} µm")
+            m2.metric("γ′ Size — Location 2", f"{r['info']['l2']} µm")
+            m1.metric("Heat Treatment", r['info']['ht'])
+            m2.metric("Material", r['info']['material'])
+
 else:
-    st.info("Upload a vendor PDF above to get started.")
+    st.info("Upload one or more vendor PDFs above to get started.")

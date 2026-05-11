@@ -3,7 +3,7 @@
 SEM Report Converter - Ansaldo Energia
 Usage: python3 sem_convert.py vendor.pdf [output.docx]
 """
-import sys, os, re, io
+import sys, os, re, io, datetime
 from pathlib import Path
 import fitz
 from docx import Document
@@ -19,7 +19,7 @@ NAVY = RGBColor(0x1A,0x1A,0x2E)
 GRAY = RGBColor(0x55,0x55,0x55)
 WHITE= RGBColor(0xFF,0xFF,0xFF)
 
-# ── helpers ─────────────────────────────────────────────
+# ── helpers ───────────────────────────────────────────────────────────
 def _bg(c,h):
     tc=c._tc;p=tc.get_or_add_tcPr();s=OxmlElement("w:shd")
     s.set(qn("w:val"),"clear");s.set(qn("w:color"),"auto");s.set(qn("w:fill"),h);p.append(s)
@@ -142,7 +142,7 @@ def _R_cap(p, text, size=11, color=None, italic=False, bold=False):
         elif part:
             R(p, part, size=size, color=color, italic=italic, bold=bold)
 
-# ── PDF helpers ─────────────────────────────────────────────
+# ── PDF helpers ──────────────────────────────────────────────────────────
 def page_text(page):
     d=page.get_text("dict");spans=[]
     for b in d["blocks"]:
@@ -178,14 +178,14 @@ def is_image_page(page,pdf):
                 return any(pdf.extract_image(img[0]).get('width',0)>500 for img in page.get_images())
     return False
 
-# ══════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════
 # PARSE
-# ══════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════
 def parse(pdf_path):
     vendor=fitz.open(pdf_path)
     full='\n'.join(page_text(p) for p in vendor)
 
-    job_m=re.search(r'Job No[:\s.]+(\d+)',full,re.I)
+    job_m=re.search(r'Job No[:\s.]+([\d]+)',full,re.I)
     job=job_m.group(1).strip() if job_m else 'N/A'
     sn_m=re.search(r'S/N[:\s]+([A-Z0-9]+)',full,re.I)
     serial=sn_m.group(1).strip() if sn_m else 'N/A'
@@ -263,9 +263,9 @@ def parse(pdf_path):
                 ht=ht,ia=ia,l1=l1,l2=l2,no_anom=no_anom,rts=rts,
                 conclusion=conclusion,captions=captions)
 
-# ══════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════
 # EXTRACT FIGURES
-# ══════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════
 def extract_figures(pdf_path):
     doc=fitz.open(pdf_path);figs={}
     for page in doc:
@@ -276,17 +276,19 @@ def extract_figures(pdf_path):
         fn=m.group(1)
         if fn in figs:continue
 
-        # Fig 1.1 — render full page image area (bag + specimen together),
-        # then white out any text overlaid within that area (removes embedded caption box)
+        pw=page.rect.width;ph=page.rect.height
+        # Only look for header/title text in the top 30% of the page to avoid
+        # mistaking image-embedded labels for the page header.
+        hdr_zone = ph * 0.30
+
         if fn=='1':
-            pw=page.rect.width;ph=page.rect.height
             d1=page.get_text("dict");hdr_bot=80.0;cap_top=ph-220.0
             for b in d1["blocks"]:
                 if b.get("type")!=0:continue
                 for line in b.get("lines",[]):
                     lt=' '.join(s["text"] for s in line.get("spans",[]))
                     bb=line["bbox"]
-                    if re.search(r'As-received|SEM Analysis',lt):
+                    if re.search(r'As-received|SEM Analysis',lt) and bb[1] < hdr_zone:
                         if bb[3]>hdr_bot:hdr_bot=bb[3]
                     if re.match(r'\s*Fig(?:ure)?\s+1\.\d+\s+shows',lt) and bb[1]>400:
                         if bb[1]<cap_top:cap_top=bb[1]
@@ -306,14 +308,13 @@ def extract_figures(pdf_path):
             continue
 
         # All other figures — crop from header to just above caption
-        pw=page.rect.width;ph=page.rect.height
         d=page.get_text("dict");hdr_bot=80.0;cap_top=ph-220.0
         for b in d["blocks"]:
             if b.get("type")!=0:continue
             for line in b.get("lines",[]):
                 lt=' '.join(s["text"] for s in line.get("spans",[]))
                 bb=line["bbox"]
-                if re.search(r'SEM Analysis\s*[–—-]|As-received|Location Mapping',lt):
+                if re.search(r'SEM Analysis\s*[–—-]|As-received|Location Mapping',lt) and bb[1] < hdr_zone:
                     if bb[3]>hdr_bot:hdr_bot=bb[3]
                 if re.match(r'\s*Fig(?:ure)?\s+1\.\d+\s+shows',lt) and bb[1]>400:
                     if bb[1]<cap_top:cap_top=bb[1]
@@ -325,9 +326,9 @@ def extract_figures(pdf_path):
     doc.close()
     return figs
 
-# ══════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════
 # BUILD DOCX
-# ══════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════
 def tw(cm):
     """Centimetres → OOXML twips (twentieths of a point)."""
     return round(cm * 1440 / 2.54)
@@ -361,7 +362,7 @@ def _cantSplit(row):
     cs.set(qn('w:val'), '1')
     trPr.append(cs)
 
-def add_two_col(doc, left_content_fn, right_bytes, right_cm=14.0, left_cm=12.5,
+def add_two_col(doc, left_content_fn, right_bytes, right_cm=13.0, left_cm=13.5,
                 caption='', img_pix=None, max_h_cm=10.0):
     t = doc.add_table(rows=1, cols=2)
     t.alignment = WD_TABLE_ALIGNMENT.CENTER
@@ -389,6 +390,16 @@ def add_two_col(doc, left_content_fn, right_bytes, right_cm=14.0, left_cm=12.5,
             _R_cap(cp, clean, size=11, color=RED, italic=True)
 
 def build(info, figs, out_path):
+    caps = info['captions']
+
+    # Determine all SEM figure numbers (excluding cover figs 1 and 2),
+    # then group into pages of 3 for a fully dynamic layout.
+    sem_fig_nums = sorted([k for k in figs.keys() if k not in ('1', '2')], key=int)
+    sem_chunks   = [sem_fig_nums[i:i+3] for i in range(0, len(sem_fig_nums), 3)]
+    total = 4 + len(sem_chunks) + 1   # cover + TOC + intro + micro + SEM pages + summary
+
+    today = datetime.date.today().strftime('%d %B %Y')
+
     doc = Document()
     sec = doc.sections[0]
     sec.page_width=Cm(21); sec.page_height=Cm(29.7)
@@ -399,19 +410,9 @@ def build(info, figs, out_path):
     _setup_footer(sec)
     doc.styles['Normal'].font.name='Calibri'; doc.styles['Normal'].font.size=Pt(10)
 
-    caps = info['captions']
-    total = 9
-
-    # ── shared logo+header table ──────────────────────────────────────────
-    # Portrait (18 cm content) and landscape (26.7 cm content) header column widths (plain cm)
-    WS_P  = [9.2, 4.2, 1.7, 1.6, 1.3]    # total 18.0 cm
-    WS_LS = [13.4, 6.3, 2.4, 2.4, 2.2]   # total 26.7 cm
-
-    def add_logo(doc):
-        lp=doc.add_paragraph(); lp.alignment=WD_ALIGN_PARAGRAPH.CENTER
-        lp.paragraph_format.space_before=Pt(0); lp.paragraph_format.space_after=Pt(4)
-        R(lp,"ansaldo",bold=True,size=24,color=RGBColor(0x8B,0x8B,0x8B))
-        R(lp,"|",size=24,color=RED); R(lp,"energia",size=24,color=RGBColor(0x8B,0x8B,0x8B))
+    # ── shared header table column widths ────────────────────────────────────────────
+    WS_P  = [9.2, 4.2, 1.7, 1.6, 1.3]    # total 18.0 cm  (portrait)
+    WS_LS = [13.4, 6.3, 2.4, 2.4, 2.2]   # total 26.7 cm  (landscape)
 
     def add_info_table(doc, page_num, landscape=False):
         ws = WS_LS if landscape else WS_P
@@ -433,8 +434,8 @@ def build(info, figs, out_path):
         add_info_table(doc, page_num, landscape=landscape)
         SP(doc,6)
 
-    # ══ PAGE 1: COVER ════════════════════════════════════════════════
-    add_logo(doc)
+    # ══ PAGE 1: COVER ════════════════════════════════════════════════════════════
+    # Logo removed per request — info table serves as the page header.
     add_info_table(doc, 1)
 
     SP(doc,12)
@@ -450,8 +451,8 @@ def build(info, figs, out_path):
     sig.alignment=WD_TABLE_ALIGNMENT.CENTER
     _fix_table(sig, sum(SW))
     for ri,row in enumerate([['','Name','Title','Date'],
-        ['Submitted','Eslam Abdelmawla','Materials Engineer',info['date']],
-        ['Approved','Khemichi Badri','Sr. Materials Engineer',info['date']]]):
+        ['Submitted','Eslam Abdelmawla','Materials Engineer', today],
+        ['Approved','Khemichi Badri','Sr. Materials Engineer', today]]):
         for ci,val in enumerate(row):
             c=sig.rows[ri].cells[ci];c.width=Cm(SW[ci]);_bdr(c)
             if ri==0:_bg(c,'F0F0F0')
@@ -459,7 +460,7 @@ def build(info, figs, out_path):
 
     _new_portrait_page(doc)
 
-    # ══ PAGE 2: TOC ══════════════════════════════════════════════════
+    # ══ PAGE 2: TOC ═══════════════════════════════════════════════════════════════
     add_page_hdr(doc, 2)
     SP(doc,4)
     h=doc.add_paragraph();h.paragraph_format.space_before=Pt(6);h.paragraph_format.space_after=Pt(10)
@@ -469,9 +470,11 @@ def build(info, figs, out_path):
     bot=OxmlElement('w:bottom');bot.set(qn('w:val'),'single');bot.set(qn('w:sz'),'6')
     bot.set(qn('w:space'),'1');bot.set(qn('w:color'),'C8102E');pBdr.append(bot);pPr.append(pBdr)
 
+    summary_page = str(total)
     for label,pg in [('TABLE OF CONTENTS','2'),('INTRODUCTION','3'),('RECAPITULATION','3'),
                      ('MICROSTRUCTURE ANALYSIS','4'),
-                     ('SUMMARY OF γ′ PRECIPITATE MEASUREMENTS','9'),('CONCLUSION','9')]:
+                     ('SUMMARY OF γ′ PRECIPITATE MEASUREMENTS', summary_page),
+                     ('CONCLUSION', summary_page)]:
         _toc_entry(doc, label, pg)
 
     _new_landscape_page(doc)
@@ -483,6 +486,7 @@ def build(info, figs, out_path):
         p=cell.add_paragraph(); p.paragraph_format.space_before=Pt(4); p.paragraph_format.space_after=Pt(8)
         R(p,'INTRODUCTION',bold=True,size=12,color=NAVY)
         p2=cell.add_paragraph(); p2.paragraph_format.space_after=Pt(10)
+        p2.alignment=WD_ALIGN_PARAGRAPH.JUSTIFY
         R(p2,f"This report presents the metallurgical evaluation of a {info['stage']} using "
             f"Scanning Electron Microscopy (SEM). The analysis was performed on the specimen in the "
             f"{info['ht']} condition. The objective is to evaluate microstructural integrity, "
@@ -499,7 +503,8 @@ def build(info, figs, out_path):
 
     if '1' in figs:
         f1=figs['1']
-        add_two_col(doc,left_p3,f1['bytes'],right_cm=14.0,left_cm=12.5,
+        # Left column widened by 1 cm (13.5 vs 12.5) so long sentences fit on one line.
+        add_two_col(doc,left_p3,f1['bytes'],right_cm=13.0,left_cm=13.5,
                     caption=caps.get('1','Fig 1.1'),img_pix=(f1['w'],f1['h']))
     else:
         left_p3_para=doc.add_paragraph(); left_p3(left_p3_para)
@@ -513,6 +518,7 @@ def build(info, figs, out_path):
         p=cell.add_paragraph();p.paragraph_format.space_before=Pt(4);p.paragraph_format.space_after=Pt(8)
         R(p,'MICROSTRUCTURE ANALYSIS',bold=True,size=12,color=NAVY)
         p2=cell.add_paragraph();p2.paragraph_format.space_after=Pt(8)
+        p2.alignment=WD_ALIGN_PARAGRAPH.JUSTIFY
         R(p2,'The analysis focused on two representative locations, revealing a matrix of '
              'γ′ precipitates and various carbide phases.',size=11)
         pb=cell.add_paragraph();pb.paragraph_format.left_indent=Cm(0.3)
@@ -531,11 +537,21 @@ def build(info, figs, out_path):
 
     if '2' in figs:
         f2=figs['2']
-        add_two_col(doc,left_p4,f2['bytes'],right_cm=14.0,left_cm=12.5,
+        add_two_col(doc,left_p4,f2['bytes'],right_cm=13.0,left_cm=13.5,
                     caption=caps.get('2','Fig 1.2'),img_pix=(f2['w'],f2['h']))
     _new_landscape_page(doc)
 
-    # ══ PAGES 5-8: SEM IMAGE GRIDS ═════════════════════
+    # ══ SEM IMAGE PAGES: 3 figures per page, location label from captions ═══
+    def _loc_label(fn_list):
+        """Detect location from captions; fall back to 'Location 1'."""
+        for fn in fn_list:
+            cap = caps.get(fn, '').lower()
+            if 'location 2' in cap:
+                return 'Location 2'
+            elif 'location 1' in cap:
+                return 'Location 1'
+        return 'Location 1'
+
     def sem_page(nums, loc_lbl, page_num, next_portrait=False):
         add_page_hdr(doc, page_num, landscape=True)
         present=[(n,figs[n]) for n in nums if n in figs]
@@ -545,9 +561,6 @@ def build(info, figs, out_path):
         img_cm = 8.55 if cols==3 else 13.0
         max_h  = 8.5  if cols==3 else 10.5
 
-        # Single row: image + caption stacked in each cell.
-        # cantSplit prevents the row splitting if content is unexpectedly tall.
-        # No keep_with_next — that caused Word to push the whole row past the header.
         t=doc.add_table(rows=1,cols=cols);t.alignment=WD_TABLE_ALIGNMENT.CENTER
         _fix_table(t, cols * col_cm)
         _cantSplit(t.rows[0])
@@ -572,20 +585,18 @@ def build(info, figs, out_path):
         else:
             _new_landscape_page(doc)
 
-    sem_page(['3','4','5'],'Location 1',5)
-    sem_page(['6','7'],'Location 1',6)
-    sem_page(['8','9','10'],'Location 2',7)
-    if '13' in figs:
-        sem_page(['11','12','13'],'Location 2',8,next_portrait=True)
-    else:
-        sem_page(['11','12'],'Location 2',8,next_portrait=True)
+    for i, chunk in enumerate(sem_chunks):
+        page_num  = 5 + i
+        is_last   = (i == len(sem_chunks) - 1)
+        sem_page(chunk, _loc_label(chunk), page_num, next_portrait=is_last)
 
-    # ══ PAGE 9: SUMMARY + CONCLUSION ═════════════════
-    add_page_hdr(doc,9)
+    # ══ SUMMARY + CONCLUSION ════════════════════════════════════════════════
+    add_page_hdr(doc, total)
 
     h=doc.add_paragraph();h.paragraph_format.space_before=Pt(10);h.paragraph_format.space_after=Pt(6)
     R(h,'SUMMARY OF γ′ PRECIPITATE MEASUREMENTS',bold=True,size=11,color=NAVY)
     p=doc.add_paragraph();p.paragraph_format.space_after=Pt(8)
+    p.alignment=WD_ALIGN_PARAGRAPH.JUSTIFY
     R(p,'To consolidate the observations from both examined locations, the measured sizes of primary γ′ precipitates are summarized in the table below:')
     SP(doc,4)
 
@@ -611,11 +622,13 @@ def build(info, figs, out_path):
         for part in parts:
             clean=re.sub(r'\s+',' ',part).strip()
             if clean:
-                p=doc.add_paragraph();p.paragraph_format.space_after=Pt(8);R(p,clean)
+                p=doc.add_paragraph();p.paragraph_format.space_after=Pt(8)
+                p.alignment=WD_ALIGN_PARAGRAPH.JUSTIFY
+                R(p,clean)
 
     doc.save(out_path)
 
-# ══════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════
 def main():
     if len(sys.argv)<2:print(__doc__);sys.exit(1)
     pdf=sys.argv[1]
