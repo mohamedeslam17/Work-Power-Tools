@@ -5,7 +5,7 @@ from pathlib import Path
 from sem_convert import parse, extract_figures, build
 
 st.set_page_config(
-    page_title="SEM Report Converter — Ansaldo Energia",
+    page_title="SEM Report Converter",
     page_icon="🔬",
     layout="centered"
 )
@@ -13,7 +13,7 @@ st.set_page_config(
 st.title("SEM Metallurgical Report Converter")
 st.markdown(
     "Upload one or more vendor SEM PDFs and fill in the fields below, "
-    "then click **Generate** to build the Ansaldo Energia Word report(s)."
+    "then click **Generate** to build the Word report(s)."
 )
 
 st.divider()

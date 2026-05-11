@@ -154,13 +154,14 @@ def page_text(page):
     return ' '.join(s[2] for s in spans if s[2].strip())
 
 def caption_from_page(page,fig_num):
-    d=page.get_text("dict");spans=[]
+    d=page.get_text("dict");ph=page.rect.height;spans=[]
+    cap_min=ph*0.70;cap_max=ph*0.95
     for b in d["blocks"]:
         if b.get("type")!=0:continue
         for line in b.get("lines",[]):
             for s in line.get("spans",[]):
                 y=s["bbox"][1]
-                if 620<y<775 and s["text"].strip():
+                if cap_min<y<cap_max and s["text"].strip():
                     spans.append((y,s["bbox"][0],s["text"]))
     spans.sort(key=lambda s:(round(s[0]/3)*3,s[1]))
     t=re.sub(r'\s+',' ',' '.join(s[2] for s in spans).strip())
@@ -169,13 +170,15 @@ def caption_from_page(page,fig_num):
     return t.strip()
 
 def is_image_page(page,pdf):
+    if not any(pdf.extract_image(img[0]).get('width',0)>500 for img in page.get_images()):
+        return False
     d=page.get_text("dict")
     for b in d["blocks"]:
         if b.get("type")!=0:continue
         for line in b.get("lines",[]):
             lt=' '.join(s["text"] for s in line.get("spans",[]))
-            if re.search(r'As-received Sample|SEM Analysis\s*[–—-]',lt):
-                return any(pdf.extract_image(img[0]).get('width',0)>500 for img in page.get_images())
+            if re.search(r'As-received|SEM Analysis|Location\s+[12]|Fig(?:ure)?\.?\s+1[.\s]*\d+',lt,re.I):
+                return True
     return False
 
 # ════════════════════════════════════════════════════════════
@@ -235,7 +238,8 @@ def parse(pdf_path):
     for page in vendor:
         if not is_image_page(page,vendor):continue
         pt=page_text(page)
-        m=re.search(r'(?:Fig|Figure)\s+1[.\s]*(\d+)\s+shows',pt,re.I)
+        m=re.search(r'(?:Fig|Figure)\.?\s+1[.\s]*(\d+)\s+shows',pt,re.I)
+        if not m:m=re.search(r'(?:Fig|Figure)\.?\s+1[.\s]*(\d+)',pt,re.I)
         if not m:continue
         fn=m.group(1)
         if fn in captions:continue
@@ -271,7 +275,8 @@ def extract_figures(pdf_path):
     for page in doc:
         if not is_image_page(page,doc):continue
         pt=page_text(page)
-        m=re.search(r'(?:Fig|Figure)\s+1[.\s]*(\d+)\s+shows',pt,re.I)
+        m=re.search(r'(?:Fig|Figure)\.?\s+1[.\s]*(\d+)\s+shows',pt,re.I)
+        if not m:m=re.search(r'(?:Fig|Figure)\.?\s+1[.\s]*(\d+)',pt,re.I)
         if not m:continue
         fn=m.group(1)
         if fn in figs:continue
@@ -282,27 +287,25 @@ def extract_figures(pdf_path):
         hdr_zone = ph * 0.30
 
         if fn=='1':
-            d1=page.get_text("dict");hdr_bot=80.0;cap_top=ph-220.0
+            d1=page.get_text("dict")
+            crop_rect=None
             for b in d1["blocks"]:
-                if b.get("type")!=0:continue
-                for line in b.get("lines",[]):
-                    lt=' '.join(s["text"] for s in line.get("spans",[]))
-                    bb=line["bbox"]
-                    if re.search(r'As-received|SEM Analysis',lt) and bb[1] < hdr_zone:
-                        if bb[3]>hdr_bot:hdr_bot=bb[3]
-                    if re.match(r'\s*Fig(?:ure)?\s+1\.\d+\s+shows',lt) and bb[1]>400:
-                        if bb[1]<cap_top:cap_top=bb[1]
-            crop_rect=fitz.Rect(18,hdr_bot+5,pw-18,cap_top-4)
-            shape=page.new_shape()
-            hit=False
-            for block in d1["blocks"]:
-                if block.get("type")==0:
-                    br=fitz.Rect(block["bbox"])
-                    if crop_rect.intersects(br):
-                        shape.draw_rect(br);hit=True
-            if hit:
-                shape.finish(fill=(1,1,1),color=(1,1,1),width=0)
-                shape.commit()
+                if b.get("type")==1:  # image block — use its exact bbox
+                    bx0,by0,bx1,by1=b["bbox"]
+                    if (bx1-bx0)>pw*0.3 and (by1-by0)>ph*0.2:
+                        crop_rect=fitz.Rect(bx0,by0,bx1,by1);break
+            if crop_rect is None:
+                hdr_bot=80.0;cap_top=ph-220.0
+                for b in d1["blocks"]:
+                    if b.get("type")!=0:continue
+                    for line in b.get("lines",[]):
+                        lt=' '.join(s["text"] for s in line.get("spans",[]))
+                        bb=line["bbox"]
+                        if re.search(r'As-received|SEM Analysis',lt) and bb[1]<hdr_zone:
+                            if bb[3]>hdr_bot:hdr_bot=bb[3]
+                        if re.match(r'\s*Fig(?:ure)?\.?\s+1\.\d+\s+shows',lt) and bb[1]>400:
+                            if bb[1]<cap_top:cap_top=bb[1]
+                crop_rect=fitz.Rect(18,hdr_bot+5,pw-18,cap_top-4)
             pix=page.get_pixmap(dpi=180,clip=crop_rect)
             figs[fn]={'bytes':pix.tobytes('jpeg'),'w':pix.width,'h':pix.height}
             continue
@@ -435,7 +438,7 @@ def build(info, figs, out_path):
         SP(doc,6)
 
     # ══ PAGE 1: COVER ════════════════════════════════════════════════════════════
-    # Logo removed per request — info table serves as the page header.
+    # No logo on cover — info table serves as the page header.
     add_info_table(doc, 1)
 
     SP(doc,12)
@@ -498,13 +501,12 @@ def build(info, figs, out_path):
                         ('Incoming Assessment',info['ia']),
                         ('Heat Treatment Condition',info['ht']),('Serial Number',info['serial'])]:
             pb=cell.add_paragraph(); pb.paragraph_format.space_before=Pt(2); pb.paragraph_format.space_after=Pt(2)
-            pb.paragraph_format.left_indent=Cm(0.3)
+            pb.paragraph_format.left_indent=Cm(0.3); pb.alignment=WD_ALIGN_PARAGRAPH.JUSTIFY
             R(pb,'• ',bold=True,size=11); R(pb,lbl+': ',bold=True,size=11); R(pb,val,size=11)
 
     if '1' in figs:
         f1=figs['1']
-        # Left column widened by 1 cm (13.5 vs 12.5) so long sentences fit on one line.
-        add_two_col(doc,left_p3,f1['bytes'],right_cm=13.0,left_cm=13.5,
+        add_two_col(doc,left_p3,f1['bytes'],right_cm=12.2,left_cm=14.5,
                     caption=caps.get('1','Fig 1.1'),img_pix=(f1['w'],f1['h']))
     else:
         left_p3_para=doc.add_paragraph(); left_p3(left_p3_para)
@@ -521,17 +523,17 @@ def build(info, figs, out_path):
         p2.alignment=WD_ALIGN_PARAGRAPH.JUSTIFY
         R(p2,'The analysis focused on two representative locations, revealing a matrix of '
              'γ′ precipitates and various carbide phases.',size=11)
-        pb=cell.add_paragraph();pb.paragraph_format.left_indent=Cm(0.3)
+        pb=cell.add_paragraph();pb.paragraph_format.left_indent=Cm(0.3);pb.alignment=WD_ALIGN_PARAGRAPH.JUSTIFY
         R(pb,'• ',size=11);R(pb,'γ Matrix: ',bold=True,size=11)
         R(pb,'Both locations showed a typical distribution of primary and secondary γ′ precipitates.',size=11)
-        pb=cell.add_paragraph();pb.paragraph_format.left_indent=Cm(0.3)
+        pb=cell.add_paragraph();pb.paragraph_format.left_indent=Cm(0.3);pb.alignment=WD_ALIGN_PARAGRAPH.JUSTIFY
         R(pb,'• ',size=11);R(pb,'Precipitates:',bold=True,size=11)
-        pb=cell.add_paragraph();pb.paragraph_format.left_indent=Cm(0.8)
+        pb=cell.add_paragraph();pb.paragraph_format.left_indent=Cm(0.8);pb.alignment=WD_ALIGN_PARAGRAPH.JUSTIFY
         R(pb,'o ',size=11);R(pb,'Grain Boundaries: ',bold=True,size=11)
         R(pb,'Fine and coarse precipitates, identified as likely ',size=11)
         _add_carbide(pb,size=11)
         R(pb,' and MC-type carbides, were observed along the grain boundaries.',size=11)
-        pb=cell.add_paragraph();pb.paragraph_format.left_indent=Cm(0.8)
+        pb=cell.add_paragraph();pb.paragraph_format.left_indent=Cm(0.8);pb.alignment=WD_ALIGN_PARAGRAPH.JUSTIFY
         R(pb,'o ',size=11);R(pb,'Intra-granular: ',bold=True,size=11)
         R(pb,'Coarse, blocky MC-type precipitates were found within the grains.',size=11)
 
@@ -556,16 +558,15 @@ def build(info, figs, out_path):
         add_page_hdr(doc, page_num, landscape=True)
         present=[(n,figs[n]) for n in nums if n in figs]
         if not present:return
-        cols=len(present)
-        col_cm = 8.85 if cols==3 else 13.3   # landscape content 26.7 cm
-        img_cm = 8.55 if cols==3 else 13.0
-        max_h  = 8.5  if cols==3 else 10.5
+        col_cm=8.85;img_cm=8.55;max_h=8.5
 
-        t=doc.add_table(rows=1,cols=cols);t.alignment=WD_TABLE_ALIGNMENT.CENTER
-        _fix_table(t, cols * col_cm)
+        t=doc.add_table(rows=1,cols=3);t.alignment=WD_TABLE_ALIGNMENT.CENTER
+        _fix_table(t,3*col_cm)
         _cantSplit(t.rows[0])
-        for ci,(fn,f) in enumerate(present):
+        for ci in range(3):
             cell=t.rows[0].cells[ci];cell.width=Cm(col_cm);_nobdr(cell)
+            if ci>=len(present):continue
+            fn,f=present[ci]
             ip=cell.paragraphs[0];ip.alignment=WD_ALIGN_PARAGRAPH.CENTER
             ip.paragraph_format.space_before=Pt(6)
             w_px,h_px=f['w'],f['h']
