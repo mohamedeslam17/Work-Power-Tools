@@ -445,7 +445,7 @@ def build(info, figs, out_path):
     t2.paragraph_format.space_after=Pt(220)
     R(t2,'METALLURGICAL EVALUATION REPORT',bold=True,size=14,color=GRAY)
 
-    SW=[3.2, 5.1, 5.1, 2.6]   # total 16.0 cm, centred on 17 cm portrait
+    SW=[3.2, 5.1, 5.1, 2.6]   # total 16.0 cm, centred on 18 cm portrait
     sig=doc.add_table(rows=3,cols=4); sig.style='Table Grid'
     sig.alignment=WD_TABLE_ALIGNMENT.CENTER
     _fix_table(sig, sum(SW))
