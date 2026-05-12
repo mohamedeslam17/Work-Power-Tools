@@ -42,6 +42,12 @@ ia_input = col2.selectbox(
     ["Medium Repair", "Heavy Repair", "Light Repair"],
     index=0
 )
+col3, col4 = st.columns(2)
+mat_input = col3.text_input(
+    "Material / Alloy",
+    value="IN738",
+    help="Alloy designation extracted from the PDF — edit if needed (e.g. IN738LC, IN-738).",
+)
 conclusion_input = st.text_area(
     "Conclusion",
     placeholder="Enter the conclusion text for the report...",
@@ -73,6 +79,8 @@ if btn_col1.button("▶ Generate Reports", type="primary", disabled=not vendor_f
                     info = parse(vendor_path)
                     info['ht'] = ht_input
                     info['ia'] = ia_input
+                    if mat_input.strip():
+                        info['material'] = mat_input.strip()
                     if conclusion_input.strip():
                         info['conclusion'] = conclusion_input.strip()
 
