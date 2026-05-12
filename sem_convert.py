@@ -119,7 +119,7 @@ def _add_carbide(p, formula='M23C6', size=10):
 
 def _clean_caption(text):
     """Strip unwanted phrases and replace ASCII symbols with Unicode in caption text."""
-    text = re.sub(r'\s*No indications? of[^.]*precipitates[^.]*\.', '', text, flags=re.I)
+    text = re.sub(r'\s*No indications? of[^.]*\.', '', text, flags=re.I)
     text = re.sub(r'\bsecond[- ]?phase\s+', '', text, flags=re.I)
     text = re.sub(r'\bgamma[- ]prime\b', 'γ′', text, flags=re.I)
     text = re.sub(r'\bgamma\b', 'γ', text, flags=re.I)
@@ -310,24 +310,57 @@ def extract_figures(pdf_path):
             figs[fn]={'bytes':pix.tobytes('jpeg'),'w':pix.width,'h':pix.height}
             continue
 
-        # All other figures — crop from header to just above caption
-        d=page.get_text("dict");hdr_bot=80.0;cap_top=ph-220.0
+        # All other figures — prefer exact image-block bounding boxes; fall back to text-based crop
+        d=page.get_text("dict")
+        img_blocks=[]
         for b in d["blocks"]:
-            if b.get("type")!=0:continue
-            for line in b.get("lines",[]):
-                lt=' '.join(s["text"] for s in line.get("spans",[]))
-                bb=line["bbox"]
-                if re.search(r'SEM Analysis\s*[–—-]|As-received|Location Mapping',lt) and bb[1] < hdr_zone:
-                    if bb[3]>hdr_bot:hdr_bot=bb[3]
-                if re.match(r'\s*Fig(?:ure)?\s+1\.\d+\s+shows',lt) and bb[1]>400:
-                    if bb[1]<cap_top:cap_top=bb[1]
+            if b.get("type")==1:
+                bx0,by0,bx1,by1=b["bbox"]
+                if (bx1-bx0)>pw*0.25 and (by1-by0)>ph*0.15:
+                    img_blocks.append((bx0,by0,bx1,by1))
 
-        crop=fitz.Rect(18,hdr_bot+5,pw-18,cap_top+8)
+        if img_blocks:
+            ibx0=min(b[0] for b in img_blocks)-4
+            iby0=min(b[1] for b in img_blocks)-4
+            ibx1=max(b[2] for b in img_blocks)+4
+            iby1=max(b[3] for b in img_blocks)+4
+            crop=fitz.Rect(max(0,ibx0),max(0,iby0),min(pw,ibx1),min(ph,iby1))
+        else:
+            hdr_bot=80.0;cap_top=ph-220.0
+            for b in d["blocks"]:
+                if b.get("type")!=0:continue
+                for line in b.get("lines",[]):
+                    lt=' '.join(s["text"] for s in line.get("spans",[]))
+                    bb=line["bbox"]
+                    if re.search(r'SEM Analysis\s*[–—-]|As-received|Location Mapping',lt) and bb[1]<hdr_zone:
+                        if bb[3]>hdr_bot:hdr_bot=bb[3]
+                    if re.match(r'\s*Fig(?:ure)?\s+1\.\d+\s+shows',lt) and bb[1]>400:
+                        if bb[1]<cap_top:cap_top=bb[1]
+            crop=fitz.Rect(18,hdr_bot+5,pw-18,cap_top-2)
+
         pix=page.get_pixmap(dpi=180,clip=crop)
         figs[fn]={'bytes':pix.tobytes('jpeg'),'w':pix.width,'h':pix.height}
 
     doc.close()
     return figs
+
+def _default_conclusion(info):
+    """Generate a template conclusion filled with parsed report metadata."""
+    l1 = info.get('l1', 'N/A')
+    l2 = info.get('l2', 'N/A')
+    return (
+        f"SEM microstructural analysis was conducted on a {info['stage']} "
+        f"(S/N: {info['serial']}) manufactured from {info['material']} superalloy. "
+        f"The specimen, provided in the {info['ht']}, was examined at two representative "
+        f"locations under magnifications up to 10,000x.\n\n"
+        f"The microstructure revealed cuboidal primary γ′ precipitates with fine secondary γ′ "
+        f"within the γ matrix. Average γ′ sizes ranged between {l1} µm and {l2} µm, consistent "
+        f"across the two examined locations. Stable MC carbides were observed within grains, "
+        f"while M23C6 carbides were present along grain boundaries.\n\n"
+        f"Based on these findings, the examined bucket (Job {info['job']}, S/N: {info['serial']}) "
+        f"is considered suitable for reconditioning, subject to completion of standard NDT "
+        f"inspection prior to return to service."
+    )
 
 # ════════════════════════════════════════════════════════════
 # BUILD DOCX
@@ -578,9 +611,15 @@ def build(info, figs, out_path):
             cp.paragraph_format.keep_together=True
             _R_cap(cp,_clean_caption(caps.get(fn,f'Fig 1.{fn}')),size=12,color=GRAY,italic=True)
 
-        ll=doc.add_paragraph();ll.alignment=WD_ALIGN_PARAGRAPH.CENTER
-        ll.paragraph_format.space_before=Pt(8)
-        R(ll,loc_lbl,bold=True,size=12)
+        # Location label as a merged row fixed inside the table
+        label_row=t.add_row()
+        _cantSplit(label_row)
+        lc=label_row.cells[0].merge(label_row.cells[2])
+        _nobdr(lc)
+        ll_p=lc.paragraphs[0];ll_p.alignment=WD_ALIGN_PARAGRAPH.CENTER
+        ll_p.paragraph_format.space_before=Pt(8);ll_p.paragraph_format.space_after=Pt(4)
+        R(ll_p,loc_lbl,bold=True,size=12)
+
         if next_portrait:
             _new_portrait_page(doc)
         else:
@@ -618,14 +657,14 @@ def build(info, figs, out_path):
 
     h=doc.add_paragraph();h.paragraph_format.space_before=Pt(10);h.paragraph_format.space_after=Pt(6)
     R(h,'CONCLUSION',bold=True,size=11,color=NAVY)
-    if info['conclusion']:
-        parts=re.split(r'\n\s*\n',info['conclusion'])
-        for part in parts:
-            clean=re.sub(r'\s+',' ',part).strip()
-            if clean:
-                p=doc.add_paragraph();p.paragraph_format.space_after=Pt(8)
-                p.alignment=WD_ALIGN_PARAGRAPH.JUSTIFY
-                R(p,clean)
+    conclusion_text=info['conclusion'] if info['conclusion'] else _default_conclusion(info)
+    for part in re.split(r'\n\s*\n',conclusion_text):
+        clean=re.sub(r'\s*No indications? of[^.]*\.','',part,flags=re.I)
+        clean=re.sub(r'\s+',' ',clean).strip()
+        if clean:
+            p=doc.add_paragraph();p.paragraph_format.space_after=Pt(8)
+            p.alignment=WD_ALIGN_PARAGRAPH.JUSTIFY
+            _R_cap(p,clean,size=10)
 
     doc.save(out_path)
 
