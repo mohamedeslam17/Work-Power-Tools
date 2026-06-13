@@ -30,6 +30,17 @@ import zipfile
 
 import openpyxl
 
+# Optional OCR stack, used only to read the burned-in legend on micrographs.
+# The reviewer works fully without it — legend reading is skipped gracefully
+# when Pillow / pytesseract / the Tesseract binary are not present.
+try:
+    import pytesseract
+    from PIL import Image
+    pytesseract.get_tesseract_version()
+    _OCR_AVAILABLE = True
+except Exception:
+    _OCR_AVAILABLE = False
+
 # ── Reference data ────────────────────────────────────────────────────────
 # Chemical-element symbols expected in composition tables. Used to tell an
 # element-header cell ("Cr", "Ni", ...) apart from an alloy name ("GTD-741").
@@ -45,18 +56,76 @@ ELEMENTS = {
 COMP_WARN_REL, COMP_WARN_ABS = 10.0, 0.10     # → warning
 COMP_CRIT_REL, COMP_CRIT_ABS = 25.0, 0.20     # → critical
 
-# Advisory hardness ranges (HRC) by alloy. ADVISORY ONLY — these are typical
-# values; verify against the controlling specification and edit as needed.
-# Alloys not listed here are simply reported without a range check.
+# ── Reference hardness ────────────────────────────────────────────────────
+# Typical hardness of common Ni- and Co-based gas-turbine superalloys in the
+# fully-heat-treated / aged condition, in HRC. ADVISORY — representative of
+# published/typical data; actual values depend on the exact heat-treat cycle
+# and the controlling specification, so verify before relying on them.
+# Anchors from datasheets / open literature: IN738LC aged ~40-45 HRC;
+# Rene 80 aged ~35 HRC (as-cast ~38); GTD-111 ~440→320 HV ≈ 44→32 HRC across
+# aging; IN718 aged 36-44 HRC; Nimonic/C263 ~28 HRC.
+#
+# CONDITION NOTE: AEG reports record *pre-* and *post-solution* hardness. The
+# solution-treated state is intentionally SOFTER than these aged ranges (re-
+# aging follows), so post-solution readings below the range are EXPECTED and
+# are reported as informational, never as failures.
+def _hrc(lo, hi, base, note=''):
+    return {'hrc': (lo, hi), 'base': base, 'note': note}
+
+# Keys are normalised (uppercase, alphanumerics only) — see _alloy_key().
 HARDNESS_REF = {
-    'GTD-111': (32, 42),
-    'GTD-741': (25, 40),
-    'RENE-80': (28, 42),
-    'IN-738':  (30, 42),
-    'IN738':   (30, 42),
-    'NIMONIC-263': (20, 35),
-    'NI-263':  (20, 35),
+    # ── Nickel-based, precipitation (γ′) hardened ──
+    'IN738':      _hrc(32, 44, 'Ni'),
+    'IN738LC':    _hrc(32, 44, 'Ni'),
+    'INCONEL738': _hrc(32, 44, 'Ni'),
+    'IN792':      _hrc(32, 44, 'Ni'),
+    'GTD111':     _hrc(32, 44, 'Ni'),
+    'GTD444':     _hrc(32, 44, 'Ni'),
+    'GTD741':     _hrc(30, 42, 'Ni', 'GE proprietary — typical Ni bucket range; verify.'),
+    'RENE80':     _hrc(30, 40, 'Ni'),
+    'RENE108':    _hrc(35, 45, 'Ni'),
+    'RENE142':    _hrc(35, 45, 'Ni'),
+    'RENEN5':     _hrc(35, 45, 'Ni'),
+    'MARM247':    _hrc(38, 46, 'Ni'),
+    'CM247LC':    _hrc(38, 46, 'Ni'),
+    'IN100':      _hrc(36, 44, 'Ni'),
+    'IN713':      _hrc(30, 42, 'Ni'),
+    'IN713C':     _hrc(30, 42, 'Ni'),
+    'WASPALOY':   _hrc(32, 42, 'Ni'),
+    'UDIMET500':  _hrc(30, 40, 'Ni'),
+    'UDIMET520':  _hrc(30, 40, 'Ni'),
+    'UDIMET720':  _hrc(36, 46, 'Ni'),
+    'IN718':      _hrc(36, 44, 'Ni'),
+    'INCONEL718': _hrc(36, 44, 'Ni'),
+    'NIMONIC263': _hrc(20, 32, 'Ni', 'Age-hardenable Ni-Co-Cr-Mo; aged ~28 HRC.'),
+    'C263':       _hrc(20, 32, 'Ni'),
+    'NI263':      _hrc(20, 32, 'Ni'),
+    'HAYNES263':  _hrc(20, 32, 'Ni'),
+    'NIMONIC90':  _hrc(30, 42, 'Ni'),
+    'NIMONIC105': _hrc(32, 42, 'Ni'),
+    'NIMONIC115': _hrc(32, 42, 'Ni'),
+    'HAYNES282':  _hrc(28, 38, 'Ni'),
+    # ── Nickel-based, solid-solution (not age-hardened; annealed, much softer) ──
+    'IN625':      _hrc(8, 25, 'Ni', 'Solid-solution; annealed ~88-96 HRB.'),
+    'INCONEL625': _hrc(8, 25, 'Ni', 'Solid-solution; annealed ~88-96 HRB.'),
+    'HASTELLOYX': _hrc(8, 25, 'Ni', 'Solid-solution; annealed ~90 HRB.'),
+    # ── Cobalt-based (carbide / solid-solution strengthened) ──
+    'FSX414':     _hrc(25, 38, 'Co', 'Cast Co nozzle/vane alloy.'),
+    'X40':        _hrc(30, 42, 'Co'),
+    'X45':        _hrc(30, 42, 'Co'),
+    'STELLITE31': _hrc(30, 42, 'Co'),
+    'MARM509':    _hrc(30, 42, 'Co'),
+    'ECY768':     _hrc(30, 42, 'Co'),
+    'STELLITE6':  _hrc(36, 45, 'Co'),
+    'HAYNES188':  _hrc(8, 25, 'Co', 'Solid-solution; annealed ~95 HRB.'),
+    'L605':       _hrc(8, 25, 'Co', 'Solid-solution; annealed ~95-100 HRB.'),
+    'HAYNES25':   _hrc(8, 25, 'Co', 'Solid-solution; annealed ~95-100 HRB.'),
 }
+
+
+def _alloy_key(material):
+    """Normalise an alloy name for HARDNESS_REF lookup (e.g. 'GTD-741'→'GTD741')."""
+    return re.sub(r'[^A-Z0-9]', '', (material or '').upper())
 
 # Placeholder strings that mean "field not actually filled in".
 _PLACEHOLDERS = {'', 'n/a', 'na', 'not provided', 'to follow', 'tbd', '-', '/'}
@@ -299,23 +368,38 @@ def _review_hardness(hardness, material):
         findings.append(('warning', 'Hardness', 'Hardness section present but no values parsed.'))
         return findings
 
+    # Real check: solution treatment should soften the material (post ≤ pre).
     if pre is not None and post is not None and post > pre + 0.5:
         findings.append(('warning', 'Hardness',
-                         f'Post-solution hardness ({post:g}) exceeds pre-solution ({pre:g}) — '
-                         'solution treatment normally softens the material.'))
+                         f'Post-solution hardness ({post:g} HRC) exceeds pre-solution '
+                         f'({pre:g} HRC) — solution treatment normally softens the material.'))
 
-    key = re.sub(r'\s+', '', (material or '').upper())
-    rng = HARDNESS_REF.get(key)
-    if rng:
-        lo, hi = rng
+    ref = HARDNESS_REF.get(_alloy_key(material))
+    if ref:
+        lo, hi = ref['hrc']
+        note = (' ' + ref['note']) if ref['note'] else ''
+        findings.append(('info', 'Hardness',
+                         f'{material}: reference aged hardness {lo}–{hi} HRC '
+                         f'({ref["base"]}-based, advisory).{note}'))
         for label, val in (('Pre-solution', pre), ('Post-solution', post)):
-            if val is not None and not (lo <= val <= hi):
+            if val is None:
+                continue
+            if val > hi + 2:
                 findings.append(('info', 'Hardness',
-                                 f'{label} {val:g} HRC outside advisory range {lo}–{hi} HRC '
-                                 f'for {material} (advisory — verify vs spec).'))
-    if not findings:
+                                 f'{label} {val:g} HRC is above the aged reference '
+                                 f'{lo}–{hi} HRC — verify.'))
+            elif val < lo and label == 'Post-solution':
+                findings.append(('info', 'Hardness',
+                                 f'{label} {val:g} HRC is below the aged reference '
+                                 f'{lo}–{hi} HRC — expected for the solution-treated '
+                                 f'(pre-aging) condition.'))
+    else:
+        findings.append(('info', 'Hardness',
+                         f'No reference hardness on file for "{material}".'))
+
+    if not any(s == 'warning' for s, _, _ in findings):
         parts = [f'{k}={v["value"]:g}' for k, v in hardness.items() if v.get('value') is not None]
-        findings.append(('pass', 'Hardness', f'Hardness recorded ({", ".join(parts)} HRC).'))
+        findings.append(('pass', 'Hardness', f'Hardness values recorded: {", ".join(parts)} HRC.'))
     return findings
 
 
@@ -478,6 +562,137 @@ def review_coating(parsed):
 
 
 # ════════════════════════════════════════════════════════════════════════
+# MICROGRAPH LEGEND OCR  (light "read the legend in the photo" support)
+# ════════════════════════════════════════════════════════════════════════
+# Burned-in legends follow the AEG convention "<job>_E_<mag>x-<n>" at the
+# bottom-left and a scale bar ("10 µm") at the bottom-right. OCR of such small,
+# speckle-surrounded text is best-effort: values are correct when read, but not
+# every image yields one. Findings are therefore advisory.
+_MAG_PATS = [
+    re.compile(r'(\d{2,4})\s*[xX%]\s*[-_]\s*(\d)'),   # 500x-1  (magnification + index)
+    re.compile(r'E\s*[_ €F]?\s*(\d{2,4})\s*[xX%]'),   # E_500x
+    re.compile(r'(?<![\d.])(\d{2,4})\s*[xX%]'),       # 500x
+]
+_JOB_PAT   = re.compile(r'\b(\d{4})\b')
+_SCALE_PAT = re.compile(r'(\d{1,3})\s*[µuμyptwb]+m', re.I)
+_CAP_MAG   = re.compile(r'(\d{2,4})\s*[xX]\b')
+
+
+def _safe_ocr(im, cfg='--psm 7'):
+    try:
+        return pytesseract.image_to_string(im, config=cfg) or ''
+    except Exception:
+        return ''
+
+
+def _binarize(im, thr, scale=4):
+    """Keep bright text (white-on-dark legend bar) and upscale small fonts."""
+    return im.point(lambda p: 255 if p > thr else 0).resize(
+        (max(1, im.width * scale), max(1, im.height * scale)))
+
+
+def _read_one_legend(img_bytes):
+    """OCR the burned-in legend of a single micrograph; None if unreadable."""
+    try:
+        im = Image.open(io.BytesIO(img_bytes)).convert('L')
+    except Exception:
+        return None
+    w, h = im.size
+    if w < 200 or h < 150:            # skip logos / thumbnails
+        return None
+    lc = im.crop((0, int(h * 0.90), int(w * 0.55), h))           # ID + magnification
+    rc = im.crop((int(w * 0.72), int(h * 0.88), w, h))           # scale bar
+    lblob = ' '.join(_safe_ocr(_binarize(lc, t)) for t in (110, 130, 150))
+    rblob = ' '.join(_safe_ocr(_binarize(rc, t)) for t in (110, 140))
+
+    out = {}
+    mag_val, idx = None, None
+    for pat in _MAG_PATS:                      # first plausible magnification wins
+        for m in pat.finditer(lblob):
+            n = int(m.group(1))
+            if 25 <= n <= 20000:               # real micrograph mags; rejects OCR noise
+                mag_val = n
+                idx = m.group(2) if pat.groups == 2 else None
+                break
+        if mag_val is not None:
+            break
+    if mag_val is not None:
+        job = _JOB_PAT.search(lblob)
+        out['mag'] = f'{mag_val}x'
+        out['id'] = (f'{job.group(1)}_' if job else '') + f'E_{mag_val}x' + \
+                    (f'-{idx}' if idx else '')
+    s = _SCALE_PAT.search(rblob) or _SCALE_PAT.search(lblob)
+    if s:
+        out['scale'] = f'{s.group(1)} µm'
+    return out or None
+
+
+def read_image_legends(data, max_images=24):
+    """Extract embedded micrographs from an xlsx and OCR each legend.
+
+    Returns (legends, ocr_used):
+        legends  : list of {'image', 'mag', 'scale', 'id'} (only readable ones)
+        ocr_used : False when the OCR stack is unavailable
+    """
+    if not _OCR_AVAILABLE:
+        return [], False
+    legends = []
+    try:
+        z = zipfile.ZipFile(io.BytesIO(data))
+        names = [n for n in z.namelist() if n.startswith('xl/media')]
+    except Exception:
+        return [], True
+    for n in sorted(names)[:max_images]:
+        try:
+            info = _read_one_legend(z.read(n))
+        except Exception:
+            info = None
+        if info:
+            info['image'] = n.split('/')[-1]
+            legends.append(info)
+    return legends, True
+
+
+def _caption_mags(pictures):
+    """Magnifications mentioned in the written picture captions, e.g. {'200x'}."""
+    mags = set()
+    for _, cap in pictures or []:
+        for m in _CAP_MAG.finditer(cap or ''):
+            mags.add(f'{m.group(1)}x')
+    return mags
+
+
+def _review_legends(legends, ocr_used, caption_mags):
+    findings = []
+    if not ocr_used:
+        findings.append(('info', 'Photo legends',
+                         'Legend OCR unavailable (Tesseract not installed) — skipped.'))
+        return findings
+    if not legends:
+        findings.append(('info', 'Photo legends',
+                         'Could not read a legend from any embedded micrograph.'))
+        return findings
+
+    img_mags = sorted({l['mag'] for l in legends if l.get('mag')},
+                      key=lambda s: int(s[:-1]))
+    findings.append(('info', 'Photo legends',
+                     f'Read legends from {len(legends)} micrograph(s); '
+                     f'magnifications: {", ".join(img_mags) if img_mags else "n/a"}.'))
+
+    # Cross-check magnifications burned into the images against the captions.
+    if img_mags and caption_mags:
+        missing = [m for m in img_mags if m not in caption_mags]
+        if missing:
+            findings.append(('warning', 'Photo legends',
+                             f'Magnification(s) {", ".join(missing)} appear in image legends '
+                             f'but in no written caption — check the captions.'))
+        else:
+            findings.append(('pass', 'Photo legends',
+                             'Image-legend magnifications all match the written captions.'))
+    return findings
+
+
+# ════════════════════════════════════════════════════════════════════════
 # PUBLIC ENTRY POINT
 # ════════════════════════════════════════════════════════════════════════
 def _media_count(data):
@@ -488,8 +703,12 @@ def _media_count(data):
         return 0
 
 
-def review_report(filename, data):
-    """Review one report. Returns (report_type, parsed, findings)."""
+def review_report(filename, data, ocr=True):
+    """Review one report. Returns (report_type, parsed, findings).
+
+    ocr : when True (and the OCR stack is available) the burned-in legend of
+          each embedded micrograph is read and cross-checked against captions.
+    """
     wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True)
     rtype = detect_type(wb)
     media = _media_count(data)
@@ -504,6 +723,13 @@ def review_report(filename, data):
         parsed = {}
         findings = [('warning', 'Format',
                      'Unrecognised layout — not classified as a metallurgical or coating report.')]
+
+    legends = []
+    if ocr:
+        legends, ocr_used = read_image_legends(data)
+        cap_mags = _caption_mags(parsed.get('pictures', []))
+        findings += _review_legends(legends, ocr_used, cap_mags)
+    parsed['legends'] = legends
     return rtype, parsed, findings
 
 
@@ -533,6 +759,9 @@ def main():
         for sev, cat, msg in findings:
             tag = {'critical': 'FAIL', 'warning': 'WARN', 'info': 'INFO', 'pass': 'OK  '}[sev]
             print(f'   [{tag}] {cat}: {msg}')
+        for lg in parsed.get('legends', []):
+            bits = [lg[k] for k in ('id', 'mag', 'scale') if lg.get(k)]
+            print(f'     · {lg["image"]}: {"  ".join(bits)}')
 
 
 if __name__ == '__main__':

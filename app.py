@@ -194,6 +194,15 @@ def _render_parsed(rtype, parsed):
                 for e in rows
             ])
 
+    legends = parsed.get('legends') or []
+    if legends:
+        st.markdown("**Micrograph legends — read from the images**")
+        st.table([
+            {"Image": l.get('image', '—'), "Magnification": l.get('mag', '—'),
+             "Scale": l.get('scale', '—'), "Legend ID": l.get('id', '—')}
+            for l in legends
+        ])
+
 
 def render_reviewer():
     st.markdown(
@@ -212,6 +221,13 @@ def render_reviewer():
         key="lab_files",
     )
 
+    ocr = st.checkbox(
+        "🔍 Read micrograph legends (OCR)",
+        value=True,
+        help="Reads the magnification / scale-bar burned into each micrograph and "
+             "cross-checks it against the written captions. Requires the Tesseract OCR engine.",
+    )
+
     if not files:
         st.info("Upload one or more `.xlsx` lab reports above to review.")
         return
@@ -221,7 +237,8 @@ def render_reviewer():
         st.subheader(f.name)
 
         try:
-            rtype, parsed, findings = review_report(f.name, f.getvalue())
+            with st.spinner("Reviewing…"):
+                rtype, parsed, findings = review_report(f.name, f.getvalue(), ocr=ocr)
         except Exception as e:
             st.error(f"Could not read report — {e}")
             continue
