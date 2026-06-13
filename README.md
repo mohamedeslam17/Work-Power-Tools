@@ -24,16 +24,22 @@ Checks include:
 - **Identity / metadata** — doc number (format + cover/contents match), customer,
   component, preparer, reviewer, approver, PO# present and well-formed
 - **Quantities** — Received = Scrap + Reconditionable; positions listed = received;
-  serial-number scope totals reconcile; Received-Parts table vs Serial-Number
-  protocol agree (catches off-by-one counts)
+  serial-number scope totals reconcile; the stated sum row matches the scopes
+  actually marked on each row (catches stale totals); Received-Parts table vs
+  Serial-Number protocol agree (catches off-by-one counts)
 - **Integrity** — unique & contiguous position numbers, serial numbers present and
-  unique, every part has a repair scope or a scrap mark
-- **Consistency** — executive-summary received count and named scrap positions
-  match the protocol; finding counts ≤ received quantity
+  unique, valid repair-scope values (L/M/H/S), scrap mark ↔ scope 'S', every part scoped
+- **Consistency** — Summary-of-Damages finding counts reconcile with the actual
+  defect marks in the protocol; executive-summary received count and scrap positions agree
 - **Completeness** — an embedded photo for every incoming-photo caption; consistent
   page numbering
 
 Output workbook tabs: **Review Summary** (identity + verdict), **Findings**
 (colour-coded by severity), **Extracted Data** (per-position traceability table).
 
-- Module: `iir_review.py` (also runnable as a CLI: `python iir_review.py report.xlsx [findings.xlsx]`)
+**Batch mode** — review several reports at once for a combined `IIR_Batch_Summary.xlsx`
+(one row per report with verdict + counts, plus a pooled **All Findings** tab).
+
+- Module: `iir_review.py`. CLI: `python iir_review.py report.xlsx` (one report),
+  `python iir_review.py report.xlsx out.xlsx` (explicit output), or
+  `python iir_review.py *.xlsx` (many reports → individual checklists + batch summary).

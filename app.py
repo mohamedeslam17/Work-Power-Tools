@@ -169,13 +169,15 @@ def render_iir_tool():
             "- **Identity / metadata** — doc number, customer, component, preparer, "
             "reviewer, approver and PO# present and well-formed\n"
             "- **Quantities** — Received = Scrap + Reconditionable; positions listed = "
-            "received; serial-number scope totals reconcile; table vs protocol agree\n"
+            "received; serial-number scope totals reconcile; the stated sum row matches "
+            "the scopes actually marked; Received-Parts table vs Serial-Number protocol agree\n"
             "- **Integrity** — unique & contiguous positions, serial numbers present and "
-            "unique, every part has a repair scope or scrap mark\n"
-            "- **Consistency** — executive-summary received count and scrap positions "
-            "match the protocol; finding counts ≤ received\n"
-            "- **Completeness** — incoming photos embedded for each caption; page "
-            "numbering consistent"
+            "unique, valid repair-scope values, scrap mark ↔ scope 'S', every part scoped\n"
+            "- **Consistency** — Summary-of-Damages finding counts match the protocol "
+            "defect marks; executive-summary received count and scrap positions agree\n"
+            "- **Completeness** — incoming photos embedded for each caption; page numbering\n\n"
+            "Review **several reports at once** for a combined **Batch Summary** workbook "
+            "(one row per report + a pooled findings tab)."
         )
 
     st.divider()
@@ -187,14 +189,19 @@ def render_iir_tool():
         key="iir_uploader",
     )
 
+    XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    BADGE = {iir_review.FAIL: "🔴", iir_review.WARN: "🟠", iir_review.PASS: "🟢"}
+
     if 'iir_results' not in st.session_state:
         st.session_state.iir_results = []
+        st.session_state.iir_batch = None
 
     if st.button("▶ Run Review", type="primary", disabled=not iir_files):
         results, errors = [], []
         with st.spinner(f"Reviewing {len(iir_files)} report(s)..."):
-            for f in iir_files:
-                with tempfile.TemporaryDirectory() as tmp:
+            with tempfile.TemporaryDirectory() as tmp:
+                records = []
+                for f in iir_files:
                     path = os.path.join(tmp, f.name)
                     with open(path, "wb") as fh:
                         fh.write(f.getvalue())
@@ -206,6 +213,7 @@ def render_iir_tool():
                         counts, verdict = iir_review.build_checklist(data, findings, out_path)
                         with open(out_path, "rb") as fh:
                             xbytes = fh.read()
+                        records.append(iir_review.record_of(data, findings))
                         results.append({
                             'name': out_name, 'src': f.name, 'bytes': xbytes,
                             'ident': data['ident'], 'rp': data['received_parts'],
@@ -214,61 +222,98 @@ def render_iir_tool():
                         })
                     except Exception as e:
                         errors.append(f"{f.name}: {e}")
+                batch_bytes = None
+                if len(records) > 1:
+                    bpath = os.path.join(tmp, "IIR_Batch_Summary.xlsx")
+                    iir_review.build_batch_summary(records, bpath)
+                    with open(bpath, "rb") as fh:
+                        batch_bytes = fh.read()
         for err in errors:
             st.error(f"Review failed — {err}")
         st.session_state.iir_results = results
+        st.session_state.iir_batch = batch_bytes
 
     results = st.session_state.iir_results
-    if not results and not iir_files:
-        st.info("Upload one or more IIR Excel files above to run the review.")
+    if not results:
+        if not iir_files:
+            st.info("Upload one or more IIR Excel files above to run the review.")
         return
 
-    for i, r in enumerate(results):
-        st.divider()
+    # ── Batch overview (one row per report) ──────────────────────────────────
+    st.divider()
+    tot = {k: sum(r['counts'][k] for r in results)
+           for k in (iir_review.FAIL, iir_review.WARN, iir_review.INFO, iir_review.PASS)}
+    st.subheader(f"Batch overview — {len(results)} report(s)")
+    overview = []
+    for r in results:
         c = r['counts']
-        verdict_kind = (iir_review.FAIL if c[iir_review.FAIL]
-                        else iir_review.WARN if c[iir_review.WARN] else iir_review.PASS)
-        badge = {iir_review.FAIL: "🔴", iir_review.WARN: "🟠", iir_review.PASS: "🟢"}[verdict_kind]
-        st.subheader(f"{badge} {r['src']}")
-
-        ident = r['ident']
-        st.caption(
-            f"**{ident.get('doc_no','?')}** · {ident.get('customer','?')} · "
-            f"{ident.get('component','?')}  —  prepared by "
-            f"{ident.get('preparer') or ident.get('author','?')}, "
-            f"reviewed by {ident.get('reviewer','?')}"
-        )
-
-        m = st.columns(4)
-        m[0].metric("🔴 Fail", c[iir_review.FAIL])
-        m[1].metric("🟠 Warn", c[iir_review.WARN])
-        m[2].metric("🔵 Info", c[iir_review.INFO])
-        m[3].metric("🟢 Pass", c[iir_review.PASS])
-
+        sev, label = iir_review.verdict_of(c)
         rp = r['rp']
-        if rp.get('found'):
-            st.caption(
-                f"Received **{rp['received']}** · Scrap **{rp['scrap']}** · "
-                f"Reconditionable **{rp['reconditionable']}** · "
-                f"Positions in protocol **{r['npos']}**"
-            )
+        overview.append({
+            "Verdict": f"{BADGE[sev]} {label.split(' — ')[0]}",
+            "Report": r['src'],
+            "Doc No": r['ident'].get('doc_no', ''),
+            "Component": r['ident'].get('component', ''),
+            "Recv": rp.get('received') if rp.get('found') else None,
+            "Scrap": rp.get('scrap') if rp.get('found') else None,
+            "Recond": rp.get('reconditionable') if rp.get('found') else None,
+            "🔴": c[iir_review.FAIL], "🟠": c[iir_review.WARN],
+            "🔵": c[iir_review.INFO], "🟢": c[iir_review.PASS],
+        })
+    st.dataframe(overview, use_container_width=True, hide_index=True)
 
-        rows = [{
-            "Severity": f"{iir_review.SEV_ICON[f['severity']]} {f['severity']}",
-            "Category": f['category'],
-            "Check": f['check'],
-            "Sheet": f['sheet'],
-            "Detail": f['detail'],
-        } for f in r['findings']]
-        st.dataframe(rows, use_container_width=True, hide_index=True)
+    m = st.columns(4)
+    m[0].metric("🔴 Fail", tot[iir_review.FAIL])
+    m[1].metric("🟠 Warn", tot[iir_review.WARN])
+    m[2].metric("🔵 Info", tot[iir_review.INFO])
+    m[3].metric("🟢 Pass", tot[iir_review.PASS])
 
+    if st.session_state.iir_batch:
         st.download_button(
-            label="⬇ Download findings checklist (.xlsx)",
-            data=r['bytes'],
-            file_name=r['name'],
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key=f"iir_dl_{i}",
+            "⬇ Download batch summary (.xlsx)",
+            data=st.session_state.iir_batch,
+            file_name="IIR_Batch_Summary.xlsx",
+            mime=XLSX_MIME, key="iir_batch_dl", type="primary",
         )
+
+    # ── Per-report detail (expanders) ────────────────────────────────────────
+    st.divider()
+    st.subheader("Report details")
+    for i, r in enumerate(results):
+        c = r['counts']
+        sev, _ = iir_review.verdict_of(c)
+        ident = r['ident']
+        header = (f"{BADGE[sev]} {r['src']}  —  {c[iir_review.FAIL]}F / "
+                  f"{c[iir_review.WARN]}W / {c[iir_review.INFO]}I / {c[iir_review.PASS]}P")
+        with st.expander(header, expanded=(sev != iir_review.PASS)):
+            st.caption(
+                f"**{ident.get('doc_no','?')}** · {ident.get('customer','?')} · "
+                f"{ident.get('component','?')}  —  prepared by "
+                f"{ident.get('preparer') or ident.get('author','?')}, "
+                f"reviewed by {ident.get('reviewer','?')}"
+            )
+            rp = r['rp']
+            if rp.get('found'):
+                st.caption(
+                    f"Received **{rp['received']}** · Scrap **{rp['scrap']}** · "
+                    f"Reconditionable **{rp['reconditionable']}** · "
+                    f"Positions in protocol **{r['npos']}**"
+                )
+            rows = [{
+                "Severity": f"{iir_review.SEV_ICON[f['severity']]} {f['severity']}",
+                "Category": f['category'],
+                "Check": f['check'],
+                "Sheet": f['sheet'],
+                "Detail": f['detail'],
+            } for f in r['findings']]
+            st.dataframe(rows, use_container_width=True, hide_index=True)
+            st.download_button(
+                label="⬇ Download findings checklist (.xlsx)",
+                data=r['bytes'],
+                file_name=r['name'],
+                mime=XLSX_MIME,
+                key=f"iir_dl_{i}",
+            )
 
 
 # ── Router ──────────────────────────────────────────────────────────────────

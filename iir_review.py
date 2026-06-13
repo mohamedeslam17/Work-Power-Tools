@@ -38,6 +38,13 @@ def _num(v):
             return float(g) if '.' in g else int(g)
     return None
 
+def _canon(s):
+    """Canonicalise a defect/finding label for fuzzy comparison: lower-case,
+    drop punctuation, singularise each word."""
+    s = re.sub(r'[^a-z0-9 ]+', ' ', str(s).lower())
+    s = re.sub(r'\s+', ' ', s).strip()
+    return ' '.join(re.sub(r's$', '', w) for w in s.split())
+
 def _cells(ws):
     for row in ws.iter_rows():
         for c in row:
@@ -435,11 +442,21 @@ def run_checks(d):
         else:
             out.append(_f("Repair scope per position", PASS, "Serial Number",
                           "Every position has a repair scope or scrap mark", "Integrity"))
-        # scrap rows should carry scope 'S'
-        bad_scrap = [r['pos'] for r in sn if r['scrap'] and r['scope'] not in ('S', '')]
-        if bad_scrap:
-            out.append(_f("Scrap rows scoped 'S'", WARN, "Serial Number",
-                          f"Scrap-marked rows with non-S scope: {bad_scrap}", "Integrity"))
+        # repair-scope values must be one of L / M / H / S
+        bad_vals = sorted({r['scope'] for r in sn
+                           if r['scope'] and r['scope'] not in ('L', 'M', 'H', 'S')})
+        if bad_vals:
+            out.append(_f("Repair-scope values valid", WARN, "Serial Number",
+                          f"Unexpected repair-scope value(s): {bad_vals} (expected L/M/H/S)", "Integrity"))
+        # scrap marks and scope 'S' must agree both ways
+        scrap_not_s = [r['pos'] for r in sn if r['scrap'] and r['scope'] not in ('S', '')]
+        s_not_scrap = [r['pos'] for r in sn if r['scope'] == 'S' and not r['scrap']]
+        if scrap_not_s:
+            out.append(_f("Scrap mark ↔ scope 'S'", WARN, "Serial Number",
+                          f"Scrap-marked but scope is not 'S': position(s) {scrap_not_s}", "Integrity"))
+        if s_not_scrap:
+            out.append(_f("Scrap mark ↔ scope 'S'", WARN, "Serial Number",
+                          f"Scope 'S' but not scrap-marked: position(s) {s_not_scrap}", "Integrity"))
 
     # ── serial-number sum row reconciliation ─────────────────────────────────
     if sumrow:
@@ -475,24 +492,65 @@ def run_checks(d):
                       "No 'Sum Scrap/Light/Medium/Heavy / Total Parts Received' row found "
                       "(present in the standard template)", "Completeness"))
 
+    # ── stated sum row vs the scopes actually marked on each row ─────────────
+    if sumrow and sn:
+        scope_ct = {c: sum(1 for r in sn if r['scope'] == c) for c in ('S', 'L', 'M', 'H')}
+        diffs = []
+        for word, key, code in [('Scrap', 'sum scrap', 'S'), ('Light', 'sum light', 'L'),
+                                 ('Medium', 'sum medium', 'M'), ('Heavy', 'sum heavy', 'H')]:
+            if key in sumrow and sumrow[key] != scope_ct[code]:
+                diffs.append(f"{word} row = {sumrow[key]} but {scope_ct[code]} part(s) scoped '{code}'")
+        if diffs:
+            out.append(_f("Sum row = scopes marked", FAIL, "Serial Number",
+                          "; ".join(diffs) + " — the totals row may be stale", "Quantities"))
+        else:
+            out.append(_f("Sum row = scopes marked", PASS, "Serial Number",
+                          f"Totals row agrees with marked scopes "
+                          f"(S {scope_ct['S']} / L {scope_ct['L']} / M {scope_ct['M']} / H {scope_ct['H']})",
+                          "Quantities"))
+
+    # ── Summary-of-Damages finding counts vs defect marks in the protocol ────
+    if d['findings_tbl'] and sn:
+        tally = {}
+        for r in sn:
+            for dd in r['defects']:
+                tally[_canon(dd)] = tally.get(_canon(dd), 0) + 1
+        compared, mism = 0, []
+        for name, cnt in d['findings_tbl'].items():
+            if not isinstance(cnt, (int, float)):
+                continue
+            key = _canon(name)
+            if key in tally:
+                compared += 1
+                if tally[key] != cnt:
+                    mism.append((name, int(cnt), tally[key]))
+        for name, cnt, act in mism:
+            out.append(_f("Finding count vs protocol", WARN, "Summary of Damages / Serial Number",
+                          f"'{name}' summary shows {cnt} but {act} part(s) marked in the protocol "
+                          f"(off by {cnt - act:+d})", "Consistency"))
+        if compared and not mism:
+            out.append(_f("Finding counts vs protocol", PASS, "Summary of Damages",
+                          f"{compared} finding categor{'y' if compared == 1 else 'ies'} reconcile "
+                          f"with the protocol defect marks", "Consistency"))
+
     # ── executive summary cross-checks ───────────────────────────────────────
     if d['exec_received'] is not None and rp['found'] and d['exec_received'] != rp['received']:
         out.append(_f("Exec-summary received count", WARN, "Executive Summary",
                       f"Narrative says 'total of {d['exec_received']}' but table received = {rp['received']}",
                       "Consistency"))
     if d['exec_scrap_pos'] and sn:
-        sn_scrap = sorted({r['pos'] for r in sn if r['scrap']})
+        sn_scrap = {r['pos'] for r in sn if r['scrap']}
         narrative = set(d['exec_scrap_pos'])
-        if narrative and sn_scrap and narrative != set(sn_scrap):
-            only_text = sorted(narrative - set(sn_scrap))
-            only_tbl = sorted(set(sn_scrap) - narrative)
-            bits = []
-            if only_text:
-                bits.append(f"named in summary but not scrap-marked: {only_text}")
-            if only_tbl:
-                bits.append(f"scrap-marked but not named in summary: {only_tbl}")
-            out.append(_f("Scrap positions: summary vs protocol", WARN, "Executive Summary",
-                          "; ".join(bits), "Consistency"))
+        only_text = sorted(narrative - sn_scrap)   # claimed scrap that isn't marked
+        only_tbl = sorted(sn_scrap - narrative)    # marked scrap not enumerated
+        if only_text:
+            out.append(_f("Scrap positions named are marked", WARN, "Executive Summary",
+                          f"Position(s) named as scrap in the summary but not scrap-marked "
+                          f"in the protocol: {only_text}", "Consistency"))
+        if only_tbl:
+            out.append(_f("Scrap positions enumerated", INFO, "Executive Summary",
+                          f"Scrap-marked in the protocol but not enumerated in the summary: "
+                          f"{only_tbl} (often qualification/sample parts)", "Consistency"))
 
     # ── findings table sanity ────────────────────────────────────────────────
     if d['findings_tbl'] and rp['found'] and rp['received']:
@@ -556,6 +614,25 @@ def run_checks(d):
     out.sort(key=lambda x: (SEV_RANK[x['severity']], x['category']))
     return out
 
+def count_severities(findings):
+    return {s: sum(1 for f in findings if f['severity'] == s) for s in (FAIL, WARN, INFO, PASS)}
+
+def verdict_of(counts):
+    """Return (severity, label) summarising a set of findings."""
+    if counts[FAIL]:
+        return FAIL, "FAIL — issues require correction"
+    if counts[WARN]:
+        return WARN, "REVIEW — warnings to confirm"
+    return PASS, "PASS — no blocking issues"
+
+def top_issue(findings):
+    """The single most important finding's detail (first FAIL, else WARN)."""
+    for sev in (FAIL, WARN):
+        for f in findings:
+            if f['severity'] == sev:
+                return f"[{sev}] {f['check']}: {f['detail']}"
+    return "—"
+
 # ════════════════════════════════════════════════════════════════════════════
 # EXCEL CHECKLIST
 # ════════════════════════════════════════════════════════════════════════════
@@ -570,9 +647,8 @@ def build_checklist(data, findings, out_path):
     hdr_font = Font(bold=True, color="FFFFFF", size=11, name="Calibri")
     label_font = Font(bold=True, name="Calibri", size=10)
 
-    counts = {s: sum(1 for f in findings if f['severity'] == s) for s in (FAIL, WARN, INFO, PASS)}
-    verdict = "FAIL — issues require correction" if counts[FAIL] else (
-        "REVIEW — warnings to confirm" if counts[WARN] else "PASS — no blocking issues")
+    counts = count_severities(findings)
+    _, verdict = verdict_of(counts)
 
     # ── Sheet 1: Review Summary ──────────────────────────────────────────────
     ws = wb.active
@@ -662,6 +738,107 @@ def build_checklist(data, findings, out_path):
     return counts, verdict
 
 # ════════════════════════════════════════════════════════════════════════════
+# BATCH SUMMARY  (many reports → one cross-report workbook)
+# ════════════════════════════════════════════════════════════════════════════
+def record_of(data, findings):
+    """Compact per-report record consumed by the batch summary and the app."""
+    return {'file': data['file'], 'ident': data['ident'],
+            'rp': data['received_parts'], 'npos': len(data['sn_rows']),
+            'findings': findings, 'counts': count_severities(findings)}
+
+def build_batch_summary(records, out_path):
+    """records: list of record_of(...) dicts. Writes a cross-report workbook
+    with a one-row-per-report 'Batch Summary' and a pooled 'All Findings' tab."""
+    NAVY = "1A1A2E"
+    hdr_fill = PatternFill("solid", fgColor=NAVY)
+    hdr_font = Font(bold=True, color="FFFFFF", size=11, name="Calibri")
+    wb = openpyxl.Workbook()
+
+    # ── Sheet 1: one row per report ──────────────────────────────────────────
+    ws = wb.active
+    ws.title = "Batch Summary"
+    ws.sheet_view.showGridLines = False
+    ws['A1'] = "IIR Batch Review"
+    ws['A1'].font = Font(bold=True, size=15, color=NAVY, name="Calibri")
+    ws['A2'] = f"{len(records)} report(s) reviewed"
+    ws['A2'].font = Font(italic=True, color="555555", name="Calibri")
+
+    headers = ["Report", "Doc No", "Customer", "Component", "Recv", "Scrap", "Recond",
+               "Pos", "Fail", "Warn", "Info", "Pass", "Verdict", "Top issue"]
+    widths  = [30, 13, 26, 24, 7, 7, 8, 6, 6, 6, 6, 6, 10, 75]
+    hrow = 4
+    for j, (h, w) in enumerate(zip(headers, widths), start=1):
+        c = ws.cell(hrow, j, h)
+        c.fill = hdr_fill; c.font = hdr_font
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        ws.column_dimensions[chr(64 + j)].width = w
+
+    tot = {FAIL: 0, WARN: 0, INFO: 0, PASS: 0}
+    for i, rec in enumerate(records):
+        counts = rec.get('counts') or count_severities(rec['findings'])
+        for k in tot:
+            tot[k] += counts[k]
+        sev, label = verdict_of(counts)
+        ident, rp = rec['ident'], rec['rp']
+        gv = (lambda k: rp.get(k) if rp.get('found') else "")
+        vals = [rec['file'], ident.get('doc_no', ''), ident.get('customer', ''),
+                ident.get('component', ''), gv('received'), gv('scrap'),
+                gv('reconditionable'), rec['npos'], counts[FAIL], counts[WARN],
+                counts[INFO], counts[PASS], label.split(' — ')[0], top_issue(rec['findings'])]
+        r = hrow + 1 + i
+        for j, v in enumerate(vals, start=1):
+            c = ws.cell(r, j, v); c.font = Font(name="Calibri", size=10)
+            c.alignment = Alignment(vertical="top", wrap_text=(j == 14),
+                                    horizontal="center" if 5 <= j <= 13 else "left")
+            _set_border(c)
+            if j == 13:
+                c.fill = PatternFill("solid", fgColor=SEV_FILL[sev])
+                c.font = Font(bold=True, color=SEV_FONT[sev], name="Calibri", size=10)
+            elif j == 9 and counts[FAIL]:
+                c.fill = PatternFill("solid", fgColor=SEV_FILL[FAIL])
+            elif j == 10 and counts[WARN]:
+                c.fill = PatternFill("solid", fgColor=SEV_FILL[WARN])
+    # totals row
+    r = hrow + 1 + len(records)
+    tc = ws.cell(r, 8, "TOTAL"); tc.font = Font(bold=True, name="Calibri", size=10)
+    tc.alignment = Alignment(horizontal="right")
+    for j, key in [(9, FAIL), (10, WARN), (11, INFO), (12, PASS)]:
+        c = ws.cell(r, j, tot[key]); c.font = Font(bold=True, name="Calibri", size=10)
+        c.alignment = Alignment(horizontal="center")
+    ws.freeze_panes = ws.cell(hrow + 1, 1)
+    ws.auto_filter.ref = f"A{hrow}:N{hrow + len(records)}"
+
+    # ── Sheet 2: pooled findings across all reports ──────────────────────────
+    fs = wb.create_sheet("All Findings")
+    fs.sheet_view.showGridLines = False
+    fheaders = ["Report", "Doc No", "Severity", "Category", "Check", "Sheet", "Detail"]
+    fwidths  = [28, 12, 11, 14, 32, 24, 80]
+    for j, (h, w) in enumerate(zip(fheaders, fwidths), start=1):
+        c = fs.cell(1, j, h); c.fill = hdr_fill; c.font = hdr_font
+        c.alignment = Alignment(horizontal="center", vertical="center")
+        fs.column_dimensions[chr(64 + j)].width = w
+    pooled = [(rec['file'], rec['ident'].get('doc_no', ''), f)
+              for rec in records for f in rec['findings']]
+    pooled.sort(key=lambda t: (SEV_RANK[t[2]['severity']], t[0]))
+    for i, (fname, doc, f) in enumerate(pooled, start=2):
+        vals = [fname, doc, f"{SEV_ICON[f['severity']]} {f['severity']}", f['category'],
+                f['check'], f['sheet'], f['detail']]
+        for j, v in enumerate(vals, start=1):
+            c = fs.cell(i, j, v); c.font = Font(name="Calibri", size=9)
+            c.alignment = Alignment(vertical="top", wrap_text=(j == 7),
+                                    horizontal="center" if j == 3 else "left")
+            _set_border(c)
+            if j == 3:
+                c.fill = PatternFill("solid", fgColor=SEV_FILL[f['severity']])
+                c.font = Font(bold=True, color=SEV_FONT[f['severity']], name="Calibri", size=9)
+    fs.freeze_panes = "A2"
+    if pooled:
+        fs.auto_filter.ref = f"A1:G{len(pooled) + 1}"
+
+    wb.save(out_path)
+    return tot
+
+# ════════════════════════════════════════════════════════════════════════════
 def review(path, out_path=None):
     """Parse + check one IIR workbook and write the checklist. Returns
     (data, findings, out_path)."""
@@ -673,21 +850,45 @@ def review(path, out_path=None):
     return data, findings, out_path
 
 def main():
-    if len(sys.argv) < 2:
+    args = sys.argv[1:]
+    if not args:
         print(__doc__)
         sys.exit(1)
-    src = sys.argv[1]
-    if not os.path.exists(src):
-        sys.exit(f"Not found: {src}")
-    out = sys.argv[2] if len(sys.argv) > 2 else f"IIR_Review_{Path(src).stem}.xlsx"
-    print(f"Reviewing: {src}")
-    data, findings, out = review(src, out)
-    counts = {s: sum(1 for f in findings if f['severity'] == s) for s in (FAIL, WARN, INFO, PASS)}
-    print(f"  {data['ident'].get('doc_no')} · {data['ident'].get('customer')} · {data['ident'].get('component')}")
-    for f in findings:
-        print(f"   {SEV_ICON[f['severity']]} [{f['severity']:4}] {f['check']}: {f['detail']}")
-    print(f"\n  {counts[FAIL]} FAIL · {counts[WARN]} WARN · {counts[INFO]} INFO · {counts[PASS]} PASS")
-    print(f"✅  Checklist: {out} ({os.path.getsize(out)//1024} KB)")
+
+    # Back-compatible: "report.xlsx out.xlsx" (single input + explicit output).
+    explicit_out = None
+    if len(args) == 2 and os.path.exists(args[0]) \
+            and not os.path.exists(args[1]) and args[1].lower().endswith('.xlsx'):
+        inputs, explicit_out = [args[0]], args[1]
+    else:
+        inputs = [a for a in args if a.lower().endswith('.xlsx') and os.path.exists(a)]
+    for a in args:
+        if a.lower().endswith('.xlsx') and a not in inputs and a != explicit_out:
+            print(f"  (skipped, not found: {a})")
+    if not inputs:
+        sys.exit("No existing .xlsx input file(s) given.")
+
+    records = []
+    for src in inputs:
+        out = explicit_out or f"IIR_Review_{Path(src).stem}.xlsx"
+        data, findings, out = review(src, out)
+        counts = count_severities(findings)
+        sev, _ = verdict_of(counts)
+        print(f"\n{SEV_ICON[sev]} {data['file']}")
+        print(f"   {data['ident'].get('doc_no')} · {data['ident'].get('customer')} · "
+              f"{data['ident'].get('component')}")
+        for f in findings:
+            if f['severity'] in (FAIL, WARN):
+                print(f"     {SEV_ICON[f['severity']]} {f['check']}: {f['detail']}")
+        print(f"   → {counts[FAIL]} FAIL · {counts[WARN]} WARN · {counts[INFO]} INFO · "
+              f"{counts[PASS]} PASS   ({out})")
+        records.append(record_of(data, findings))
+
+    if len(records) > 1:
+        batch = "IIR_Batch_Summary.xlsx"
+        tot = build_batch_summary(records, batch)
+        print(f"\n📊 Batch summary of {len(records)} reports → {batch}")
+        print(f"   {tot[FAIL]} FAIL · {tot[WARN]} WARN · {tot[INFO]} INFO · {tot[PASS]} PASS")
 
 if __name__ == "__main__":
     main()
