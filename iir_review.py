@@ -21,6 +21,69 @@ SEV_FILL  = {FAIL: "FFC7CE", WARN: "FFEB9C", INFO: "D9E1F2", PASS: "C6EFCE"}
 SEV_FONT  = {FAIL: "9C0006", WARN: "9C6500", INFO: "1F4E78", PASS: "006100"}
 SEV_ICON  = {FAIL: "🔴", WARN: "🟠", INFO: "🔵", PASS: "🟢"}
 
+# ── configurable severities ────────────────────────────────────────────────
+OFF = "Off"
+SEVERITY_CHOICES = [FAIL, WARN, INFO, OFF]
+
+# Problem-producing checks in display order: (category, title, default severity).
+# The "all good" PASS confirmations are intentionally not configurable.
+CHECK_CATALOG = [
+    ("Identity",     "Header metadata complete",             FAIL),
+    ("Identity",     "PO number assigned",                   WARN),
+    ("Identity",     "Doc-number format",                    WARN),
+    ("Identity",     "Doc-number cover vs contents",         WARN),
+    ("Identity",     "Preparer name complete",               WARN),
+    ("Identity",     "Name fields tidy",                     INFO),
+    ("Quantities",   "Received-parts table found",           FAIL),
+    ("Quantities",   "Received = Scrap + Reconditionable",   FAIL),
+    ("Quantities",   "Received ≤ Required",                  WARN),
+    ("Quantities",   "Required quantity plausible",          WARN),
+    ("Quantities",   "Positions listed = Received",          FAIL),
+    ("Quantities",   "Scope totals = Total received",        FAIL),
+    ("Quantities",   "Sum-row total = positions listed",     WARN),
+    ("Quantities",   "Sum row = scopes marked",              FAIL),
+    ("Quantities",   "Reconditionable: table vs protocol",   FAIL),
+    ("Quantities",   "Scrap count: table vs protocol",       FAIL),
+    ("Integrity",    "Position numbers unique",              FAIL),
+    ("Integrity",    "Position numbering contiguous",        WARN),
+    ("Integrity",    "Serial number per position",           WARN),
+    ("Integrity",    "Serial numbers unique",                WARN),
+    ("Integrity",    "Repair scope per position",            WARN),
+    ("Integrity",    "Repair-scope values valid",            WARN),
+    ("Integrity",    "Scrap mark ↔ scope 'S'",               WARN),
+    ("Consistency",  "Finding count vs protocol",            WARN),
+    ("Consistency",  "Finding counts ≤ received",            WARN),
+    ("Consistency",  "Exec-summary received count",          WARN),
+    ("Consistency",  "Scrap positions named are marked",     WARN),
+    ("Consistency",  "Scrap positions enumerated",           INFO),
+    ("Consistency",  "Serial-number summary totals present", WARN),
+    ("Completeness", "Photos embedded",                      FAIL),
+    ("Completeness", "Photo per caption",                    WARN),
+    ("Completeness", "Page numbers unique",                  WARN),
+    ("Completeness", "Page sequence contiguous",             WARN),
+    ("Completeness", "Page 'of N' consistent",               WARN),
+    ("Completeness", "Page footers show total",              INFO),
+    ("Completeness", "Page total vs sheet count",            INFO),
+]
+DEFAULT_SEVERITY = {title: sev for _, title, sev in CHECK_CATALOG}
+
+def apply_overrides(findings, overrides):
+    """Remap non-PASS finding severities per `overrides` ({check_title:
+    severity|OFF}). PASS confirmations are left untouched; a check set to OFF
+    is dropped from the results."""
+    if not overrides:
+        return findings
+    kept = []
+    for f in findings:
+        if f['severity'] == PASS or f['check'] not in overrides:
+            kept.append(f)
+            continue
+        sev = overrides[f['check']]
+        if sev == OFF:
+            continue
+        kept.append(dict(f, severity=sev) if sev != f['severity'] else f)
+    return kept
+
 # ── low-level helpers ──────────────────────────────────────────────────────
 def _norm(v):
     return re.sub(r'\s+', ' ', str(v)).strip() if v is not None else ''
@@ -331,7 +394,7 @@ def _f(check, severity, sheet, detail, category="General"):
     return {'check': check, 'category': category, 'severity': severity,
             'sheet': sheet, 'detail': detail}
 
-def run_checks(d):
+def run_checks(d, overrides=None):
     out = []
     ident = d['ident']
     rp = d['received_parts']
@@ -374,7 +437,7 @@ def run_checks(d):
     for k, lbl in [('reviewer', 'Reviewer'), ('approver', 'Approver')]:
         v = ident.get(k)
         if isinstance(v, str) and v != v.strip():
-            out.append(_f(f"{lbl} field tidy", INFO, "Cover",
+            out.append(_f("Name fields tidy", INFO, "Cover",
                           f"{lbl} value has stray whitespace: '{v}'", "Identity"))
 
     # ── received-parts internal reconciliation ───────────────────────────────
@@ -610,7 +673,8 @@ def run_checks(d):
         out.append(_f("Incoming photos present", PASS, "Incoming photos",
                       f"{len(d['photos'])} photo sheet(s), {total_imgs} images embedded", "Completeness"))
 
-    # stable sort: severity first, then category
+    # apply user severity overrides, then stable-sort: severity, then category
+    out = apply_overrides(out, overrides)
     out.sort(key=lambda x: (SEV_RANK[x['severity']], x['category']))
     return out
 

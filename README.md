@@ -37,6 +37,12 @@ Checks include:
 Output workbook tabs: **Review Summary** (identity + verdict), **Findings**
 (colour-coded by severity), **Extracted Data** (per-position traceability table).
 
+**Tunable severities** — a **Check settings** panel lets you set each check to
+🔴 Fail / 🟠 Warn / 🔵 Info / ⚪ Off. The findings, counts and pass/review/fail
+verdict update live, so you can match the review to your own QA policy (e.g. treat
+a provisional PO# as Info, or promote a miscount to Fail). Defaults live in
+`iir_review.CHECK_CATALOG`.
+
 **Batch mode** — review several reports at once for a combined `IIR_Batch_Summary.xlsx`
 (one row per report with verdict + counts, plus a pooled **All Findings** tab).
 

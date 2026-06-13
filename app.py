@@ -154,9 +154,37 @@ def render_sem_tool():
 # TOOL 2 — IIR Quality Review
 # ════════════════════════════════════════════════════════════════════════════
 def render_iir_tool():
+    import io
     import iir_review
+    from itertools import groupby
 
-    SEV_ORDER = [iir_review.FAIL, iir_review.WARN, iir_review.INFO, iir_review.PASS]
+    XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    BADGE = {iir_review.FAIL: "🔴", iir_review.WARN: "🟠",
+             iir_review.INFO: "🔵", iir_review.PASS: "🟢"}
+    CHOICE_LABEL = {iir_review.FAIL: "🔴 Fail", iir_review.WARN: "🟠 Warn",
+                    iir_review.INFO: "🔵 Info", iir_review.OFF: "⚪ Off"}
+
+    def check_settings():
+        """Severity dropdown per check; returns {check_title: severity|OFF}."""
+        with st.expander("⚙️ Check settings — set the severity of each check"):
+            st.caption("Change any check's level, or turn it Off. The overview and "
+                       "verdicts below update immediately — no need to re-upload.")
+            if st.button("↺ Reset to defaults", key="iir_sev_reset"):
+                for _, title, _ in iir_review.CHECK_CATALOG:
+                    st.session_state.pop(f"iir_sev::{title}", None)
+            chosen = {}
+            for cat, items in groupby(iir_review.CHECK_CATALOG, key=lambda t: t[0]):
+                st.markdown(f"**{cat}**")
+                items = list(items)
+                cols = st.columns(2)
+                for j, (_, title, default) in enumerate(items):
+                    chosen[title] = cols[j % 2].selectbox(
+                        title, iir_review.SEVERITY_CHOICES,
+                        index=iir_review.SEVERITY_CHOICES.index(default),
+                        format_func=lambda s: CHOICE_LABEL[s],
+                        key=f"iir_sev::{title}",
+                    )
+        return chosen
 
     st.title("IIR Quality Review")
     st.markdown(
@@ -189,55 +217,45 @@ def render_iir_tool():
         key="iir_uploader",
     )
 
-    XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    BADGE = {iir_review.FAIL: "🔴", iir_review.WARN: "🟠", iir_review.PASS: "🟢"}
+    if 'iir_data' not in st.session_state:
+        st.session_state.iir_data = []   # [{'src': name, 'data': parsed}, ...]
 
-    if 'iir_results' not in st.session_state:
-        st.session_state.iir_results = []
-        st.session_state.iir_batch = None
-
+    # Parse on demand; cached so changing the check settings re-checks instantly.
     if st.button("▶ Run Review", type="primary", disabled=not iir_files):
-        results, errors = [], []
-        with st.spinner(f"Reviewing {len(iir_files)} report(s)..."):
+        parsed, errors = [], []
+        with st.spinner(f"Reading {len(iir_files)} report(s)..."):
             with tempfile.TemporaryDirectory() as tmp:
-                records = []
                 for f in iir_files:
                     path = os.path.join(tmp, f.name)
                     with open(path, "wb") as fh:
                         fh.write(f.getvalue())
-                    out_name = f"IIR_Review_{Path(f.name).stem}.xlsx"
-                    out_path = os.path.join(tmp, out_name)
                     try:
-                        data = iir_review.parse_iir(path)
-                        findings = iir_review.run_checks(data)
-                        counts, verdict = iir_review.build_checklist(data, findings, out_path)
-                        with open(out_path, "rb") as fh:
-                            xbytes = fh.read()
-                        records.append(iir_review.record_of(data, findings))
-                        results.append({
-                            'name': out_name, 'src': f.name, 'bytes': xbytes,
-                            'ident': data['ident'], 'rp': data['received_parts'],
-                            'npos': len(data['sn_rows']),
-                            'findings': findings, 'counts': counts, 'verdict': verdict,
-                        })
+                        parsed.append({'src': f.name, 'data': iir_review.parse_iir(path)})
                     except Exception as e:
                         errors.append(f"{f.name}: {e}")
-                batch_bytes = None
-                if len(records) > 1:
-                    bpath = os.path.join(tmp, "IIR_Batch_Summary.xlsx")
-                    iir_review.build_batch_summary(records, bpath)
-                    with open(bpath, "rb") as fh:
-                        batch_bytes = fh.read()
         for err in errors:
             st.error(f"Review failed — {err}")
-        st.session_state.iir_results = results
-        st.session_state.iir_batch = batch_bytes
+        st.session_state.iir_data = parsed
 
-    results = st.session_state.iir_results
-    if not results:
-        if not iir_files:
-            st.info("Upload one or more IIR Excel files above to run the review.")
+    parsed = st.session_state.iir_data
+    if not parsed:
+        st.info("Upload IIR Excel file(s) and click ▶ Run Review." if iir_files
+                else "Upload one or more IIR Excel files above to run the review.")
         return
+
+    overrides = check_settings()
+
+    # Re-run the checks for every report with the current severity settings.
+    results = []
+    for item in parsed:
+        data = item['data']
+        findings = iir_review.run_checks(data, overrides)
+        results.append({
+            'src': item['src'], 'data': data, 'findings': findings,
+            'counts': iir_review.count_severities(findings),
+            'ident': data['ident'], 'rp': data['received_parts'],
+            'npos': len(data['sn_rows']),
+        })
 
     # ── Batch overview (one row per report) ──────────────────────────────────
     st.divider()
@@ -268,12 +286,14 @@ def render_iir_tool():
     m[2].metric("🔵 Info", tot[iir_review.INFO])
     m[3].metric("🟢 Pass", tot[iir_review.PASS])
 
-    if st.session_state.iir_batch:
+    if len(results) > 1:
+        records = [iir_review.record_of(r['data'], r['findings']) for r in results]
+        buf = io.BytesIO()
+        iir_review.build_batch_summary(records, buf)
         st.download_button(
-            "⬇ Download batch summary (.xlsx)",
-            data=st.session_state.iir_batch,
-            file_name="IIR_Batch_Summary.xlsx",
-            mime=XLSX_MIME, key="iir_batch_dl", type="primary",
+            "⬇ Download batch summary (.xlsx)", data=buf.getvalue(),
+            file_name="IIR_Batch_Summary.xlsx", mime=XLSX_MIME,
+            key="iir_batch_dl", type="primary",
         )
 
     # ── Per-report detail (expanders) ────────────────────────────────────────
@@ -307,12 +327,13 @@ def render_iir_tool():
                 "Detail": f['detail'],
             } for f in r['findings']]
             st.dataframe(rows, use_container_width=True, hide_index=True)
+            buf = io.BytesIO()
+            iir_review.build_checklist(r['data'], r['findings'], buf)
             st.download_button(
                 label="⬇ Download findings checklist (.xlsx)",
-                data=r['bytes'],
-                file_name=r['name'],
-                mime=XLSX_MIME,
-                key=f"iir_dl_{i}",
+                data=buf.getvalue(),
+                file_name=f"IIR_Review_{Path(r['src']).stem}.xlsx",
+                mime=XLSX_MIME, key=f"iir_dl_{i}",
             )
 
 
