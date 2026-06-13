@@ -4,7 +4,14 @@ import os
 from pathlib import Path
 from sem_convert import parse, extract_figures, build
 from lab_review import review_report, summarize
-from photo_lib import add_to_library, alloy_counts, photos_for, LIBRARY_DIR
+from photo_lib import (add_to_library, alloy_counts, photos_for,
+                       get_image_bytes, backend_name, LIBRARY_DIR)
+
+
+@st.cache_data(show_spinner=False)
+def _lib_image(path, drive_id):
+    """Cached fetch of one library image (local file / GitHub / Drive)."""
+    return get_image_bytes({"path": path, "drive_id": drive_id})
 
 st.set_page_config(
     page_title="AEG Materials Tools",
@@ -293,6 +300,7 @@ def render_gallery():
         "Browse stored micrographs **by alloy**, with the data of the report they "
         "came from. Add micrographs from the **Lab Report Review** tab."
     )
+    st.caption(f"Storage backend: **{backend_name()}**")
     counts = alloy_counts()
     total = sum(counts.values())
     if not total:
@@ -300,7 +308,7 @@ def render_gallery():
                 "“Add this report's micrographs to the library”.")
         return
 
-    st.caption(f"{total} micrograph(s) across {len(counts)} alloy(s) · stored in `{LIBRARY_DIR}/`")
+    st.caption(f"{total} micrograph(s) across {len(counts)} alloy(s)")
     pick = st.selectbox("Alloy", [f"{a} ({n})" for a, n in sorted(counts.items())])
     alloy = pick.rsplit(" (", 1)[0]
     recs = photos_for(alloy)
@@ -309,13 +317,13 @@ def render_gallery():
     cols = st.columns(3)
     for i, r in enumerate(recs):
         c = cols[i % 3]
-        path = os.path.join(LIBRARY_DIR, r.get("path", ""))
+        img = _lib_image(r.get("path"), r.get("drive_id"))
         contrast = "etched" if r.get("etched") else "low-contrast"
         cap = f"Job {r.get('job') or '—'} · {r.get('mag') or '?'} · {contrast}"
-        if os.path.exists(path):
-            c.image(path, caption=cap, width="stretch")
+        if img:
+            c.image(img, caption=cap, width="stretch")
         else:
-            c.warning(f"missing file: {r.get('path')}")
+            c.warning(f"missing: {r.get('path') or r.get('drive_id')}")
         meas = r.get("measurements") or []
         line = f"set: {(r.get('source') or '')[:34]}"
         if meas:

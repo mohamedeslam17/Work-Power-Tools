@@ -29,12 +29,32 @@ Extracts the embedded micrographs from a reviewed report into a **per-alloy**
 folder structure with a JSON index, and serves an in-app gallery: pick an alloy
 → see its micrographs with the data of the report they came from (job, magnification,
 etch state, source, any thickness measurements). Implemented in
-[`photo_lib.py`](photo_lib.py); stored under `photo_library/` (override with
-`PHOTO_LIBRARY_DIR`). Add to it via the button in the review tab, or the CLI:
+[`photo_lib.py`](photo_lib.py). Add to it via the button in the review tab, or the CLI:
 
 ```bash
 python3 photo_lib.py "path/to/report.xlsx" [more.xlsx ...]
 ```
+
+**Persistent storage.** Streamlit Community Cloud wipes the local filesystem on
+reboot, so runtime additions need a cloud backend. The library is pluggable and
+auto-selects by what's configured:
+
+* **GitHub** *(recommended — no IT, browser-only)* — commits micrographs into the
+  repo via a fine-grained PAT (Contents: read & write). Set in
+  `.streamlit/secrets.toml` / Streamlit Cloud secrets:
+  ```toml
+  github_token  = "github_pat_..."
+  github_repo   = "owner/Work-Power-Tools"
+  github_branch = "main"          # branch to store files on
+  github_base   = "photo_library" # path prefix in the repo
+  ```
+* **Google Drive** *(alternative)* — OAuth acting as you (see [`drive_store.py`](drive_store.py)).
+  Run `python3 drive_store.py --auth` once for a refresh token, then set
+  `drive_client_id`, `drive_client_secret`, `drive_refresh_token`, `drive_folder_id`.
+  Needs `google-api-python-client google-auth google-auth-oauthlib`.
+* **Local** *(default / fallback)* — a folder (`PHOTO_LIBRARY_DIR`, default
+  `photo_library/`); the committed seed library survives via git, but runtime
+  additions don't persist across reboots.
 
 **Built-in hardness reference.** `HARDNESS_REF` in [`lab_review.py`](lab_review.py)
 holds typical *aged-condition* hardness (HRC) for common Ni- and Co-based
