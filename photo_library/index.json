@@ -14,7 +14,8 @@
     "added": "2026-06-13",
     "component": "2 bucket",
     "title": "Aluminium Slurry Coating on Test Button",
-    "source": "6983 TSME FS.6 2nd Stage Bucket Aluminizing Coating Report - AEG.xlsx"
+    "source": "6983 TSME FS.6 2nd Stage Bucket Aluminizing Coating Report - AEG.xlsx",
+    "etchant": "Unspecified"
   },
   {
     "alloy": "Coating",
@@ -31,7 +32,8 @@
     "added": "2026-06-13",
     "component": "2 bucket",
     "title": "Aluminium Slurry Coating on Test Button",
-    "source": "6983 TSME FS.6 2nd Stage Bucket Aluminizing Coating Report - AEG.xlsx"
+    "source": "6983 TSME FS.6 2nd Stage Bucket Aluminizing Coating Report - AEG.xlsx",
+    "etchant": "Unspecified"
   },
   {
     "alloy": "Coating",
@@ -48,7 +50,8 @@
     "added": "2026-06-13",
     "component": "2 bucket",
     "title": "Aluminium Slurry Coating on Test Button",
-    "source": "6983 TSME FS.6 2nd Stage Bucket Aluminizing Coating Report - AEG.xlsx"
+    "source": "6983 TSME FS.6 2nd Stage Bucket Aluminizing Coating Report - AEG.xlsx",
+    "etchant": "Unspecified"
   },
   {
     "alloy": "Coating",
@@ -64,7 +67,8 @@
     "added": "2026-06-13",
     "component": "2 bucket",
     "title": "Aluminium Slurry Coating on Test Button",
-    "source": "6983 TSME FS.6 2nd Stage Bucket Aluminizing Coating Report - AEG.xlsx"
+    "source": "6983 TSME FS.6 2nd Stage Bucket Aluminizing Coating Report - AEG.xlsx",
+    "etchant": "Unspecified"
   },
   {
     "alloy": "Coating",
@@ -81,7 +85,8 @@
     "added": "2026-06-13",
     "component": "2 bucket",
     "title": "Aluminium Slurry Coating on Test Button",
-    "source": "6983 TSME FS.6 2nd Stage Bucket Aluminizing Coating Report - AEG.xlsx"
+    "source": "6983 TSME FS.6 2nd Stage Bucket Aluminizing Coating Report - AEG.xlsx",
+    "etchant": "Unspecified"
   },
   {
     "alloy": "Coating",
@@ -95,7 +100,8 @@
     "added": "2026-06-13",
     "component": "2 bucket",
     "title": "Aluminium Slurry Coating on Test Button",
-    "source": "6983 TSME FS.6 2nd Stage Bucket Aluminizing Coating Report - AEG.xlsx"
+    "source": "6983 TSME FS.6 2nd Stage Bucket Aluminizing Coating Report - AEG.xlsx",
+    "etchant": "Unspecified"
   },
   {
     "alloy": "Rene-80",
@@ -111,7 +117,8 @@
     "machine": "V84.2",
     "component": "2nd Stage Vane",
     "serial": "CD70356     CD70386\nCD70374  CD70385",
-    "source": "R 6831 AEN Saudi V84.2 2nd Stage Vane  Metallurgical Report - AEG (final).xlsx"
+    "source": "R 6831 AEN Saudi V84.2 2nd Stage Vane  Metallurgical Report - AEG (final).xlsx",
+    "etchant": "Etched (unspecified)"
   },
   {
     "alloy": "Rene-80",
@@ -127,7 +134,8 @@
     "machine": "V84.2",
     "component": "2nd Stage Vane",
     "serial": "CD70356     CD70386\nCD70374  CD70385",
-    "source": "R 6831 AEN Saudi V84.2 2nd Stage Vane  Metallurgical Report - AEG (final).xlsx"
+    "source": "R 6831 AEN Saudi V84.2 2nd Stage Vane  Metallurgical Report - AEG (final).xlsx",
+    "etchant": "Etched (unspecified)"
   },
   {
     "alloy": "Rene-80",
@@ -145,7 +153,8 @@
     "machine": "V84.2",
     "component": "2nd Stage Vane",
     "serial": "CD70356     CD70386\nCD70374  CD70385",
-    "source": "R 6831 AEN Saudi V84.2 2nd Stage Vane  Metallurgical Report - AEG (final).xlsx"
+    "source": "R 6831 AEN Saudi V84.2 2nd Stage Vane  Metallurgical Report - AEG (final).xlsx",
+    "etchant": "Etched (unspecified)"
   },
   {
     "alloy": "Rene-80",
@@ -161,7 +170,8 @@
     "machine": "V84.2",
     "component": "2nd Stage Vane",
     "serial": "CD70356     CD70386\nCD70374  CD70385",
-    "source": "R 6831 AEN Saudi V84.2 2nd Stage Vane  Metallurgical Report - AEG (final).xlsx"
+    "source": "R 6831 AEN Saudi V84.2 2nd Stage Vane  Metallurgical Report - AEG (final).xlsx",
+    "etchant": "Etched (unspecified)"
   },
   {
     "alloy": "GTD-741",
@@ -183,7 +193,8 @@
     "machine": "MS7001",
     "component": "2nd Stage Bucket",
     "serial": "H2CP 023223     H2CP 026505",
-    "source": "R 7227 AEN Saudi FS.7 2nd Stage Bucket Metallurgical Report - AEG.xlsx"
+    "source": "R 7227 AEN Saudi FS.7 2nd Stage Bucket Metallurgical Report - AEG.xlsx",
+    "etchant": "Waterless Kalling"
   },
   {
     "alloy": "GTD-741",
@@ -204,7 +215,8 @@
     "machine": "MS7001",
     "component": "2nd Stage Bucket",
     "serial": "H2CP 023223     H2CP 026505",
-    "source": "R 7227 AEN Saudi FS.7 2nd Stage Bucket Metallurgical Report - AEG.xlsx"
+    "source": "R 7227 AEN Saudi FS.7 2nd Stage Bucket Metallurgical Report - AEG.xlsx",
+    "etchant": "Waterless Kalling"
   },
   {
     "alloy": "GTD-741",
@@ -220,7 +232,8 @@
     "machine": "MS7001",
     "component": "2nd Stage Bucket",
     "serial": "H2CP 023223     H2CP 026505",
-    "source": "R 7227 AEN Saudi FS.7 2nd Stage Bucket Metallurgical Report - AEG.xlsx"
+    "source": "R 7227 AEN Saudi FS.7 2nd Stage Bucket Metallurgical Report - AEG.xlsx",
+    "etchant": "Unetched"
   },
   {
     "alloy": "GTD-741",
@@ -236,7 +249,8 @@
     "machine": "MS7001",
     "component": "2nd Stage Bucket",
     "serial": "H2CP 023223     H2CP 026505",
-    "source": "R 7227 AEN Saudi FS.7 2nd Stage Bucket Metallurgical Report - AEG.xlsx"
+    "source": "R 7227 AEN Saudi FS.7 2nd Stage Bucket Metallurgical Report - AEG.xlsx",
+    "etchant": "Waterless Kalling"
   },
   {
     "alloy": "GTD-741",
@@ -252,7 +266,8 @@
     "machine": "MS7001",
     "component": "2nd Stage Bucket",
     "serial": "H2CP 023223     H2CP 026505",
-    "source": "R 7227 AEN Saudi FS.7 2nd Stage Bucket Metallurgical Report - AEG.xlsx"
+    "source": "R 7227 AEN Saudi FS.7 2nd Stage Bucket Metallurgical Report - AEG.xlsx",
+    "etchant": "Waterless Kalling"
   },
   {
     "alloy": "GTD-741",
@@ -268,7 +283,8 @@
     "machine": "MS7001",
     "component": "2nd Stage Bucket",
     "serial": "H2CP 023223     H2CP 026505",
-    "source": "R 7227 AEN Saudi FS.7 2nd Stage Bucket Metallurgical Report - AEG.xlsx"
+    "source": "R 7227 AEN Saudi FS.7 2nd Stage Bucket Metallurgical Report - AEG.xlsx",
+    "etchant": "Waterless Kalling"
   },
   {
     "alloy": "GTD-741",
@@ -284,7 +300,8 @@
     "machine": "MS7001",
     "component": "2nd Stage Bucket",
     "serial": "H2CP 023223     H2CP 026505",
-    "source": "R 7227 AEN Saudi FS.7 2nd Stage Bucket Metallurgical Report - AEG.xlsx"
+    "source": "R 7227 AEN Saudi FS.7 2nd Stage Bucket Metallurgical Report - AEG.xlsx",
+    "etchant": "Waterless Kalling"
   },
   {
     "alloy": "GTD-741",
@@ -300,7 +317,8 @@
     "machine": "MS7001",
     "component": "2nd Stage Bucket",
     "serial": "H2CP 023223     H2CP 026505",
-    "source": "R 7227 AEN Saudi FS.7 2nd Stage Bucket Metallurgical Report - AEG.xlsx"
+    "source": "R 7227 AEN Saudi FS.7 2nd Stage Bucket Metallurgical Report - AEG.xlsx",
+    "etchant": "Waterless Kalling"
   },
   {
     "alloy": "Nimonic-263",
@@ -316,7 +334,8 @@
     "machine": "MS 6001",
     "component": "Transition Piece",
     "serial": "213017 - 429",
-    "source": "R 7253 PSM Thomassen FS.6 Transition Piece  Metallurgical Report - AEG.xlsx"
+    "source": "R 7253 PSM Thomassen FS.6 Transition Piece  Metallurgical Report - AEG.xlsx",
+    "etchant": "Oxalic Acid"
   },
   {
     "alloy": "Nimonic-263",
@@ -335,7 +354,8 @@
     "machine": "MS 6001",
     "component": "Transition Piece",
     "serial": "213017 - 429",
-    "source": "R 7253 PSM Thomassen FS.6 Transition Piece  Metallurgical Report - AEG.xlsx"
+    "source": "R 7253 PSM Thomassen FS.6 Transition Piece  Metallurgical Report - AEG.xlsx",
+    "etchant": "Oxalic Acid"
   },
   {
     "alloy": "Nimonic-263",
@@ -351,7 +371,8 @@
     "machine": "MS 6001",
     "component": "Transition Piece",
     "serial": "213017 - 429",
-    "source": "R 7253 PSM Thomassen FS.6 Transition Piece  Metallurgical Report - AEG.xlsx"
+    "source": "R 7253 PSM Thomassen FS.6 Transition Piece  Metallurgical Report - AEG.xlsx",
+    "etchant": "Oxalic Acid"
   },
   {
     "alloy": "Nimonic-263",
@@ -367,7 +388,8 @@
     "machine": "MS 6001",
     "component": "Transition Piece",
     "serial": "213017 - 429",
-    "source": "R 7253 PSM Thomassen FS.6 Transition Piece  Metallurgical Report - AEG.xlsx"
+    "source": "R 7253 PSM Thomassen FS.6 Transition Piece  Metallurgical Report - AEG.xlsx",
+    "etchant": "Oxalic Acid"
   },
   {
     "alloy": "GTD 111",
@@ -383,7 +405,8 @@
     "machine": "MS7001",
     "component": "1st Stage Bucket",
     "serial": "C1ZP 092923      C1ZP 093046\nC1ZP 092942\nC1ZP 093046",
-    "source": "TBR 6943 AEN Saudi FS.7 1st Stage Bucket  Metallurgical Report - AEG (Final).xlsx"
+    "source": "TBR 6943 AEN Saudi FS.7 1st Stage Bucket  Metallurgical Report - AEG (Final).xlsx",
+    "etchant": "Etched (unspecified)"
   },
   {
     "alloy": "GTD 111",
@@ -399,7 +422,8 @@
     "machine": "MS7001",
     "component": "1st Stage Bucket",
     "serial": "C1ZP 092923      C1ZP 093046\nC1ZP 092942\nC1ZP 093046",
-    "source": "TBR 6943 AEN Saudi FS.7 1st Stage Bucket  Metallurgical Report - AEG (Final).xlsx"
+    "source": "TBR 6943 AEN Saudi FS.7 1st Stage Bucket  Metallurgical Report - AEG (Final).xlsx",
+    "etchant": "Etched (unspecified)"
   },
   {
     "alloy": "GTD 111",
@@ -415,7 +439,8 @@
     "machine": "MS7001",
     "component": "1st Stage Bucket",
     "serial": "C1ZP 092923      C1ZP 093046\nC1ZP 092942\nC1ZP 093046",
-    "source": "TBR 6943 AEN Saudi FS.7 1st Stage Bucket  Metallurgical Report - AEG (Final).xlsx"
+    "source": "TBR 6943 AEN Saudi FS.7 1st Stage Bucket  Metallurgical Report - AEG (Final).xlsx",
+    "etchant": "Etched (unspecified)"
   },
   {
     "alloy": "GTD 111",
@@ -431,6 +456,7 @@
     "machine": "MS7001",
     "component": "1st Stage Bucket",
     "serial": "C1ZP 092923      C1ZP 093046\nC1ZP 092942\nC1ZP 093046",
-    "source": "TBR 6943 AEN Saudi FS.7 1st Stage Bucket  Metallurgical Report - AEG (Final).xlsx"
+    "source": "TBR 6943 AEN Saudi FS.7 1st Stage Bucket  Metallurgical Report - AEG (Final).xlsx",
+    "etchant": "Etched (unspecified)"
   }
 ]

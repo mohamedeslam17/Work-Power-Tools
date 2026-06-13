@@ -313,22 +313,34 @@ def render_gallery():
     alloy = pick.rsplit(" (", 1)[0]
     recs = photos_for(alloy)
 
-    st.divider()
-    cols = st.columns(3)
-    for i, r in enumerate(recs):
-        c = cols[i % 3]
-        img = _lib_image(r.get("path"), r.get("drive_id"))
-        contrast = "etched" if r.get("etched") else "low-contrast"
-        cap = f"Job {r.get('job') or '—'} · {r.get('mag') or '?'} · {contrast}"
-        if img:
-            c.image(img, caption=cap, width="stretch")
-        else:
-            c.warning(f"missing: {r.get('path') or r.get('drive_id')}")
-        meas = r.get("measurements") or []
-        line = f"set: {(r.get('source') or '')[:34]}"
-        if meas:
-            line += " · " + ", ".join(f"{m}µm" for m in meas)
-        c.caption(line)
+    # Segregate by etchant within the alloy.
+    groups = {}
+    for r in recs:
+        groups.setdefault(r.get("etchant") or "Unspecified", []).append(r)
+
+    etch_filter = st.selectbox(
+        "Etchant", ["All"] + [f"{e} ({len(g)})" for e, g in sorted(groups.items())])
+    shown = groups if etch_filter == "All" else {etch_filter.rsplit(" (", 1)[0]:
+                                                 groups[etch_filter.rsplit(" (", 1)[0]]}
+
+    for etch in sorted(shown):
+        st.divider()
+        st.subheader(f"🧪 {etch}  ·  {len(shown[etch])}")
+        cols = st.columns(3)
+        for i, r in enumerate(shown[etch]):
+            c = cols[i % 3]
+            img = _lib_image(r.get("path"), r.get("drive_id"))
+            contrast = "etched" if r.get("etched") else "low-contrast"
+            cap = f"Job {r.get('job') or '—'} · {r.get('mag') or '?'} · {contrast}"
+            if img:
+                c.image(img, caption=cap, width="stretch")
+            else:
+                c.warning(f"missing: {r.get('path') or r.get('drive_id')}")
+            meas = r.get("measurements") or []
+            line = f"set: {(r.get('source') or '')[:34]}"
+            if meas:
+                line += " · " + ", ".join(f"{m}µm" for m in meas)
+            c.caption(line)
 
 
 # ════════════════════════════════════════════════════════════════════════

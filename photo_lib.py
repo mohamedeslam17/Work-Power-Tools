@@ -96,6 +96,8 @@ def _records(filename, data, parsed, rtype):
         return []
     alloy, job, meta = _report_meta(filename, parsed, rtype)
     raw = _raw_image_bytes(data)
+    from lab_review import report_etchants, image_etchant
+    by_mag, primary = report_etchants(parsed.get('pictures'))
     recs = []
     for im in images:
         name = im.get('image')
@@ -104,7 +106,8 @@ def _records(filename, data, parsed, rtype):
         recs.append({
             'alloy': alloy, 'job': job, 'image': name, 'bytes': raw[name],
             'mag': im.get('mag'), 'scale': im.get('scale'),
-            'etched': im.get('etched'), 'measurements': im.get('measurements', []),
+            'etched': im.get('etched'), 'etchant': image_etchant(im.get('mag'), by_mag, primary),
+            'measurements': im.get('measurements', []),
             'added': datetime.date.today().isoformat(), **meta,
         })
     return recs
