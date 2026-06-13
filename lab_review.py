@@ -606,6 +606,7 @@ def _read_one_legend(img_bytes):
     rblob = ' '.join(_safe_ocr(_binarize(rc, t)) for t in (110, 140))
 
     out = {}
+    job_m = _JOB_PAT.search(lblob)             # leading 4-digit job number, if legible
     mag_val, idx = None, None
     for pat in _MAG_PATS:                      # first plausible magnification wins
         for m in pat.finditer(lblob):
@@ -617,10 +618,11 @@ def _read_one_legend(img_bytes):
         if mag_val is not None:
             break
     if mag_val is not None:
-        job = _JOB_PAT.search(lblob)
         out['mag'] = f'{mag_val}x'
-        out['id'] = (f'{job.group(1)}_' if job else '') + f'E_{mag_val}x' + \
+        out['id'] = (f'{job_m.group(1)}_' if job_m else '') + f'E_{mag_val}x' + \
                     (f'-{idx}' if idx else '')
+    if job_m:
+        out['job'] = job_m.group(1)
     s = _SCALE_PAT.search(rblob) or _SCALE_PAT.search(lblob)
     if s:
         out['scale'] = f'{s.group(1)} µm'
@@ -662,7 +664,14 @@ def _caption_mags(pictures):
     return mags
 
 
-def _review_legends(legends, ocr_used, caption_mags):
+def _digit_dist(a, b):
+    """Positional digit difference between two same-length strings; len-gap otherwise."""
+    if len(a) != len(b):
+        return max(len(a), len(b))
+    return sum(x != y for x, y in zip(a, b))
+
+
+def _review_legends(legends, ocr_used, caption_mags, report_job=None):
     findings = []
     if not ocr_used:
         findings.append(('info', 'Photo legends',
@@ -689,6 +698,28 @@ def _review_legends(legends, ocr_used, caption_mags):
         else:
             findings.append(('pass', 'Photo legends',
                              'Image-legend magnifications all match the written captions.'))
+
+    # Cross-check the job number burned into the legends against the report.
+    # OCR misreads single digits, so all genuine photos share one job number:
+    # pass if any legend matches exactly, and only warn when readings clearly
+    # diverge (≥2 digits) — that suggests a micrograph from another report.
+    legend_jobs = [l['job'] for l in legends if l.get('job')]
+    if report_job and report_job.isdigit() and legend_jobs:
+        if report_job in legend_jobs:
+            findings.append(('pass', 'Photo legends',
+                             f'Micrograph legends carry the report job number ({report_job}).'))
+        else:
+            best = min(legend_jobs, key=lambda j: _digit_dist(j, report_job))
+            if _digit_dist(best, report_job) >= 2:
+                seen = ", ".join(sorted(set(legend_jobs)))
+                findings.append(('warning', 'Photo legends',
+                                 f'Legend job number(s) [{seen}] do not match the report job '
+                                 f'{report_job} — verify the micrographs belong to this report '
+                                 f'(or an OCR misread).'))
+            else:
+                findings.append(('info', 'Photo legends',
+                                 f'Legend job numbers are within one digit of the report job '
+                                 f'({report_job}) — likely OCR variance.'))
     return findings
 
 
@@ -728,7 +759,8 @@ def review_report(filename, data, ocr=True):
     if ocr:
         legends, ocr_used = read_image_legends(data)
         cap_mags = _caption_mags(parsed.get('pictures', []))
-        findings += _review_legends(legends, ocr_used, cap_mags)
+        report_job = parsed.get('header', {}).get('job')
+        findings += _review_legends(legends, ocr_used, cap_mags, report_job)
     parsed['legends'] = legends
     return rtype, parsed, findings
 
