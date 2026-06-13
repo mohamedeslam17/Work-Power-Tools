@@ -344,13 +344,202 @@ def render_gallery():
 
 
 # ════════════════════════════════════════════════════════════════════════
+# TAB 4 — IIR Quality Review (Incoming Inspection Report consistency/completeness QA)
+def render_iir_tool():
+    import io
+    import iir_review
+    from itertools import groupby
+
+    XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    BADGE = {iir_review.FAIL: "🔴", iir_review.WARN: "🟠",
+             iir_review.INFO: "🔵", iir_review.PASS: "🟢"}
+    CHOICE_LABEL = {iir_review.FAIL: "🔴 Fail", iir_review.WARN: "🟠 Warn",
+                    iir_review.INFO: "🔵 Info", iir_review.OFF: "⚪ Off"}
+
+    def check_settings():
+        """Severity dropdown per check; returns {check_title: severity|OFF}."""
+        with st.expander("⚙️ Check settings — set the severity of each check"):
+            st.caption("Change any check's level, or turn it Off. The overview and "
+                       "verdicts below update immediately — no need to re-upload.")
+            if st.button("↺ Reset to defaults", key="iir_sev_reset"):
+                for _, title, _ in iir_review.CHECK_CATALOG:
+                    st.session_state.pop(f"iir_sev::{title}", None)
+            chosen = {}
+            for cat, items in groupby(iir_review.CHECK_CATALOG, key=lambda t: t[0]):
+                st.markdown(f"**{cat}**")
+                items = list(items)
+                cols = st.columns(2)
+                for j, (_, title, default) in enumerate(items):
+                    chosen[title] = cols[j % 2].selectbox(
+                        title, iir_review.SEVERITY_CHOICES,
+                        index=iir_review.SEVERITY_CHOICES.index(default),
+                        format_func=lambda s: CHOICE_LABEL[s],
+                        key=f"iir_sev::{title}",
+                    )
+        return chosen
+
+    st.title("IIR Quality Review")
+    st.markdown(
+        "Upload one or more **Incoming Inspection Reports** (Detailed Assessment "
+        "Customer Reports) as `.xlsx`. Each workbook is checked for internal "
+        "consistency and completeness, and a downloadable findings checklist is produced."
+    )
+    with st.expander("What does it check?"):
+        st.markdown(
+            "- **Identity / metadata** — doc number, customer, component, preparer, "
+            "reviewer, approver and PO# present and well-formed\n"
+            "- **Quantities** — Received = Scrap + Reconditionable; positions listed = "
+            "received; serial-number scope totals reconcile; the stated sum row matches "
+            "the scopes actually marked; Received-Parts table vs Serial-Number protocol agree\n"
+            "- **Integrity** — unique & contiguous positions, serial numbers present and "
+            "unique, valid repair-scope values, scrap mark ↔ scope 'S', every part scoped\n"
+            "- **Consistency** — Summary-of-Damages finding counts match the protocol "
+            "defect marks; executive-summary received count and scrap positions agree\n"
+            "- **Completeness** — incoming photos embedded for each caption; page numbering\n\n"
+            "Review **several reports at once** for a combined **Batch Summary** workbook "
+            "(one row per report + a pooled findings tab)."
+        )
+
+    st.divider()
+
+    iir_files = st.file_uploader(
+        "IIR workbook(s) *(required)*",
+        type=["xlsx"],
+        accept_multiple_files=True,
+        key="iir_uploader",
+    )
+
+    if 'iir_data' not in st.session_state:
+        st.session_state.iir_data = []   # [{'src': name, 'data': parsed}, ...]
+
+    # Parse on demand; cached so changing the check settings re-checks instantly.
+    if st.button("▶ Run Review", type="primary", disabled=not iir_files):
+        parsed, errors = [], []
+        with st.spinner(f"Reading {len(iir_files)} report(s)..."):
+            with tempfile.TemporaryDirectory() as tmp:
+                for f in iir_files:
+                    path = os.path.join(tmp, f.name)
+                    with open(path, "wb") as fh:
+                        fh.write(f.getvalue())
+                    try:
+                        parsed.append({'src': f.name, 'data': iir_review.parse_iir(path)})
+                    except Exception as e:
+                        errors.append(f"{f.name}: {e}")
+        for err in errors:
+            st.error(f"Review failed — {err}")
+        st.session_state.iir_data = parsed
+
+    parsed = st.session_state.iir_data
+    if not parsed:
+        st.info("Upload IIR Excel file(s) and click ▶ Run Review." if iir_files
+                else "Upload one or more IIR Excel files above to run the review.")
+        return
+
+    overrides = check_settings()
+
+    # Re-run the checks for every report with the current severity settings.
+    results = []
+    for item in parsed:
+        data = item['data']
+        findings = iir_review.run_checks(data, overrides)
+        results.append({
+            'src': item['src'], 'data': data, 'findings': findings,
+            'counts': iir_review.count_severities(findings),
+            'ident': data['ident'], 'rp': data['received_parts'],
+            'npos': len(data['sn_rows']),
+        })
+
+    # ── Batch overview (one row per report) ──────────────────────────────────
+    st.divider()
+    tot = {k: sum(r['counts'][k] for r in results)
+           for k in (iir_review.FAIL, iir_review.WARN, iir_review.INFO, iir_review.PASS)}
+    st.subheader(f"Batch overview — {len(results)} report(s)")
+    overview = []
+    for r in results:
+        c = r['counts']
+        sev, label = iir_review.verdict_of(c)
+        rp = r['rp']
+        overview.append({
+            "Verdict": f"{BADGE[sev]} {label.split(' — ')[0]}",
+            "Report": r['src'],
+            "Doc No": r['ident'].get('doc_no', ''),
+            "Component": r['ident'].get('component', ''),
+            "Recv": rp.get('received') if rp.get('found') else None,
+            "Scrap": rp.get('scrap') if rp.get('found') else None,
+            "Recond": rp.get('reconditionable') if rp.get('found') else None,
+            "🔴": c[iir_review.FAIL], "🟠": c[iir_review.WARN],
+            "🔵": c[iir_review.INFO], "🟢": c[iir_review.PASS],
+        })
+    st.dataframe(overview, use_container_width=True, hide_index=True)
+
+    m = st.columns(4)
+    m[0].metric("🔴 Fail", tot[iir_review.FAIL])
+    m[1].metric("🟠 Warn", tot[iir_review.WARN])
+    m[2].metric("🔵 Info", tot[iir_review.INFO])
+    m[3].metric("🟢 Pass", tot[iir_review.PASS])
+
+    if len(results) > 1:
+        records = [iir_review.record_of(r['data'], r['findings']) for r in results]
+        buf = io.BytesIO()
+        iir_review.build_batch_summary(records, buf)
+        st.download_button(
+            "⬇ Download batch summary (.xlsx)", data=buf.getvalue(),
+            file_name="IIR_Batch_Summary.xlsx", mime=XLSX_MIME,
+            key="iir_batch_dl", type="primary",
+        )
+
+    # ── Per-report detail (expanders) ────────────────────────────────────────
+    st.divider()
+    st.subheader("Report details")
+    for i, r in enumerate(results):
+        c = r['counts']
+        sev, _ = iir_review.verdict_of(c)
+        ident = r['ident']
+        header = (f"{BADGE[sev]} {r['src']}  —  {c[iir_review.FAIL]}F / "
+                  f"{c[iir_review.WARN]}W / {c[iir_review.INFO]}I / {c[iir_review.PASS]}P")
+        with st.expander(header, expanded=(sev != iir_review.PASS)):
+            st.caption(
+                f"**{ident.get('doc_no','?')}** · {ident.get('customer','?')} · "
+                f"{ident.get('component','?')}  —  prepared by "
+                f"{ident.get('preparer') or ident.get('author','?')}, "
+                f"reviewed by {ident.get('reviewer','?')}"
+            )
+            rp = r['rp']
+            if rp.get('found'):
+                st.caption(
+                    f"Received **{rp['received']}** · Scrap **{rp['scrap']}** · "
+                    f"Reconditionable **{rp['reconditionable']}** · "
+                    f"Positions in protocol **{r['npos']}**"
+                )
+            rows = [{
+                "Severity": f"{iir_review.SEV_ICON[f['severity']]} {f['severity']}",
+                "Category": f['category'],
+                "Check": f['check'],
+                "Sheet": f['sheet'],
+                "Detail": f['detail'],
+            } for f in r['findings']]
+            st.dataframe(rows, use_container_width=True, hide_index=True)
+            buf = io.BytesIO()
+            iir_review.build_checklist(r['data'], r['findings'], buf)
+            st.download_button(
+                label="⬇ Download findings checklist (.xlsx)",
+                data=buf.getvalue(),
+                file_name=f"IIR_Review_{Path(r['src']).stem}.xlsx",
+                mime=XLSX_MIME, key=f"iir_dl_{i}",
+            )
+
+
+# ════════════════════════════════════════════════════════════════════════
 st.title("AEG Materials Engineering Tools")
 
-tab_conv, tab_review, tab_gallery = st.tabs(
-    ["🔬 SEM Report Converter", "🧪 Lab Report Review", "🖼️ Photo Library"])
+tab_conv, tab_review, tab_gallery, tab_iir = st.tabs(
+    ["🔬 SEM Report Converter", "🧪 Lab Report Review", "🖼️ Photo Library",
+     "🛠️ IIR Review"])
 with tab_conv:
     render_converter()
 with tab_review:
     render_reviewer()
 with tab_gallery:
     render_gallery()
+with tab_iir:
+    render_iir_tool()

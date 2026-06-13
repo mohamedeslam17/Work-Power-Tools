@@ -1,7 +1,7 @@
 # Work-Power-Tools
 
 Materials-engineering tools for Ansaldo Energia (AEG), packaged as a single
-Streamlit app with three tabs.
+Streamlit app with four tabs.
 
 ## Tools
 
@@ -78,6 +78,26 @@ post-HT etching reads as low-contrast); and reads burned-in thickness labels
 needs the **Tesseract** engine (`packages.txt` installs `tesseract-ocr`; the app
 degrades gracefully without it).
 
+### 🛠️ IIR Review *(new)*
+Automated consistency/completeness QA of **Incoming Inspection Reports** (Detailed
+Assessment Customer Reports) delivered as `.xlsx`. Upload one or more workbooks for a
+severity-tagged findings checklist plus an on-screen batch overview. Implemented in
+[`iir_review.py`](iir_review.py).
+
+Checks span **Identity/metadata**, **Quantities** (Received = Scrap + Reconditionable,
+positions = received, serial-scope totals reconcile, sum-row vs marked scopes,
+Received-Parts table vs Serial-Number protocol), **Integrity** (unique/contiguous
+positions, serial numbers, valid repair-scope L/M/H/S, scrap ↔ scope 'S'),
+**Consistency** (Summary-of-Damages counts vs protocol marks, executive-summary
+cross-checks) and **Completeness** (a photo per caption, page numbering). Each check's
+severity is tunable (🔴 Fail / 🟠 Warn / 🔵 Info / ⚪ Off) live in the UI; defaults live in
+`iir_review.CHECK_CATALOG`. Review several at once for a combined **Batch Summary** workbook.
+
+```bash
+python3 iir_review.py "report.xlsx"     # one report  → findings checklist
+python3 iir_review.py *.xlsx             # many reports → checklists + batch summary
+```
+
 ## Running
 
 ```bash
@@ -96,4 +116,5 @@ python3 lab_review.py "path/to/report.xlsx" [more.xlsx ...]
 * Composition tolerances and the advisory hardness ranges are constants at the
   top of [`lab_review.py`](lab_review.py) (`COMP_WARN_REL`, `HARDNESS_REF`, …) —
   adjust them to match your controlling specification.
-* Sample reports used during development live in `Samples 1/`.
+* Raw customer report `.xlsx` files are **not tracked in git** (`*.xlsx` is
+  git-ignored); supply your own workbooks at runtime / on the command line.
