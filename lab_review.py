@@ -260,6 +260,21 @@ def _hardness(ws):
     return out
 
 
+def _coating(ws):
+    """Coating presence / type as recorded in the structured cells."""
+    out = {'present': None, 'type': None, 'received': None, 'outgoing': None}
+    loc = _find(ws, r'^Coating\s*$')
+    if loc:
+        out['present'] = _value_below(ws, *loc)
+    for key, pat in (('type', r'^Type of Coating'),
+                     ('received', r'Received\s*Coating'),
+                     ('outgoing', r'Outgoing\s*Coating')):
+        loc = _find(ws, pat)
+        if loc:
+            out[key] = _value_below(ws, *loc)
+    return out
+
+
 def _composition(ws, which):
     """Extract {element: value} for which='Nominal' or 'Actual'."""
     loc = _find(ws, r'\(\s*' + which + r'\s*\)')
@@ -310,6 +325,7 @@ def parse_metallurgical(wb, media=0):
         'hardness':  _hardness(ws),
         'nominal':   _composition(ws, 'Nominal'),
         'actual':    _composition(ws, 'Actual'),
+        'coating':   _coating(ws),
         'comment':   _comment(ws),
         'pictures':  _pictures(ws),
         'signoff':   _signoff(ws),
@@ -354,6 +370,70 @@ def _review_composition(nominal, actual):
     if not flagged:
         findings.append(('pass', 'Composition',
                          f'All {len(common)} matched elements within ±{COMP_WARN_REL:g}% tolerance.'))
+    return findings
+
+
+# Coating-type vocabulary (tolerant of the "MCrAlY"/"MCrAIY" spelling seen in
+# the sheets). Each entry maps a canonical name to a detection pattern.
+_COATING_TYPE_PATS = (
+    ('TBC',       r'\bTBC\b|thermal\s*barrier'),
+    ('MCrAlY',    r'MCR\w*Y'),
+    ('aluminide', r'alumini[sz]|\baluminide\b|\bPt[-\s]?Al\b|platinum\s*alumin'),
+    ('diffusion', r'diffusion\s*coat'),
+    ('chromide',  r'chromi[sz]|\bchromide\b'),
+)
+
+
+def _coating_types_in(text):
+    """Set of canonical coating types mentioned in a piece of text."""
+    t = text or ''
+    return {name for name, pat in _COATING_TYPE_PATS if re.search(pat, t, re.I)}
+
+
+def _review_comment(parsed):
+    """Flag where the free-text comment contradicts the coating cells."""
+    findings = []
+    comment = parsed.get('comment') or ''
+    coat = parsed.get('coating') or {}
+    if not comment:
+        return findings
+    cl = comment.lower()
+
+    cell_types = set()
+    for key in ('type', 'received', 'outgoing'):
+        cell_types |= _coating_types_in(coat.get(key))
+    comment_types = _coating_types_in(comment)
+
+    present = (coat.get('present') or '').strip().lower()
+    cell_has  = present == 'yes' or bool(cell_types)
+    cell_none = present == 'no' or (not cell_types and _is_placeholder(coat.get('type')))
+
+    comment_has = bool(comment_types) or bool(re.search(
+        r'received with[^.]{0,30}coating|coated with|coating (?:was |is )?(?:applied|present|intact)', cl))
+    comment_none = bool(re.search(
+        r'\buncoated\b|no coating|without (?:any )?coating|not coated|'
+        r'coating (?:is |was )?(?:fully )?removed', cl))
+
+    # Coating type: comment names a type the cell disagrees with.
+    if cell_types and comment_types and cell_types.isdisjoint(comment_types):
+        findings.append(('warning', 'Comment',
+                         f'Comment mentions {"/".join(sorted(comment_types))} coating but the '
+                         f'coating cell says {"/".join(sorted(cell_types))}.'))
+    elif cell_types and (cell_types & comment_types):
+        findings.append(('pass', 'Comment',
+                         f'Comment coating type matches the coating cell '
+                         f'({"/".join(sorted(cell_types & comment_types))}).'))
+
+    # Coating presence: cell vs comment.
+    if cell_none and comment_has and not comment_none:
+        what = "/".join(sorted(comment_types)) if comment_types else 'a coating'
+        findings.append(('warning', 'Comment',
+                         f'Coating cell indicates no coating, but the comment refers to {what}.'))
+    elif cell_has and comment_none and not comment_has:
+        label = "/".join(sorted(cell_types)) or present
+        findings.append(('warning', 'Comment',
+                         f'Coating cell indicates a coating ({label}), but the comment says '
+                         f'it is uncoated.'))
     return findings
 
 
@@ -448,6 +528,7 @@ def review_metallurgical(parsed):
     findings += _review_completeness(parsed)
     findings += _review_hardness(parsed['hardness'], parsed['sample'].get('material'))
     findings += _review_composition(parsed['nominal'], parsed['actual'])
+    findings += _review_comment(parsed)
     return findings
 
 

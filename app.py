@@ -165,6 +165,10 @@ def _render_parsed(rtype, parsed):
         c2.write(f"**Material:** {smp.get('material') or '—'}")
         c2.write(f"**Description:** {smp.get('description') or '—'}")
         c2.write(f"**S/N:** {smp.get('serial') or '—'}")
+        coat = parsed.get('coating') or {}
+        coat_str = (coat.get('type') or coat.get('received') or coat.get('outgoing')
+                    or coat.get('present') or '—')
+        c1.write(f"**Coating:** {coat_str}")
 
         nom, act = parsed.get('nominal', {}), parsed.get('actual', {})
         if nom or act:
