@@ -575,6 +575,57 @@ def _norm_alloy(s):
     return re.sub(r'[^a-z0-9]', '', (s or '').lower())
 
 
+# Etchant vocabulary (ordered: multi-word / specific first, generic last).
+_ETCHANT_VOCAB = [
+    (r'unetched|as[-\s]?polished', 'Unetched'),
+    (r'waterless\s*kalling',       'Waterless Kalling'),
+    (r'\bkalling',                 'Kalling'),
+    (r'oxalic',                    'Oxalic Acid'),
+    (r'glyceregia',                'Glyceregia'),
+    (r'\bmarble',                  "Marble's"),
+    (r'\bnital\b',                 'Nital'),
+    (r'vilella',                   "Vilella's"),
+    (r'murakami',                  'Murakami'),
+    (r'aqua\s*regia',              'Aqua Regia'),
+    (r'electrolytic',              'Electrolytic'),
+    (r'\betch',                    'Etched (unspecified)'),
+]
+
+
+def caption_etchant(text):
+    """Canonical etchant named in a caption, or None."""
+    t = text or ''
+    for pat, name in _ETCHANT_VOCAB:
+        if re.search(pat, t, re.I):
+            return name
+    return None
+
+
+def report_etchants(pictures):
+    """(magnification→etchant map, primary named etchant) from a report's captions."""
+    by_mag, counts = {}, {}
+    for label, cap in pictures or []:
+        text = f"{label} {cap or ''}"
+        et = caption_etchant(text)
+        if et and et not in ('Unetched', 'Etched (unspecified)'):
+            counts[et] = counts.get(et, 0) + 1
+        if et:
+            for m in re.finditer(r'(\d{2,4})\s*[xX]\b', text):
+                by_mag.setdefault(f"{m.group(1)}x", et)
+    primary = max(counts, key=counts.get) if counts else None
+    if primary is None and by_mag:        # no named etchant → most common caption etchant
+        vals = list(by_mag.values())
+        primary = max(set(vals), key=vals.count)
+    return by_mag, primary
+
+
+def image_etchant(image_mag, by_mag, primary):
+    """Best-effort etchant for one micrograph (caption etchant for its magnification)."""
+    if image_mag and image_mag in by_mag:
+        return by_mag[image_mag]
+    return primary or 'Unspecified'
+
+
 def _review_captions(parsed):
     """Caption integrity: numbering, etch status, and comment picture references."""
     findings = []
