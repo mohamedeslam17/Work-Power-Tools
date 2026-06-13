@@ -24,6 +24,7 @@ Public entry point:
 Usage (CLI):  python3 lab_review.py report.xlsx
 """
 import io
+import os
 import re
 import sys
 import zipfile
@@ -477,7 +478,7 @@ def parse_coating(wb, media=0):
             aws = ws
             break
 
-    data = {'title': None, 'report_no': None, 'rows': [],
+    data = {'title': None, 'report_no': None, 'component': None, 'rows': [],
             'signoff': _coating_signoff(wb), 'media': media}
 
     cover = wb.worksheets[0]
@@ -487,6 +488,18 @@ def parse_coating(wb, media=0):
     rn = _find(cover, r'Report\s*No')
     if rn:
         data['report_no'] = _value_right(cover, *rn)
+    # Component (e.g. "2nd Stage Bucket") sits in the cover header text.
+    for ws in wb.worksheets:
+        for row in ws.iter_rows(max_row=25):
+            for cell in row:
+                comp = _canon_component(_txt(cell.value))
+                if comp:
+                    data['component'] = comp
+                    break
+            if data['component']:
+                break
+        if data['component']:
+            break
 
     if aws is None:
         return data
@@ -724,6 +737,97 @@ def _review_legends(legends, ocr_used, caption_mags, report_job=None):
 
 
 # ════════════════════════════════════════════════════════════════════════
+# FILENAME vs CONTENT  (catch a mis-named workbook)
+# ════════════════════════════════════════════════════════════════════════
+# Component synonyms (GE terminology): bucket≡blade (rotating), vane≡nozzle
+# (stationary). Order matters — multi-word parts first.
+_PART_SYNONYMS = [
+    (r'transition\s*piece',  'transition piece'),
+    (r'combustion\s*liner',  'combustion liner'),
+    (r'\bliner\b',           'combustion liner'),
+    (r'\bbucket\b|\bblade\b', 'bucket'),
+    (r'\bvane\b|\bnozzle\b',  'vane'),
+    (r'\bshroud\b',          'shroud'),
+    (r'\bdiaphragm\b',       'diaphragm'),
+    (r'\bseal\b',            'seal'),
+]
+
+
+def _canon_component(text):
+    """Canonical 'stage + part' from free text, e.g. '2nd Stage Bucket' → '2 bucket'."""
+    t = (text or '').lower()
+    part = next((name for pat, name in _PART_SYNONYMS if re.search(pat, t)), None)
+    if part is None:
+        return None
+    m = re.search(r'(\d)\s*(?:st|nd|rd|th)?\s*stage', t)
+    return (f'{m.group(1)} ' if m else '') + part
+
+
+def _content_job(parsed, rtype):
+    """4-digit AEG job number from the report content, for either report family."""
+    if rtype == 'metallurgical':
+        m = re.search(r'\d{4}', parsed.get('header', {}).get('job') or '')
+    else:
+        m = re.search(r'\d{4}', parsed.get('report_no') or '')
+    return m.group() if m else ''
+
+
+def review_filename(filename, parsed, rtype):
+    """Check that the workbook's name agrees with its contents."""
+    findings = []
+    name = re.sub(r'\.xlsx?$', '', os.path.basename(filename or ''), flags=re.I)
+    if not name:
+        return findings
+    low = name.lower()
+    matched = []
+
+    # Job number (filename vs content).
+    fjob = re.search(r'\b(\d{4})\b', name)
+    cjob = _content_job(parsed, rtype)
+    if fjob and cjob:
+        if fjob.group(1) == cjob:
+            matched.append('job')
+        else:
+            findings.append(('warning', 'Filename',
+                             f'Filename job number {fjob.group(1)} ≠ report job {cjob}.'))
+
+    # Report type (filename keyword vs detected type).
+    if 'coating' in low and rtype == 'metallurgical':
+        findings.append(('warning', 'Filename',
+                         'Filename says "Coating" but the content is a metallurgical report.'))
+    elif re.search(r'metallurg', low) and rtype == 'coating':
+        findings.append(('warning', 'Filename',
+                         'Filename says "Metallurgical" but the content is a coating report.'))
+    elif ('coating' in low and rtype == 'coating') or \
+         (re.search(r'metallurg', low) and rtype == 'metallurgical'):
+        matched.append('type')
+
+    # Component / part.
+    fcomp = _canon_component(name)
+    ccomp = (_canon_component(parsed.get('sample', {}).get('description'))
+             if rtype == 'metallurgical' else parsed.get('component'))
+    if fcomp and ccomp:
+        if fcomp == ccomp:
+            matched.append('component')
+        else:
+            findings.append(('warning', 'Filename',
+                             f'Filename component "{fcomp}" ≠ report description "{ccomp}".'))
+
+    # Customer (advisory, lenient — pass on any shared word ≥3 chars).
+    ccust = parsed.get('header', {}).get('customer') if rtype == 'metallurgical' else None
+    if ccust:
+        ctoks = set(re.findall(r'[a-z]{3,}', ccust.lower()))
+        if ctoks and not (ctoks & set(re.findall(r'[a-z]{3,}', low))):
+            findings.append(('info', 'Filename',
+                             f'Filename customer doesn’t obviously match the report customer "{ccust}".'))
+
+    if matched and not any(c == 'Filename' and s == 'warning' for s, c, _ in findings):
+        findings.append(('pass', 'Filename',
+                         f'Filename agrees with the report ({", ".join(matched)}).'))
+    return findings
+
+
+# ════════════════════════════════════════════════════════════════════════
 # PUBLIC ENTRY POINT
 # ════════════════════════════════════════════════════════════════════════
 def _media_count(data):
@@ -754,6 +858,8 @@ def review_report(filename, data, ocr=True):
         parsed = {}
         findings = [('warning', 'Format',
                      'Unrecognised layout — not classified as a metallurgical or coating report.')]
+
+    findings += review_filename(filename, parsed, rtype)
 
     legends = []
     if ocr:
