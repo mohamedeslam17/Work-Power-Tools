@@ -434,6 +434,39 @@ def _review_comment(parsed):
         findings.append(('warning', 'Comment',
                          f'Coating cell indicates a coating ({label}), but the comment says '
                          f'it is uncoated.'))
+
+    # Alloy named in the comment vs the material cell.
+    material = (parsed.get('sample') or {}).get('material')
+    if material:
+        mkey = _norm_alloy(material)
+        others = sorted({m.group(0) for m in _ALLOY_PAT.finditer(comment)
+                         if _norm_alloy(m.group(0)) != mkey
+                         and _norm_alloy(m.group(0)) not in mkey
+                         and mkey not in _norm_alloy(m.group(0))})
+        if others:
+            findings.append(('warning', 'Comment',
+                             f'Comment mentions alloy {", ".join(others)} but the material cell '
+                             f'says "{material}".'))
+
+    # Service verdict in the comment vs the Result cell.
+    result = (parsed.get('sample') or {}).get('result') or ''
+    rlow = result.lower()
+    neg = re.search(r'not\s+suitable|unsuitable|not\s+recommend|\breject|\bscrap|'
+                    r'beyond\s+repair|non[-\s]?conform|unacceptable', cl)
+    pos = re.search(r'(?<!not )(?:\bsuitable for|\bacceptable|recommended for|'
+                    r'reconditi|fit for service|return to service)', cl)
+    result_pos = bool(re.search(r'accept|suitable|conform|\bpass\b', rlow)) and 'see comment' not in rlow
+    result_neg = bool(re.search(r'reject|not\s+suitable|scrap|unacceptable', rlow))
+    if result_pos and neg and not pos:
+        findings.append(('warning', 'Comment',
+                         f'Result cell says "{result}" but the comment indicates the part is NOT suitable.'))
+    elif result_neg and pos and not neg:
+        findings.append(('warning', 'Comment',
+                         f'Result cell says "{result}" but the comment indicates the part IS suitable.'))
+    elif 'see comment' in rlow and bool(neg) != bool(pos):
+        findings.append(('info', 'Comment',
+                         f'Result defers to the comment; the comment verdict reads '
+                         f'{"not suitable / negative" if neg else "suitable / positive"}.'))
     return findings
 
 
@@ -523,12 +556,68 @@ def _review_completeness(parsed):
     return findings
 
 
+# Caption / comment integrity vocabulary.
+_PICNUM   = re.compile(r'picture\s*(\d+)', re.I)
+_ETCH_PAT = re.compile(r'etch|unetched|as[-\s]?polished|kalling|glyceregia|oxalic|'
+                       r'marble|nital|vilella|murakami|aqua\s*regia|electrolytic', re.I)
+_ALLOY_PAT = re.compile(
+    r'\b(?:IN[-\s]?\d{3}(?:LC)?|GTD[-\s]?\d{3}|Ren[eé][-\s]?\d+|Nimonic[-\s]?\d+|'
+    r'Inconel[-\s]?\d+|Hastelloy[-\s]?\w?|Waspaloy|Mar[-\s]?M[-\s]?\d+|'
+    r'FSX[-\s]?\d+|Udimet[-\s]?\d+|C[-\s]?263)\b', re.I)
+
+
+def _norm_alloy(s):
+    return re.sub(r'[^a-z0-9]', '', (s or '').lower())
+
+
+def _review_captions(parsed):
+    """Caption integrity: numbering, etch status, and comment picture references."""
+    findings = []
+    pics = parsed.get('pictures') or []
+    if not pics:
+        return findings
+    comment = parsed.get('comment') or ''
+
+    nums = []
+    for label, _ in pics:
+        m = _PICNUM.search(label or '')
+        if m:
+            nums.append(int(m.group(1)))
+
+    dups = sorted({n for n in nums if nums.count(n) > 1})
+    if dups:
+        findings.append(('warning', 'Captions',
+                         f'Caption picture number(s) repeated: {", ".join(map(str, dups))}.'))
+    if nums:
+        missing = sorted(set(range(1, max(nums) + 1)) - set(nums))
+        if missing:
+            findings.append(('info', 'Captions',
+                             f'Picture numbering gap — missing {", ".join(map(str, missing))}.'))
+
+    no_etch = [(label or '?').rstrip(':') for label, cap in pics
+               if not _ETCH_PAT.search(f"{label} {cap or ''}")]
+    if no_etch:
+        findings.append(('warning', 'Captions',
+                         f'No etch status in caption(s): {", ".join(no_etch)}.'))
+    else:
+        findings.append(('pass', 'Captions', 'Every caption states an etch status.'))
+
+    refs = [int(m.group(1)) for m in
+            re.finditer(r'pic(?:ture)?\.?\s*(?:no\.?\s*)?(\d+)', comment, re.I)]
+    if refs and max(refs) > len(pics):
+        findings.append(('warning', 'Captions',
+                         f'Comment refers to Picture {max(refs)} but only {len(pics)} '
+                         f'picture(s) are present.'))
+    return findings
+
+
 def review_metallurgical(parsed):
     findings = []
     findings += _review_completeness(parsed)
     findings += _review_hardness(parsed['hardness'], parsed['sample'].get('material'))
     findings += _review_composition(parsed['nominal'], parsed['actual'])
     findings += _review_comment(parsed)
+    findings += _review_captions(parsed)
     return findings
 
 
