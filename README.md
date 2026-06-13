@@ -58,8 +58,9 @@ auto-selects by what's configured:
   `github_repo`, `github_branch`, `github_base`. Note: repos suit only small
   libraries (≈1–5 GB practical limit).
 * **Local** *(default / fallback)* — a folder (`PHOTO_LIBRARY_DIR`, default
-  `photo_library/`); the committed seed library survives via git, but runtime
-  additions don't persist across reboots.
+  `photo_library/`); **not tracked in git** (customer micrographs are kept out of
+  the repo), and runtime additions don't persist across reboots — use the Drive
+  backend for persistence.
 
 **Built-in hardness reference.** `HARDNESS_REF` in [`lab_review.py`](lab_review.py)
 holds typical *aged-condition* hardness (HRC) for common Ni- and Co-based
