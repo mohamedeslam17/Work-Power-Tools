@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 from sem_convert import parse, extract_figures, build
 from lab_review import review_report, summarize
+from photo_lib import add_to_library, alloy_counts, photos_for, LIBRARY_DIR
 
 st.set_page_config(
     page_title="AEG Materials Tools",
@@ -226,10 +227,11 @@ def render_reviewer():
     )
 
     ocr = st.checkbox(
-        "🔍 Read micrograph legends (OCR)",
+        "🔍 Analyse micrographs (legends, etch, thickness)",
         value=True,
-        help="Reads the magnification / scale-bar burned into each micrograph and "
-             "cross-checks it against the written captions. Requires the Tesseract OCR engine.",
+        help="Reads each micrograph's burned-in legend (magnification / scale), gauges "
+             "etched-vs-low-contrast, and reads any burned-in thickness measurements — "
+             "cross-checking against the captions and comment. Requires the Tesseract OCR engine.",
     )
 
     if not files:
@@ -275,12 +277,60 @@ def render_reviewer():
         with st.expander("Extracted data"):
             _render_parsed(rtype, parsed)
 
+        if rtype in ('metallurgical', 'coating'):
+            if st.button("📁 Add this report's micrographs to the library",
+                         key=f"add_{f.name}"):
+                added = add_to_library(f.name, f.getvalue(), parsed, rtype)
+                st.success(f"Added {added} micrograph(s) to the library."
+                           if added else "No new micrographs added (already in library).")
+
+
+# ════════════════════════════════════════════════════════════════════════
+# TAB 3 — Photo Library (per-alloy micrograph gallery)
+# ════════════════════════════════════════════════════════════════════════
+def render_gallery():
+    st.markdown(
+        "Browse stored micrographs **by alloy**, with the data of the report they "
+        "came from. Add micrographs from the **Lab Report Review** tab."
+    )
+    counts = alloy_counts()
+    total = sum(counts.values())
+    if not total:
+        st.info("The library is empty. Review a report and click "
+                "“Add this report's micrographs to the library”.")
+        return
+
+    st.caption(f"{total} micrograph(s) across {len(counts)} alloy(s) · stored in `{LIBRARY_DIR}/`")
+    pick = st.selectbox("Alloy", [f"{a} ({n})" for a, n in sorted(counts.items())])
+    alloy = pick.rsplit(" (", 1)[0]
+    recs = photos_for(alloy)
+
+    st.divider()
+    cols = st.columns(3)
+    for i, r in enumerate(recs):
+        c = cols[i % 3]
+        path = os.path.join(LIBRARY_DIR, r.get("path", ""))
+        contrast = "etched" if r.get("etched") else "low-contrast"
+        cap = f"Job {r.get('job') or '—'} · {r.get('mag') or '?'} · {contrast}"
+        if os.path.exists(path):
+            c.image(path, caption=cap, width="stretch")
+        else:
+            c.warning(f"missing file: {r.get('path')}")
+        meas = r.get("measurements") or []
+        line = f"set: {(r.get('source') or '')[:34]}"
+        if meas:
+            line += " · " + ", ".join(f"{m}µm" for m in meas)
+        c.caption(line)
+
 
 # ════════════════════════════════════════════════════════════════════════
 st.title("AEG Materials Engineering Tools")
 
-tab_conv, tab_review = st.tabs(["🔬 SEM Report Converter", "🧪 Lab Report Review"])
+tab_conv, tab_review, tab_gallery = st.tabs(
+    ["🔬 SEM Report Converter", "🧪 Lab Report Review", "🖼️ Photo Library"])
 with tab_conv:
     render_converter()
 with tab_review:
     render_reviewer()
+with tab_gallery:
+    render_gallery()

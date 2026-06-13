@@ -1,7 +1,7 @@
 # Work-Power-Tools
 
 Materials-engineering tools for Ansaldo Energia (AEG), packaged as a single
-Streamlit app with two tabs.
+Streamlit app with three tabs.
 
 ## Tools
 
@@ -19,10 +19,22 @@ Two report families are recognised automatically:
 
 | Family            | Checks performed |
 |-------------------|------------------|
-| **Metallurgical** | Actual-vs-Nominal chemical composition (element-by-element, beyond ±10% → warning, ±25% → fail); hardness (pre/post-solution sanity + built-in alloy reference, see below); completeness of header/sample fields; micrograph presence & captions; sign-off (lab / engineer / date). |
-| **Coating**       | Coating-thickness measurements vs the design MIN/MAX limits; sign-off; reference-micrograph presence. |
+| **Metallurgical** | Filename ↔ content (job / type / component / customer); Actual-vs-Nominal composition (element-by-element, ±10% → warning, ±25% → fail); hardness (pre/post-solution sanity + built-in alloy reference); completeness; sign-off; coating cell ↔ comment (presence & type); caption integrity (duplicate/gap numbers, etch status required, comment over-references); comment ↔ material/Result verdict; micrograph legends, etch contrast and burned-in thickness. |
+| **Coating**       | Filename ↔ content; coating-thickness measurements vs design MIN/MAX limits; sign-off; reference-micrograph presence. |
 
 Findings are graded **🔴 Fail / 🟠 Warning / 🔵 Note / 🟢 Pass** and shown on screen.
+
+### 🖼️ Photo Library *(new)*
+Extracts the embedded micrographs from a reviewed report into a **per-alloy**
+folder structure with a JSON index, and serves an in-app gallery: pick an alloy
+→ see its micrographs with the data of the report they came from (job, magnification,
+etch state, source, any thickness measurements). Implemented in
+[`photo_lib.py`](photo_lib.py); stored under `photo_library/` (override with
+`PHOTO_LIBRARY_DIR`). Add to it via the button in the review tab, or the CLI:
+
+```bash
+python3 photo_lib.py "path/to/report.xlsx" [more.xlsx ...]
+```
 
 **Built-in hardness reference.** `HARDNESS_REF` in [`lab_review.py`](lab_review.py)
 holds typical *aged-condition* hardness (HRC) for common Ni- and Co-based
@@ -32,11 +44,14 @@ that **post-solution** readings are expected to run *below* it (the solution-
 treated state precedes re-aging), so those are informational, not failures.
 Values are advisory — verify against the controlling spec.
 
-**Micrograph legends (OCR).** With the *Read micrograph legends* option on, the
-reviewer reads the burned-in legend (`<job>_E_<mag>x-<n>` and the scale bar)
-from each embedded micrograph and cross-checks the magnification against the
-written captions. This is best-effort and needs the **Tesseract** engine
-(`packages.txt` installs `tesseract-ocr`; the app degrades gracefully without it).
+**Micrograph analysis (OCR).** With the *Analyse micrographs* option on, the
+reviewer reads each embedded micrograph's burned-in legend (`<job>_E_<mag>x-<n>`
++ scale bar) and cross-checks the magnification and job number against the
+captions; gauges etched-vs-low-contrast via edge density (advisory — faint
+post-HT etching reads as low-contrast); and reads burned-in thickness labels
+(e.g. `42 µm`) to surface alongside the comment's thickness values. Best-effort;
+needs the **Tesseract** engine (`packages.txt` installs `tesseract-ocr`; the app
+degrades gracefully without it).
 
 ## Running
 

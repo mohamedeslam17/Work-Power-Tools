@@ -31,14 +31,19 @@ import zipfile
 
 import openpyxl
 
-# Optional OCR stack, used only to read the burned-in legend on micrographs.
-# The reviewer works fully without it — legend reading is skipped gracefully
-# when Pillow / pytesseract / the Tesseract binary are not present.
+# Optional OCR / imaging stack. The reviewer works without it — legend, etch
+# and thickness reading from micrographs are skipped gracefully when Pillow /
+# pytesseract / the Tesseract binary are not present.
+try:
+    from PIL import Image, ImageFilter
+    _PIL_AVAILABLE = True
+except Exception:
+    _PIL_AVAILABLE = False
+
 try:
     import pytesseract
-    from PIL import Image
     pytesseract.get_tesseract_version()
-    _OCR_AVAILABLE = True
+    _OCR_AVAILABLE = _PIL_AVAILABLE
 except Exception:
     _OCR_AVAILABLE = False
 
@@ -774,29 +779,40 @@ def _binarize(im, thr, scale=4):
         (max(1, im.width * scale), max(1, im.height * scale)))
 
 
-def _read_one_legend(img_bytes):
-    """OCR the burned-in legend of a single micrograph; None if unreadable."""
-    try:
-        im = Image.open(io.BytesIO(img_bytes)).convert('L')
-    except Exception:
+_ETCH_THR = 0.05   # edge-density below this ⇒ image looks unetched / very low contrast
+
+
+def _edge_density(im):
+    """Fraction of strong edges in the image body — high ⇒ etched, low ⇒ unetched."""
+    if not _PIL_AVAILABLE:
         return None
     w, h = im.size
-    if w < 200 or h < 150:            # skip logos / thumbnails
+    c = im.crop((int(w * 0.15), int(h * 0.15), int(w * 0.85), int(h * 0.80)))
+    try:
+        px = list(c.filter(ImageFilter.FIND_EDGES).get_flattened_data())
+    except Exception:
         return None
+    return sum(1 for p in px if p > 40) / len(px) if px else None
+
+
+def _read_legend_im(im):
+    """OCR the burned-in legend (ID / magnification / scale-bar) of one micrograph."""
+    if not _OCR_AVAILABLE:
+        return {}
+    w, h = im.size
     lc = im.crop((0, int(h * 0.90), int(w * 0.55), h))           # ID + magnification
     rc = im.crop((int(w * 0.72), int(h * 0.88), w, h))           # scale bar
     lblob = ' '.join(_safe_ocr(_binarize(lc, t)) for t in (110, 130, 150))
     rblob = ' '.join(_safe_ocr(_binarize(rc, t)) for t in (110, 140))
 
     out = {}
-    job_m = _JOB_PAT.search(lblob)             # leading 4-digit job number, if legible
+    job_m = _JOB_PAT.search(lblob)
     mag_val, idx = None, None
-    for pat in _MAG_PATS:                      # first plausible magnification wins
+    for pat in _MAG_PATS:
         for m in pat.finditer(lblob):
             n = int(m.group(1))
-            if 25 <= n <= 20000:               # real micrograph mags; rejects OCR noise
-                mag_val = n
-                idx = m.group(2) if pat.groups == 2 else None
+            if 25 <= n <= 20000:
+                mag_val, idx = n, (m.group(2) if pat.groups == 2 else None)
                 break
         if mag_val is not None:
             break
@@ -809,33 +825,114 @@ def _read_one_legend(img_bytes):
     s = _SCALE_PAT.search(rblob) or _SCALE_PAT.search(lblob)
     if s:
         out['scale'] = f'{s.group(1)} µm'
-    return out or None
+    return out
 
 
-def read_image_legends(data, max_images=24):
-    """Extract embedded micrographs from an xlsx and OCR each legend.
-
-    Returns (legends, ocr_used):
-        legends  : list of {'image', 'mag', 'scale', 'id'} (only readable ones)
-        ocr_used : False when the OCR stack is unavailable
-    """
+def _read_measurements_im(im):
+    """Read thickness labels (e.g. '42 µm') burned into the image body."""
     if not _OCR_AVAILABLE:
-        return [], False
-    legends = []
+        return []
+    w, h = im.size
+    body = im.crop((0, 0, w, int(h * 0.85)))        # exclude bottom legend + scale bar
+    big = body.resize((body.width * 3, body.height * 3))
+    bright = big.point(lambda p: 255 if p > 200 else 0)
+    txt = _safe_ocr(bright, '--psm 11')
+    return sorted({int(v) for v in re.findall(r'(\d{1,3})\s*[µuμ]m', txt, re.I)})
+
+
+def analyze_images(data, want_bytes=False, max_images=40):
+    """Single pass over embedded micrographs.
+
+    Returns (images, ocr_used) where each image dict carries:
+      'image', 'strong', 'etched', 'measurements', optional 'mag'/'scale'/'id'/'job',
+      and 'bytes'/'ext' when want_bytes is set.
+    """
+    images = []
+    if not _PIL_AVAILABLE:
+        return images, False
     try:
         z = zipfile.ZipFile(io.BytesIO(data))
-        names = [n for n in z.namelist() if n.startswith('xl/media')]
+        names = sorted(n for n in z.namelist() if n.startswith('xl/media'))
     except Exception:
-        return [], True
-    for n in sorted(names)[:max_images]:
+        return images, _OCR_AVAILABLE
+    for n in names[:max_images]:
+        raw = z.read(n)
         try:
-            info = _read_one_legend(z.read(n))
+            im = Image.open(io.BytesIO(raw)).convert('L')
         except Exception:
-            info = None
-        if info:
-            info['image'] = n.split('/')[-1]
-            legends.append(info)
-    return legends, True
+            continue
+        w, h = im.size
+        if w < 200 or h < 150:           # skip logos / thumbnails
+            continue
+        strong = _edge_density(im)
+        entry = {'image': n.split('/')[-1],
+                 'strong': strong,
+                 'etched': (strong is None) or (strong >= _ETCH_THR),
+                 'measurements': _read_measurements_im(im)}
+        entry.update(_read_legend_im(im))
+        if want_bytes:
+            entry['bytes'] = raw
+            entry['ext'] = n.rsplit('.', 1)[-1].lower()
+        images.append(entry)
+    return images, _OCR_AVAILABLE
+
+
+def read_image_legends(data, max_images=40):
+    """Back-compat: the legend subset of analyze_images()."""
+    images, ocr_used = analyze_images(data, max_images=max_images)
+    legends = [im for im in images if im.get('mag') or im.get('scale')]
+    return legends, ocr_used
+
+
+def _comment_thickness_um(comment):
+    """Thickness values in the comment text, normalised to µm."""
+    out = set()
+    for m in re.finditer(r'(\d+(?:\.\d+)?)\s*(mm|µm|um|μm)\b', comment or '', re.I):
+        v = float(m.group(1))
+        out.add(round(v * 1000) if m.group(2).lower() == 'mm' else round(v))
+    return out
+
+
+def _review_etch(images, pictures):
+    """A5 — advisory contrast info (caption-only etch enforcement lives in captions)."""
+    findings = []
+    scored = [im for im in images if im.get('strong') is not None]
+    if not scored:
+        return findings
+    n_low = sum(1 for im in scored if not im.get('etched'))
+    n_cap = sum(1 for label, cap in (pictures or [])
+                if re.search(r'\bunetched\b|as[-\s]?polished', f"{label} {cap or ''}", re.I))
+    findings.append(('info', 'Photo etch',
+                     f'{len(scored) - n_low} of {len(scored)} micrograph(s) show etched-type '
+                     f'contrast; {n_low} low-contrast (unetched / faint post-HT).'))
+    if n_low != n_cap:
+        findings.append(('info', 'Photo etch',
+                         f'{n_low} micrograph(s) read as low-contrast vs {n_cap} caption(s) '
+                         f'marked "unetched" — worth a glance (faint post-HT etch reads low).'))
+    return findings
+
+
+def _review_thickness(parsed, images):
+    """A1 — surface comment vs in-photo thickness measurements for comparison."""
+    findings = []
+    comment_um = _comment_thickness_um(parsed.get('comment'))
+    photo_um = sorted({v for im in images for v in im.get('measurements', [])})
+    if not (comment_um or photo_um):
+        return findings
+    parts = []
+    if comment_um:
+        parts.append('comment ' + ', '.join(f'{v} µm' for v in sorted(comment_um)))
+    if photo_um:
+        parts.append('photos ' + ', '.join(f'{v} µm' for v in photo_um))
+    findings.append(('info', 'Thickness', 'Thickness values — ' + '; '.join(parts) + '.'))
+    if comment_um and photo_um:
+        lo, hi = min(photo_um), max(photo_um)
+        outliers = [v for v in sorted(comment_um) if v < lo * 0.5 or v > hi * 2]
+        if outliers:
+            findings.append(('warning', 'Thickness',
+                             f'Comment thickness {", ".join(f"{v} µm" for v in outliers)} is far '
+                             f'from the photo measurements ({lo}–{hi} µm) — verify.'))
+    return findings
 
 
 def _caption_mags(pictures):
@@ -1031,13 +1128,17 @@ def review_report(filename, data, ocr=True):
 
     findings += review_filename(filename, parsed, rtype)
 
-    legends = []
+    images = []
     if ocr:
-        legends, ocr_used = read_image_legends(data)
+        images, ocr_used = analyze_images(data)
+        legends = [im for im in images if im.get('mag') or im.get('scale')]
         cap_mags = _caption_mags(parsed.get('pictures', []))
         report_job = parsed.get('header', {}).get('job')
         findings += _review_legends(legends, ocr_used, cap_mags, report_job)
-    parsed['legends'] = legends
+        findings += _review_etch(images, parsed.get('pictures', []))
+        findings += _review_thickness(parsed, images)
+    parsed['images'] = images
+    parsed['legends'] = [im for im in images if im.get('mag') or im.get('scale')]
     return rtype, parsed, findings
 
 
