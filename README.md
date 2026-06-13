@@ -39,19 +39,24 @@ python3 photo_lib.py "path/to/report.xlsx" [more.xlsx ...]
 reboot, so runtime additions need a cloud backend. The library is pluggable and
 auto-selects by what's configured:
 
-* **GitHub** *(recommended — no IT, browser-only)* — commits micrographs into the
-  repo via a fine-grained PAT (Contents: read & write). Set in
-  `.streamlit/secrets.toml` / Streamlit Cloud secrets:
-  ```toml
-  github_token  = "github_pat_..."
-  github_repo   = "owner/Work-Power-Tools"
-  github_branch = "main"          # branch to store files on
-  github_base   = "photo_library" # path prefix in the repo
-  ```
-* **Google Drive** *(alternative)* — OAuth acting as you (see [`drive_store.py`](drive_store.py)).
-  Run `python3 drive_store.py --auth` once for a refresh token, then set
-  `drive_client_id`, `drive_client_secret`, `drive_refresh_token`, `drive_folder_id`.
-  Needs `google-api-python-client google-auth google-auth-oauthlib`.
+* **Google Drive** *(recommended — 15 GB+, no repo bloat)* — OAuth acting as you
+  ([`drive_store.py`](drive_store.py)), least-privilege `drive.file` scope, into a
+  self-managed **"AEG Photo Library"** folder in your Drive. Setup:
+  1. Google Cloud console → enable the **Drive API** → create an **OAuth client
+     (Desktop)**; add yourself as a test user on the consent screen.
+  2. `python3 drive_store.py --auth` (any machine/Colab with a browser) → prints a
+     refresh token.
+  3. Add to Streamlit secrets:
+     ```toml
+     drive_client_id     = "....apps.googleusercontent.com"
+     drive_client_secret = "...."
+     drive_refresh_token = "1//...."
+     ```
+  4. `python3 drive_store.py --migrate` pushes the seeded local library up to Drive.
+* **GitHub** *(alternative — no IT, browser-only)* — commits micrographs into the
+  repo via a fine-grained PAT (Contents: read & write). Set `github_token`,
+  `github_repo`, `github_branch`, `github_base`. Note: repos suit only small
+  libraries (≈1–5 GB practical limit).
 * **Local** *(default / fallback)* — a folder (`PHOTO_LIBRARY_DIR`, default
   `photo_library/`); the committed seed library survives via git, but runtime
   additions don't persist across reboots.
