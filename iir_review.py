@@ -68,6 +68,7 @@ CHECK_CATALOG = [
     ("Spares",       "Scrap agrees: protocol vs replacement table", WARN),
     ("Spares",       "Spare replacements identified",        INFO),
     ("Spares",       "Spare parts list present",             INFO),
+    ("Spares",       "Spare quantities scale with the set",  INFO),
 ]
 DEFAULT_SEVERITY = {title: sev for _, title, sev in CHECK_CATALOG}
 
@@ -636,14 +637,19 @@ def _parse_spares(wb, data):
                 break
         if hr is None:
             continue
-        c_part = min((c.column for c in ws[hr] if isinstance(c.value, str) and _norm(c.value)), default=1)
+        cmap = {_norm(c.value).lower(): c.column for c in ws[hr]
+                if isinstance(c.value, str) and _norm(c.value)}
+        c_part = next((v for k, v in cmap.items() if 'part' in k and 'number' not in k),
+                      min(cmap.values()))
+        c_qty = next((v for k, v in cmap.items() if 'quantity' in k or k == 'qty'), None)
         for r in range(hr + 1, ws.max_row + 1):
             part = ws.cell(r, c_part).value
             if not (isinstance(part, str) and part.strip()):
                 if slist:
                     break
                 continue
-            slist.append(part.strip())
+            nums = re.findall(r'\d+', _norm(ws.cell(r, c_qty).value)) if c_qty else []
+            slist.append({'part': part.strip(), 'qty': sum(int(x) for x in nums) if nums else None})
         break
     data['spares_list'] = slist
     data['spares_replace_note'] = any(
@@ -689,11 +695,20 @@ def _spare_checks(d):
                 out.append(_f("Scrap agrees: protocol vs replacement table", WARN, "Spare parts",
                               "; ".join(parts), "Spares"))
     elif d.get('spares_list'):
-        n = len(d['spares_list'])
+        slist = d['spares_list']
         note = d.get('spares_replace_note')
         out.append(_f("Spare parts list present", INFO, "Spare Parts List",
-                      f"{n} spare/consumable line item(s) listed"
+                      f"{len(slist)} spare/consumable line item(s) listed"
                       + (" — flagged to be replaced with new ones" if note else ""), "Spares"))
+        comp = d.get('b_qty') or len(d.get('sn_rows', []))
+        withq = [s for s in slist if s.get('qty')]
+        if comp and withq:
+            mult = sum(1 for s in withq if s['qty'] % comp == 0)
+            out.append(_f("Spare quantities scale with the set", INFO, "Spare Parts List",
+                          f"{mult}/{len(withq)} spare quantities are whole multiples of the "
+                          f"{comp}-unit set"
+                          + (f" ({len(withq) - mult} assembly-specific, not per-unit)"
+                             if mult < len(withq) else ""), "Spares"))
     return out
 
 def run_checks(d, overrides=None):
