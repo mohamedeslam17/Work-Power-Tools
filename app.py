@@ -3,7 +3,11 @@ import tempfile
 import os
 from pathlib import Path
 from sem_convert import parse, extract_figures, build
-from lab_review import review_report, summarize, HT_ORDER
+from lab_review import review_report, summarize
+try:
+    from lab_review import HT_ORDER
+except ImportError:   # tolerate a stale/cached lab_review module on redeploy
+    HT_ORDER = ['As-received', 'Post-solution', 'Post stress-relief', 'Post-ageing', 'Unspecified']
 from photo_lib import (add_to_library, alloy_counts, photos_for,
                        get_image_bytes, backend_name, LIBRARY_DIR)
 
