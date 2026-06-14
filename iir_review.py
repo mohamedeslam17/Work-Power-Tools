@@ -64,6 +64,10 @@ CHECK_CATALOG = [
     ("Completeness", "Page 'of N' consistent",               WARN),
     ("Completeness", "Page footers show total",              INFO),
     ("Completeness", "Page total vs sheet count",            INFO),
+    ("Spares",       "Replacement table covers all positions", WARN),
+    ("Spares",       "Scrap agrees: protocol vs replacement table", WARN),
+    ("Spares",       "Spare replacements identified",        INFO),
+    ("Spares",       "Spare parts list present",             INFO),
 ]
 DEFAULT_SEVERITY = {title: sev for _, title, sev in CHECK_CATALOG}
 
@@ -490,6 +494,7 @@ def parse_iir(path):
     data['template'] = _detect_template(wb)
     if data['template'] == 'B':
         _parse_family_b(wb, path, data)
+    _parse_spares(wb, data)
 
     wb.close()
     return data
@@ -577,10 +582,124 @@ def _checks_family_b(d):
                       "No Incoming/Receiving Photos sheet found", "Completeness"))
     return out
 
+def _parse_spares(wb, data):
+    """Damage-driven spares. Family A: the 'Expected Replacement Components'
+    matrix (per position, an 'X' under each spare component needed, or Scrap).
+    Family B: the consumables 'Spare Parts List' + a 'will be replaced' note."""
+    matrix, comp_names = [], []
+    for name in wb.sheetnames:
+        if 'spare' not in name.lower():
+            continue
+        ws = wb[name]
+        hr = next((r for r in range(1, 12)
+                   if any(isinstance(c.value, str) and ('position' in c.value.lower()
+                          or 'sequential' in c.value.lower()) for c in ws[r])
+                   and any(isinstance(c.value, str) and 'serial' in c.value.lower() for c in ws[r])),
+                  None)
+        if hr is None:
+            continue
+        hdr = {c.column: _norm(c.value) for c in ws[hr] if isinstance(c.value, str) and _norm(c.value)}
+        def find(*needles):
+            return next((col for col, v in hdr.items()
+                         if any(n in v.lower() for n in needles)), None)
+        c_pos, c_sn = find('position', 'sequential'), find('serial')
+        c_rem, c_pn = find('remark'), find('part number')
+        comp_cols = {col: v for col, v in hdr.items()
+                     if col not in (c_pos, c_sn, c_rem, c_pn)
+                     and not any(x in v.lower() for x in ('position', 'sequential', 'serial',
+                                                          'remark', 'part number', 'adder', 'item'))}
+        for v in (hdr[c] for c in sorted(comp_cols)):
+            if v not in comp_names:
+                comp_names.append(v)
+        for r in range(hr + 1, ws.max_row + 1):
+            pv = ws.cell(r, c_pos).value if c_pos else None
+            if not isinstance(pv, (int, float)) or isinstance(pv, bool):
+                continue
+            comps = [hdr[col] for col in comp_cols if _norm(ws.cell(r, col).value)]
+            rem = _norm(ws.cell(r, c_rem).value).lower() if c_rem else ''
+            matrix.append({'pos': int(pv), 'comps': comps, 'scrap': 'scrap' in rem})
+    data['spares_matrix'] = matrix
+    data['spares_components'] = comp_names
+
+    slist = []
+    for name in wb.sheetnames:
+        ws = wb[name]
+        lab = next((c.row for c in _cells(ws)
+                    if isinstance(c.value, str) and re.search(r'spare\s*parts?\s*list', c.value, re.I)), None)
+        if lab is None:
+            continue
+        hr = None
+        for r in range(lab, min(ws.max_row, lab + 6) + 1):
+            vals = [_norm(c.value).lower() for c in ws[r] if isinstance(c.value, str)]
+            if any('part number' in v for v in vals) and any('quantity' in v or v == 'qty' for v in vals):
+                hr = r
+                break
+        if hr is None:
+            continue
+        c_part = min((c.column for c in ws[hr] if isinstance(c.value, str) and _norm(c.value)), default=1)
+        for r in range(hr + 1, ws.max_row + 1):
+            part = ws.cell(r, c_part).value
+            if not (isinstance(part, str) and part.strip()):
+                if slist:
+                    break
+                continue
+            slist.append(part.strip())
+        break
+    data['spares_list'] = slist
+    data['spares_replace_note'] = any(
+        isinstance(c.value, str)
+        and re.search(r'spare parts?.{0,50}replac|replac.{0,40}new ones', c.value, re.I)
+        for name in wb.sheetnames for c in _cells(wb[name]))
+
+def _spare_checks(d):
+    """Relate the spare / replacement parts to the damage findings + serial protocol."""
+    out = []
+    matrix = d.get('spares_matrix') or []
+    if matrix:
+        from collections import Counter
+        tally = Counter(c for m in matrix for c in m['comps'])
+        scrap_pos = sorted(m['pos'] for m in matrix if m['scrap'])
+        if tally:
+            summ = ", ".join(f"{n}× {name}" for name, n in tally.most_common())
+            out.append(_f("Spare replacements identified", INFO, "Spare parts",
+                          f"Damage-driven replacement components over {len(matrix)} position(s): {summ}"
+                          + (f"; {len(scrap_pos)} scrapped" if scrap_pos else ""), "Spares"))
+        sn_pos = {r['pos'] for r in d.get('sn_rows', [])}
+        mat_pos = {m['pos'] for m in matrix}
+        if sn_pos:
+            missing = sorted(sn_pos - mat_pos)
+            if missing:
+                out.append(_f("Replacement table covers all positions", WARN, "Spare parts",
+                              f"{len(missing)} protocol position(s) absent from the replacement "
+                              f"table: {missing[:15]}", "Spares"))
+            else:
+                out.append(_f("Replacement table covers all positions", PASS, "Spare parts",
+                              f"All {len(sn_pos)} protocol positions appear in the replacement table",
+                              "Spares"))
+        sn_scrap = {r['pos'] for r in d.get('sn_rows', []) if r.get('scrap')}
+        if sn_scrap or scrap_pos:
+            only_mat = sorted(set(scrap_pos) - sn_scrap)
+            only_sn = sorted(sn_scrap - set(scrap_pos))
+            if only_mat or only_sn:
+                parts = []
+                if only_mat:
+                    parts.append(f"scrap in replacement table but not protocol: {only_mat[:10]}")
+                if only_sn:
+                    parts.append(f"scrap in protocol but not replacement table: {only_sn[:10]}")
+                out.append(_f("Scrap agrees: protocol vs replacement table", WARN, "Spare parts",
+                              "; ".join(parts), "Spares"))
+    elif d.get('spares_list'):
+        n = len(d['spares_list'])
+        note = d.get('spares_replace_note')
+        out.append(_f("Spare parts list present", INFO, "Spare Parts List",
+                      f"{n} spare/consumable line item(s) listed"
+                      + (" — flagged to be replaced with new ones" if note else ""), "Spares"))
+    return out
+
 def run_checks(d, overrides=None):
     tmpl = d.get('template')
     if tmpl == 'B':
-        out = _checks_family_b(d)
+        out = _checks_family_b(d) + _spare_checks(d)
         out = apply_overrides(out, overrides)
         out.sort(key=lambda x: (SEV_RANK[x['severity']], x['category']))
         return out
@@ -874,6 +993,8 @@ def run_checks(d, overrides=None):
         total_imgs = sum(p['images'] for p in d['photos'])
         out.append(_f("Incoming photos present", PASS, "Incoming photos",
                       f"{len(d['photos'])} photo sheet(s), {total_imgs} images embedded", "Completeness"))
+
+    out += _spare_checks(d)
 
     # apply user severity overrides, then stable-sort: severity, then category
     out = apply_overrides(out, overrides)

@@ -97,7 +97,10 @@ positions = received, serial-scope totals reconcile, sum-row vs marked scopes,
 Received-Parts table vs Serial-Number protocol), **Integrity** (unique/contiguous
 positions, serial numbers, valid repair-scope L/M/H/S, scrap ↔ scope 'S'),
 **Consistency** (Summary-of-Damages counts vs protocol marks, executive-summary
-cross-checks) and **Completeness** (a photo per caption, page numbering). Each check's
+cross-checks), **Completeness** (a photo per caption, page numbering) and **Spares** —
+the damage-driven *Expected Replacement Components* matrix tallied per component and
+reconciled to the serial protocol (position coverage + scrap), plus the consumables
+*Spare Parts List*. Each check's
 severity is tunable (🔴 Fail / 🟠 Warn / 🔵 Info / ⚪ Off) live in the UI; defaults live in
 `iir_review.CHECK_CATALOG`. Review several at once for a combined **Batch Summary** workbook.
 
