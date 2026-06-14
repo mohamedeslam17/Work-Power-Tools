@@ -290,7 +290,7 @@ def parse_iir(path):
     cover    = _sheet_by(wb, 'Cover')
     contents = _sheet_by(wb, 'Contents')
     es       = _sheet_by(wb, 'Executive', 'Summary of Re')  # exec summary
-    recv     = _sheet_by(wb, 'Received')
+    recv     = _sheet_by(wb, 'Received', 'Reconditioned')
     damages  = _sheet_by(wb, 'Damages')
 
     # ── identity: prefer the Contents header block (clean label/value cells) ──
@@ -361,7 +361,12 @@ def parse_iir(path):
                     if name in k:
                         return v
                 return None
-            idx = {k: cidx(k) for k in ['required', 'received', 'scrap', 'reconditionable']}
+            idx = {k: cidx(k) for k in ['required', 'received', 'scrap']}
+            # count column reads "Reconditioned" (final reports) or "Reconditionable"
+            # (incoming) — but never the "Reconditioning Order No" text column
+            idx['reconditionable'] = next(
+                (v for k, v in cols.items()
+                 if k.startswith('recondition') and 'order' not in k), None)
             for r in range(hr + 1, hr + 30):
                 first = recv.cell(r, 1).value
                 if isinstance(first, str) and first.strip().lower().startswith('table'):
@@ -384,7 +389,8 @@ def parse_iir(path):
             continue
         ws = wb[name]
         hr = next((r for r in range(1, 14)
-                   if any(isinstance(c.value, str) and 'position' in c.value.lower()
+                   if any(isinstance(c.value, str)
+                          and ('position' in c.value.lower() or 'sequential' in c.value.lower())
                           for c in ws[r])), None)
         colmap = {}
         if hr:
@@ -394,7 +400,7 @@ def parse_iir(path):
                 if needle in k:
                     return v
             return None
-        c_pos = col('position'); c_pn = col('part number'); c_sn = col('serial')
+        c_pos = col('position') or col('sequential'); c_pn = col('part number'); c_sn = col('serial')
         c_scope = col('repair scope') or col('scope'); c_scrap = col('scrap')
         defect_cols = {k: v for k, v in colmap.items()
                        if k not in ('position no', 'part number', 'serial number',

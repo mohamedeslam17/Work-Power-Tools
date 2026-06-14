@@ -85,6 +85,13 @@ Assessment Customer Reports) delivered as `.xlsx`. Upload one or more workbooks 
 severity-tagged findings checklist plus an on-screen batch overview. Implemented in
 [`iir_review.py`](iir_review.py).
 
+**Two report layouts are recognised automatically:** the classic *Contents /
+Summary of Received (or Reconditioned) Parts / Serial Number* template, and the
+section-based *Introduction / CONFIGURATION / SN registration / Incoming Photos*
+template used by most reports. Identity, the serial registration and photos are
+read from whichever layout a workbook uses; an unrecognised workbook is flagged
+("unrecognized layout") instead of being silently mis-scored.
+
 Checks span **Identity/metadata**, **Quantities** (Received = Scrap + Reconditionable,
 positions = received, serial-scope totals reconcile, sum-row vs marked scopes,
 Received-Parts table vs Serial-Number protocol), **Integrity** (unique/contiguous
