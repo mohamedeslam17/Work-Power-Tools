@@ -96,17 +96,29 @@ def _records(filename, data, parsed, rtype):
         return []
     alloy, job, meta = _report_meta(filename, parsed, rtype)
     raw = _raw_image_bytes(data)
-    from lab_review import report_etchants, image_etchant
-    by_mag, primary = report_etchants(parsed.get('pictures'))
+    from lab_review import (report_etchants, image_etchant, report_ht, image_ht,
+                            image_captions, caption_etchant, caption_ht)
+    pics = parsed.get('pictures')
+    et_by_mag, et_primary = report_etchants(pics)
+    ht_by_mag, ht_primary = report_ht(pics)
+    caps = image_captions(data, pics)        # {image: caption} via drawing anchors
     recs = []
     for im in images:
         name = im.get('image')
         if not name or name not in raw:
             continue
+        mag = im.get('mag')
+        cap = caps.get(name)
+        if cap is not None:                  # exact caption for this image
+            etchant = caption_etchant(cap) or et_primary or 'Unspecified'
+            ht = caption_ht(cap) or ht_primary or 'Unspecified'
+        else:                                # fall back to magnification matching
+            etchant = image_etchant(mag, et_by_mag, et_primary)
+            ht = image_ht(mag, ht_by_mag, ht_primary)
         recs.append({
             'alloy': alloy, 'job': job, 'image': name, 'bytes': raw[name],
-            'mag': im.get('mag'), 'scale': im.get('scale'),
-            'etched': im.get('etched'), 'etchant': image_etchant(im.get('mag'), by_mag, primary),
+            'mag': mag, 'scale': im.get('scale'),
+            'etched': im.get('etched'), 'etchant': etchant, 'ht': ht,
             'measurements': im.get('measurements', []),
             'added': datetime.date.today().isoformat(), **meta,
         })
