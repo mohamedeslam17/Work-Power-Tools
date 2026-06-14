@@ -88,6 +88,8 @@ HARDNESS_REF = {
     'GTD111':     _hrc(32, 44, 'Ni'),
     'GTD444':     _hrc(32, 44, 'Ni'),
     'GTD741':     _hrc(30, 42, 'Ni', 'GE proprietary — typical Ni bucket range; verify.'),
+    'GTD222':     _hrc(25, 38, 'Ni', 'GE cast nozzle alloy (moderate γ′, weldable) — advisory; verify.'),
+    'GTD241':     _hrc(25, 40, 'Ni', 'GE cast nozzle alloy — advisory; verify.'),
     'RENE80':     _hrc(30, 40, 'Ni'),
     'RENE108':    _hrc(35, 45, 'Ni'),
     'RENE142':    _hrc(35, 45, 'Ni'),
@@ -99,6 +101,7 @@ HARDNESS_REF = {
     'IN713C':     _hrc(30, 42, 'Ni'),
     'WASPALOY':   _hrc(32, 42, 'Ni'),
     'UDIMET500':  _hrc(30, 40, 'Ni'),
+    'U500':       _hrc(30, 40, 'Ni'),     # Udimet 500 alias
     'UDIMET520':  _hrc(30, 40, 'Ni'),
     'UDIMET720':  _hrc(36, 46, 'Ni'),
     'IN718':      _hrc(36, 44, 'Ni'),
@@ -115,6 +118,7 @@ HARDNESS_REF = {
     'IN625':      _hrc(8, 25, 'Ni', 'Solid-solution; annealed ~88-96 HRB.'),
     'INCONEL625': _hrc(8, 25, 'Ni', 'Solid-solution; annealed ~88-96 HRB.'),
     'HASTELLOYX': _hrc(8, 25, 'Ni', 'Solid-solution; annealed ~90 HRB.'),
+    'HASTX':      _hrc(8, 25, 'Ni', 'Hastelloy X alias; solid-solution, ~90 HRB.'),
     # ── Cobalt-based (carbide / solid-solution strengthened) ──
     'FSX414':     _hrc(25, 38, 'Co', 'Cast Co nozzle/vane alloy.'),
     'X40':        _hrc(30, 42, 'Co'),
@@ -281,18 +285,33 @@ def _coating(ws):
 
 
 def _composition(ws, which):
-    """Extract {element: value} for which='Nominal' or 'Actual'."""
-    loc = _find(ws, r'\(\s*' + which + r'\s*\)')
+    """Extract {element: value} for which='Nominal' or 'Actual'.
+
+    Handles the two layouts seen in practice: element headers in the
+    '(Nominal/Actual)' label row with values below, OR element headers in the
+    row above the label with values in the label row. Tolerates the 'Minimal'
+    typo for 'Nominal'.
+    """
+    pat = r'\(\s*(?:Nominal|Minimal)\s*\)' if which == 'Nominal' else r'\(\s*Actual\s*\)'
+    loc = _find(ws, pat)
     comp = {}
     if not loc:
         return comp
-    hrow = loc[0]
-    for cell in ws[hrow]:
-        sym = _txt(cell.value)
-        if sym.capitalize() in ELEMENTS:
-            val = _num(ws.cell(row=hrow + 1, column=cell.column).value)
-            if val is not None:
-                comp[sym.capitalize()] = val
+    lrow = loc[0]
+
+    def elem_cells(r):
+        return [c for c in ws[r] if r >= 1 and _txt(c.value).capitalize() in ELEMENTS]
+
+    if len(elem_cells(lrow)) >= 2:           # elements in label row, values below
+        ehdr, vrow = lrow, lrow + 1
+    elif lrow > 1 and len(elem_cells(lrow - 1)) >= 2:   # elements above, values in label row
+        ehdr, vrow = lrow - 1, lrow
+    else:
+        return comp
+    for cell in elem_cells(ehdr):
+        val = _num(ws.cell(row=vrow, column=cell.column).value)
+        if val is not None:
+            comp[_txt(cell.value).capitalize()] = val
     return comp
 
 
@@ -314,7 +333,7 @@ def _pictures(ws):
 def _signoff(ws):
     out = {}
     for key, pat in (('met_lab', r'Met\.?\s*Lab'),
-                     ('mat_eng', r'Mat\.?\s*Eng'),
+                     ('mat_eng', r'(?:Mat|Met)\.?\s*Eng'),
                      ('date',    r'^Date\s*:')):
         loc = _find(ws, pat)
         if loc:
@@ -346,23 +365,31 @@ def _review_composition(nominal, actual):
         return findings
 
     common = sorted(set(nominal) & set(actual))
-    flagged = False
+    deviations = []
     for el in common:
         nom, act = nominal[el], actual[el]
         if nom == 0:
             continue
         dev = act - nom
         rel = dev / abs(nom) * 100.0
-        a, r = abs(dev), abs(rel)
-        if r >= COMP_CRIT_REL and a >= COMP_CRIT_ABS:
-            sev = 'critical'
-        elif r >= COMP_WARN_REL and a >= COMP_WARN_ABS:
-            sev = 'warning'
-        else:
-            continue
-        flagged = True
-        findings.append((sev, 'Composition',
-                         f'{el}: actual {act:g} vs nominal {nom:g} wt% ({rel:+.0f}%).'))
+        if abs(rel) >= COMP_WARN_REL and abs(dev) >= COMP_WARN_ABS:
+            deviations.append((el, nom, act, rel))
+
+    # A few elements off is normal service depletion / EDS scatter → warnings.
+    # Many elements off together signals the actual material doesn't match the
+    # stated alloy → one consolidated FAIL ("verify material/grade").
+    n_dev, n_common = len(deviations), len(common)
+    systemic = n_dev >= 4 or (n_dev >= 3 and n_common and n_dev / n_common >= 0.5)
+    if systemic:
+        worst = sorted(deviations, key=lambda d: -abs(d[3]))[:4]
+        detail = ", ".join(f"{el} {rel:+.0f}%" for el, _, _, rel in worst)
+        findings.append(('critical', 'Composition',
+                         f'{n_dev} of {n_common} elements out of tolerance ({detail} …) — actual '
+                         f'composition does not match the stated alloy; verify material/grade.'))
+    else:
+        for el, nom, act, rel in deviations:
+            findings.append(('warning', 'Composition',
+                             f'{el}: actual {act:g} vs nominal {nom:g} wt% ({rel:+.0f}%).'))
 
     only_nom = sorted(set(nominal) - set(actual))
     only_act = sorted(set(actual) - set(nominal))
@@ -372,7 +399,7 @@ def _review_composition(nominal, actual):
     if only_act:
         findings.append(('info', 'Composition',
                          f'Reported but not in nominal spec: {", ".join(only_act)}.'))
-    if not flagged:
+    if not deviations:
         findings.append(('pass', 'Composition',
                          f'All {len(common)} matched elements within ±{COMP_WARN_REL:g}% tolerance.'))
     return findings
