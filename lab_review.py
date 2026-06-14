@@ -365,23 +365,31 @@ def _review_composition(nominal, actual):
         return findings
 
     common = sorted(set(nominal) & set(actual))
-    flagged = False
+    deviations = []
     for el in common:
         nom, act = nominal[el], actual[el]
         if nom == 0:
             continue
         dev = act - nom
         rel = dev / abs(nom) * 100.0
-        a, r = abs(dev), abs(rel)
-        if r >= COMP_CRIT_REL and a >= COMP_CRIT_ABS:
-            sev = 'critical'
-        elif r >= COMP_WARN_REL and a >= COMP_WARN_ABS:
-            sev = 'warning'
-        else:
-            continue
-        flagged = True
-        findings.append((sev, 'Composition',
-                         f'{el}: actual {act:g} vs nominal {nom:g} wt% ({rel:+.0f}%).'))
+        if abs(rel) >= COMP_WARN_REL and abs(dev) >= COMP_WARN_ABS:
+            deviations.append((el, nom, act, rel))
+
+    # A few elements off is normal service depletion / EDS scatter → warnings.
+    # Many elements off together signals the actual material doesn't match the
+    # stated alloy → one consolidated FAIL ("verify material/grade").
+    n_dev, n_common = len(deviations), len(common)
+    systemic = n_dev >= 4 or (n_dev >= 3 and n_common and n_dev / n_common >= 0.5)
+    if systemic:
+        worst = sorted(deviations, key=lambda d: -abs(d[3]))[:4]
+        detail = ", ".join(f"{el} {rel:+.0f}%" for el, _, _, rel in worst)
+        findings.append(('critical', 'Composition',
+                         f'{n_dev} of {n_common} elements out of tolerance ({detail} …) — actual '
+                         f'composition does not match the stated alloy; verify material/grade.'))
+    else:
+        for el, nom, act, rel in deviations:
+            findings.append(('warning', 'Composition',
+                             f'{el}: actual {act:g} vs nominal {nom:g} wt% ({rel:+.0f}%).'))
 
     only_nom = sorted(set(nominal) - set(actual))
     only_act = sorted(set(actual) - set(nominal))
@@ -391,7 +399,7 @@ def _review_composition(nominal, actual):
     if only_act:
         findings.append(('info', 'Composition',
                          f'Reported but not in nominal spec: {", ".join(only_act)}.'))
-    if not flagged:
+    if not deviations:
         findings.append(('pass', 'Composition',
                          f'All {len(common)} matched elements within ±{COMP_WARN_REL:g}% tolerance.'))
     return findings
