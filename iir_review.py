@@ -366,7 +366,7 @@ def parse_iir(path):
             # (incoming) — but never the "Reconditioning Order No" text column
             idx['reconditionable'] = next(
                 (v for k, v in cols.items()
-                 if k.startswith('recondition') and 'order' not in k), None)
+                 if k.startswith(('recondition', 'repairab', 'repaired')) and 'order' not in k), None)
             for r in range(hr + 1, hr + 30):
                 first = recv.cell(r, 1).value
                 if isinstance(first, str) and first.strip().lower().startswith('table'):
@@ -666,8 +666,14 @@ def run_checks(d, overrides=None):
             out.append(_f("Positions listed = Received", PASS, "Serial Number",
                           f"{npos} positions listed = {rp['received']} received", "Quantities"))
         else:
-            out.append(_f("Positions listed = Received", FAIL, "Serial Number",
-                          f"{npos} positions in protocol ≠ {rp['received']} received", "Quantities"))
+            # final-repair / reconditioned reports legitimately serialise fewer
+            # parts than were received, so flag for confirmation rather than fail
+            recond_report = any('recondition' in s.lower() for s in d['sheets'])
+            out.append(_f("Positions listed = Received", WARN if recond_report else FAIL,
+                          "Serial Number",
+                          f"{npos} positions in protocol ≠ {rp['received']} received"
+                          + (" — final-repair report, confirm" if recond_report else ""),
+                          "Quantities"))
 
     if positions:
         dupes = sorted({p for p in positions if positions.count(p) > 1})
