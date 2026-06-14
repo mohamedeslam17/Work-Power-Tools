@@ -653,6 +653,105 @@ def image_etchant(image_mag, by_mag, primary):
     return primary or 'Unspecified'
 
 
+# Heat-treatment condition vocabulary (ordered by repair sequence; specific
+# first). The condition usually varies per picture within a report.
+_HT_VOCAB = [
+    (r'post[-\s]*ag(?:e?ing|ed)|after\s*ag(?:e?ing)|\bre[-\s]*ag|\baged\b|\bage?ing\b', 'Post-ageing'),
+    (r'stress[-\s]*relief|after\s*stress|\bSR\b\s*HT|post[-\s]*weld', 'Post stress-relief'),
+    # As-received / pre-solution before post-solution so "Pre-Solution" isn't
+    # caught by the post-solution "re-solution" alternative.
+    (r'pre[-\s]*solution|as[-\s]*received|as\s*received|receiving|incoming|as[-\s]*is|service[-\s]*exposed', 'As-received'),
+    (r'post[-\s]*solution|after\s*solution|solution(?:ed|ing)?\s*(?:ht|treat)|\bre[-\s]*solution', 'Post-solution'),
+]
+
+# Display order for HT groups (process sequence).
+HT_ORDER = ['As-received', 'Post-solution', 'Post stress-relief', 'Post-ageing', 'Unspecified']
+
+
+def caption_ht(text):
+    """Canonical heat-treatment condition named in a caption, or None."""
+    t = text or ''
+    for pat, name in _HT_VOCAB:
+        if re.search(pat, t, re.I):
+            return name
+    return None
+
+
+def report_ht(pictures):
+    """(magnification→HT map, primary HT) from a report's captions.
+
+    HT typically varies per picture (pre/post-solution, stress relief, ageing),
+    so the per-magnification map is the main output.
+    """
+    by_mag, counts = {}, {}
+    for label, cap in pictures or []:
+        text = f"{label} {cap or ''}"
+        ht = caption_ht(text)
+        if ht:
+            counts[ht] = counts.get(ht, 0) + 1
+            for m in re.finditer(r'(\d{2,4})\s*[xX]\b', text):
+                by_mag.setdefault(f"{m.group(1)}x", ht)
+    primary = max(counts, key=counts.get) if counts else None
+    return by_mag, primary
+
+
+def image_ht(image_mag, by_mag, primary):
+    """Best-effort HT condition for one micrograph (caption HT for its magnification)."""
+    if image_mag and image_mag in by_mag:
+        return by_mag[image_mag]
+    return primary or 'Unspecified'
+
+
+def _anchor_order(data):
+    """Embedded micrographs in visual (drawing-anchor) order, top-to-bottom /
+    left-to-right, excluding logos/thumbnails. Returns a list of image names."""
+    if not _PIL_AVAILABLE:
+        return []
+    try:
+        z = zipfile.ZipFile(io.BytesIO(data))
+    except Exception:
+        return []
+    real = set()
+    for n in z.namelist():
+        if n.startswith('xl/media'):
+            try:
+                im = Image.open(io.BytesIO(z.read(n)))
+                if im.size[0] >= 200 and im.size[1] >= 150:
+                    real.add(n.split('/')[-1])
+            except Exception:
+                pass
+    placed = []
+    for d in [n for n in z.namelist() if re.match(r'xl/drawings/drawing\d+\.xml$', n)]:
+        try:
+            rels = z.read(d.replace('drawings/', 'drawings/_rels/') + '.rels').decode('utf-8', 'ignore')
+        except Exception:
+            continue
+        rid2media = {i: t.split('/')[-1]
+                     for i, t in re.findall(r'Id="(rId\d+)"[^>]*Target="([^"]+)"', rels)}
+        xml = z.read(d).decode('utf-8', 'ignore')
+        for anc in re.findall(r'<xdr:(?:two|one)CellAnchor.*?</xdr:(?:two|one)CellAnchor>', xml, re.DOTALL):
+            fm = re.search(r'<xdr:from>.*?<xdr:col>(\d+)</xdr:col>.*?<xdr:row>(\d+)</xdr:row>', anc, re.DOTALL)
+            em = re.search(r'r:embed="(rId\d+)"', anc)
+            if fm and em and rid2media.get(em.group(1)) in real:
+                placed.append((int(fm.group(2)), int(fm.group(1)), rid2media[em.group(1)]))
+    placed.sort()
+    return [p[2] for p in placed]
+
+
+def image_captions(data, pictures):
+    """Map each embedded micrograph to its picture caption via anchor order.
+
+    Returns {image_name: caption}; empty when the image count doesn't match the
+    caption count (caller falls back to magnification matching).
+    """
+    order = _anchor_order(data)
+    caps = [c for _, c in sorted((int(m.group(1)), c) for l, c in (pictures or [])
+                                 for m in [_PICNUM.search(l or '')] if m)]
+    if not order or len(order) != len(caps):
+        return {}
+    return dict(zip(order, caps))
+
+
 def _review_captions(parsed):
     """Caption integrity: numbering, etch status, and comment picture references."""
     findings = []

@@ -3,7 +3,7 @@ import tempfile
 import os
 from pathlib import Path
 from sem_convert import parse, extract_figures, build
-from lab_review import review_report, summarize
+from lab_review import review_report, summarize, HT_ORDER
 from photo_lib import (add_to_library, alloy_counts, photos_for,
                        get_image_bytes, backend_name, LIBRARY_DIR)
 
@@ -313,21 +313,28 @@ def render_gallery():
     alloy = pick.rsplit(" (", 1)[0]
     recs = photos_for(alloy)
 
-    # Segregate by etchant within the alloy.
+    # Segregate within the alloy by either heat-treatment condition or etchant.
+    dim = st.selectbox("Segregate by", ["Heat treatment", "Etchant"])
+    key = "ht" if dim == "Heat treatment" else "etchant"
+    other = "etchant" if key == "ht" else "ht"
+    icon = "🔥" if key == "ht" else "🧪"
+
     groups = {}
     for r in recs:
-        groups.setdefault(r.get("etchant") or "Unspecified", []).append(r)
+        groups.setdefault(r.get(key) or "Unspecified", []).append(r)
+    if key == "ht":          # process sequence for HT, alphabetical for etchant
+        order = [g for g in HT_ORDER if g in groups] + sorted(g for g in groups if g not in HT_ORDER)
+    else:
+        order = sorted(groups)
 
-    etch_filter = st.selectbox(
-        "Etchant", ["All"] + [f"{e} ({len(g)})" for e, g in sorted(groups.items())])
-    shown = groups if etch_filter == "All" else {etch_filter.rsplit(" (", 1)[0]:
-                                                 groups[etch_filter.rsplit(" (", 1)[0]]}
+    flt = st.selectbox(dim, ["All"] + [f"{g} ({len(groups[g])})" for g in order])
+    shown = order if flt == "All" else [flt.rsplit(" (", 1)[0]]
 
-    for etch in sorted(shown):
+    for g in shown:
         st.divider()
-        st.subheader(f"🧪 {etch}  ·  {len(shown[etch])}")
+        st.subheader(f"{icon} {g}  ·  {len(groups[g])}")
         cols = st.columns(3)
-        for i, r in enumerate(shown[etch]):
+        for i, r in enumerate(groups[g]):
             c = cols[i % 3]
             img = _lib_image(r.get("path"), r.get("drive_id"))
             contrast = "etched" if r.get("etched") else "low-contrast"
@@ -336,11 +343,13 @@ def render_gallery():
                 c.image(img, caption=cap, width="stretch")
             else:
                 c.warning(f"missing: {r.get('path') or r.get('drive_id')}")
+            bits = [f"set: {(r.get('source') or '')[:30]}"]
+            if r.get(other):
+                bits.append(str(r.get(other)))
             meas = r.get("measurements") or []
-            line = f"set: {(r.get('source') or '')[:34]}"
             if meas:
-                line += " · " + ", ".join(f"{m}µm" for m in meas)
-            c.caption(line)
+                bits.append(", ".join(f"{m}µm" for m in meas))
+            c.caption(" · ".join(bits))
 
 
 # ════════════════════════════════════════════════════════════════════════
