@@ -185,6 +185,103 @@ def _image_anchors_per_sheet(path, sheetnames):
 # ════════════════════════════════════════════════════════════════════════════
 # PARSE
 # ════════════════════════════════════════════════════════════════════════════
+def _label_value(ws, cell):
+    """Value for a label cell: text after a ':' in the same cell, else the first
+    non-empty cell to its right."""
+    if cell is None:
+        return None
+    m = re.search(r':\s*(.+)$', _norm(cell.value))
+    if m and m.group(1).strip():
+        return m.group(1).strip()
+    return _value_right_of(ws, cell, max_gap=18)
+
+# ── template family detection ───────────────────────────────────────────────
+# Two real IIR layouts ship in the wild:
+#   A  "Contents / EXECUTIVE SUMMARY / Summary of Received Parts / Serial Number"
+#   B  section-based: "Introduction / CONFIGURATION / SN (registration) / Incoming Photos"
+def _detect_template(wb):
+    names = [_norm(n).lower() for n in wb.sheetnames]
+    has = lambda pred: any(pred(n) for n in names)
+    is_a = has(lambda n: 'summary of' in n and ('received' in n or 'reconditioned' in n)) \
+        or (has(lambda n: n == 'contents') and has(lambda n: n.startswith('serial number')))
+    sn_b = has(lambda n: n == 'sn' or n.startswith('sn list') or n.startswith('sn '))
+    cfg_b = has(lambda n: 'config' in n or n.startswith('section-') or n == 'introduction')
+    if is_a:
+        return 'A'
+    if sn_b and cfg_b:
+        return 'B'
+    return 'unknown'
+
+def _parse_family_b(wb, path, data):
+    """Section-based IIR: identity from Cover/CONFIGURATION, serial registration
+    from the SN sheet(s), photos from Incoming/Receiving Photos."""
+    ident = {}
+    cover = _sheet_by(wb, 'Cover')
+    if cover is not None:
+        for key, pat in [('doc_no', r'AEG\s*Job\s*No'), ('customer', r'^\s*Client'),
+                         ('machine', r'Machine\s*Type'), ('component', r'^\s*Component'),
+                         ('plant', r'^\s*Plant')]:
+            v = _label_value(cover, _find_label(cover, pat))
+            if v and not ident.get(key):
+                ident[key] = v
+        t = _find_label(cover, r'inspection report')
+        if t is not None:
+            ident['title'] = _norm(t.value)
+    cfg = _sheet_by(wb, 'CONFIG')  # matches CONFIG / CONFIGURATION / Configuration
+    if cfg is not None:
+        for key, pat in [('part_no', r'PART\s*NUMBER'), ('casting', r'CASTING\s*NUMBER'),
+                         ('material', r'^\s*MATERIAL\b'), ('manufacturer', r'MANUFACTURER')]:
+            v = _label_value(cfg, _find_label(cfg, pat))
+            if v:
+                ident[key] = v
+    data['ident'] = ident
+
+    # serial-number registration: pair each "Serial Number" column with the
+    # nearest "Item No." column to its left (handles the multi-block grid).
+    serials, items, qty = [], [], None
+    sn_names = [n for n in wb.sheetnames
+                if _norm(n).lower() == 'sn' or _norm(n).lower().startswith(('sn list', 'sn '))]
+    for name in sn_names:
+        ws = wb[name]
+        if qty is None:
+            qv = _num(_label_value(ws, _find_label(ws, r'^\s*Qty\b')))
+            if qv:
+                qty = int(qv)
+        if not ident.get('doc_no'):
+            jc = _label_value(ws, _find_label(ws, r'JC\s*No|Job\s*No'))
+            if jc:
+                ident['doc_no'] = _norm(jc)
+        for r in range(1, min(ws.max_row, 16) + 1):
+            row = [(c.column, _norm(c.value).lower()) for c in ws[r] if isinstance(c.value, str)]
+            sn_cols = [col for col, v in row if v.startswith('serial')]
+            item_cols = sorted(col for col, v in row if v.startswith('item'))
+            if not (sn_cols and item_cols):   # a real header row has both
+                continue
+            for sc in sn_cols:
+                ic = max((c for c in item_cols if c < sc), default=None)
+                for rr in range(r + 1, ws.max_row + 1):
+                    sv = _norm(ws.cell(rr, sc).value)
+                    iv = ws.cell(rr, ic).value if ic else None
+                    if isinstance(iv, (int, float)) and not isinstance(iv, bool) and sv:
+                        items.append(int(iv))
+                        serials.append(sv)
+            break  # first header row only
+    data['b_serials'], data['b_items'], data['b_qty'] = serials, items, qty
+    data['sn_rows'] = [{'pos': it, 'pn': ident.get('part_no', ''), 'sn': sn,
+                        'scope': '', 'scrap': False, 'defects': [], 'sheet': 'SN'}
+                       for it, sn in zip(items, serials)]
+
+    anchors = _image_anchors_per_sheet(path, wb.sheetnames)
+    photos = []
+    for name in wb.sheetnames:
+        low = name.lower()
+        if 'incoming photo' in low or 'receiving photo' in low or low.strip().startswith('photos'):
+            ws = wb[name]
+            caps = [_norm(c.value) for c in _cells(ws)
+                    if isinstance(c.value, str) and re.match(r'(?i)(fig|photo|pic)\.?\s*\d+', c.value.strip())]
+            photos.append({'sheet': name, 'captions': caps, 'images': anchors.get(name, 0)})
+    data['photos'] = photos
+
 def parse_iir(path):
     wb = openpyxl.load_workbook(path, data_only=True)
     data = {'path': str(path), 'file': os.path.basename(str(path)),
@@ -384,6 +481,10 @@ def parse_iir(path):
         photos.append({'sheet': name, 'captions': caps, 'images': anchors.get(name, 0)})
     data['photos'] = photos
 
+    data['template'] = _detect_template(wb)
+    if data['template'] == 'B':
+        _parse_family_b(wb, path, data)
+
     wb.close()
     return data
 
@@ -394,7 +495,96 @@ def _f(check, severity, sheet, detail, category="General"):
     return {'check': check, 'category': category, 'severity': severity,
             'sheet': sheet, 'detail': detail}
 
+def _checks_family_b(d):
+    """Checks for the section-based (Family B) IIR layout."""
+    out = []
+    ident = d['ident']
+    serials = d.get('b_serials', [])
+    items = d.get('b_items', [])
+    qty = d.get('b_qty')
+
+    req = [('doc_no', 'AEG Job No'), ('customer', 'Client'),
+           ('component', 'Component'), ('machine', 'Machine Type')]
+    missing = [lbl for k, lbl in req if not _norm(ident.get(k))]
+    if missing:
+        out.append(_f("Header metadata complete", FAIL, "Cover",
+                      "Missing: " + ", ".join(missing), "Identity"))
+    else:
+        out.append(_f("Header metadata complete", PASS, "Cover",
+                      f"Job {ident.get('doc_no')} · {ident.get('customer')} · {ident.get('component')}",
+                      "Identity"))
+    if not _norm(ident.get('material')):
+        out.append(_f("Material recorded", WARN, "Configuration",
+                      "No material found in the configuration/background sheet", "Identity"))
+
+    if not serials:
+        out.append(_f("Serial-number list found", FAIL, "SN",
+                      "Could not read the serial-number registration list", "Quantities"))
+    else:
+        n = len(serials)
+        if qty is not None:
+            if n == qty:
+                out.append(_f("Serial count = stated Qty", PASS, "SN",
+                              f"{n} serials listed = stated Qty {qty}", "Quantities"))
+            else:
+                out.append(_f("Serial count = stated Qty", FAIL, "SN",
+                              f"{n} serials listed ≠ stated Qty {qty} (off by {n - qty:+d})", "Quantities"))
+        else:
+            out.append(_f("Serial-number count", INFO, "SN",
+                          f"{n} serials listed (no stated Qty found on the sheet)", "Quantities"))
+        dup_sn = sorted({s for s in serials if serials.count(s) > 1})
+        if dup_sn:
+            out.append(_f("Serial numbers unique", WARN, "SN",
+                          f"Repeated serial number(s): {dup_sn[:10]}"
+                          + (" …" if len(dup_sn) > 10 else ""), "Integrity"))
+        else:
+            out.append(_f("Serial numbers unique", PASS, "SN",
+                          f"All {n} serial numbers are unique", "Integrity"))
+        if items:
+            gaps = sorted(set(range(1, max(items) + 1)) - set(items))
+            dup_it = sorted({i for i in items if items.count(i) > 1})
+            if gaps:
+                out.append(_f("Item numbering contiguous", WARN, "SN",
+                              f"Missing item number(s): {gaps[:15]}"
+                              + (" …" if len(gaps) > 15 else ""), "Integrity"))
+            if dup_it:
+                out.append(_f("Item numbers unique", WARN, "SN",
+                              f"Duplicate item number(s): {dup_it[:15]}", "Integrity"))
+            if not gaps and not dup_it:
+                out.append(_f("Item numbering contiguous", PASS, "SN",
+                              f"Items 1–{max(items)} present with no gaps or duplicates", "Integrity"))
+
+    photos = d.get('photos', [])
+    for ph in photos:
+        if ph['captions'] and ph['images'] == 0:
+            out.append(_f("Photos embedded", FAIL, ph['sheet'],
+                          f"{len(ph['captions'])} caption(s) but no embedded images", "Completeness"))
+    total_imgs = sum(p['images'] for p in photos)
+    if photos and total_imgs:
+        out.append(_f("Incoming photos present", PASS, "Incoming Photos",
+                      f"{total_imgs} image(s) across {len(photos)} photo sheet(s)", "Completeness"))
+    elif photos:
+        out.append(_f("Incoming photos present", WARN, "Incoming Photos",
+                      "Photo sheet(s) present but no embedded images found", "Completeness"))
+    else:
+        out.append(_f("Incoming photos present", WARN, "Photos",
+                      "No Incoming/Receiving Photos sheet found", "Completeness"))
+    return out
+
 def run_checks(d, overrides=None):
+    tmpl = d.get('template')
+    if tmpl == 'B':
+        out = _checks_family_b(d)
+        out = apply_overrides(out, overrides)
+        out.sort(key=lambda x: (SEV_RANK[x['severity']], x['category']))
+        return out
+    if tmpl == 'unknown':
+        out = [_f("Recognized IIR layout", FAIL, "Workbook",
+                  "Unrecognized workbook structure — neither the Contents / Summary-of-Received-Parts "
+                  "layout nor the Configuration / SN section layout was found; cannot review.", "Structure")]
+        out = apply_overrides(out, overrides)
+        out.sort(key=lambda x: (SEV_RANK[x['severity']], x['category']))
+        return out
     out = []
     ident = d['ident']
     rp = d['received_parts']
