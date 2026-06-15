@@ -24,6 +24,16 @@ Two report families are recognised automatically:
 
 Findings are graded **🔴 Fail / 🟠 Warning / 🔵 Note / 🟢 Pass** and shown on screen.
 
+**Annotated report view.** Alongside the findings list, the reviewer renders the
+report's data region as a spreadsheet-like image with the offending cells boxed,
+numbered and explained in a baked-in legend — composition deviations, hardness,
+blank header/sign-off fields, captions without an etch status, and coating
+thickness outside the design limits. The embedded micrographs are annotated too:
+the burned-in legend / scale-bar regions are boxed, and low contrast or any
+burned-in thickness reading is flagged. Implemented in
+[`report_render.py`](report_render.py) — pure [Pillow](https://python-pillow.org/),
+no extra system dependencies (cell anchoring comes from `lab_review.collect_highlights`).
+
 ### 🖼️ Photo Library *(new)*
 Extracts the embedded micrographs from a reviewed report into a **per-alloy**
 folder structure with a JSON index, and serves an in-app gallery: pick an alloy

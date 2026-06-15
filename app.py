@@ -8,6 +8,7 @@ try:
     from lab_review import HT_ORDER
 except ImportError:   # tolerate a stale/cached lab_review module on redeploy
     HT_ORDER = ['As-received', 'Post-solution', 'Post stress-relief', 'Post-ageing', 'Unspecified']
+import report_render
 from photo_lib import (add_to_library, alloy_counts, photos_for,
                        get_image_bytes, backend_name, LIBRARY_DIR)
 
@@ -16,6 +17,16 @@ from photo_lib import (add_to_library, alloy_counts, photos_for,
 def _lib_image(path, drive_id):
     """Cached fetch of one library image (local file / GitHub / Drive)."""
     return get_image_bytes({"path": path, "drive_id": drive_id})
+
+
+@st.cache_data(show_spinner=False)
+def _review_and_render(name, data, ocr):
+    """Review a report and build its annotated images, cached on the bytes so
+    re-runs (and the check toggles) don't re-parse or re-render."""
+    rtype, parsed, findings = review_report(name, data, ocr=ocr)
+    annotated = report_render.render_report_image(data, parsed, findings, rtype, filename=name)
+    micrographs = report_render.annotate_micrographs(data, parsed)
+    return rtype, parsed, findings, annotated, micrographs
 
 st.set_page_config(
     page_title="AEG Materials Tools",
@@ -255,7 +266,8 @@ def render_reviewer():
 
         try:
             with st.spinner("Reviewing…"):
-                rtype, parsed, findings = review_report(f.name, f.getvalue(), ocr=ocr)
+                rtype, parsed, findings, annotated, micrographs = \
+                    _review_and_render(f.name, f.getvalue(), ocr)
         except Exception as e:
             st.error(f"Could not read report — {e}")
             continue
@@ -287,6 +299,27 @@ def render_reviewer():
 
         with st.expander("Extracted data"):
             _render_parsed(rtype, parsed)
+
+        if annotated or micrographs:
+            flagged = bool(counts['critical'] or counts['warning'])
+            with st.expander("🖼 Annotated report view — issue areas highlighted",
+                             expanded=flagged):
+                if annotated:
+                    st.image(annotated, use_container_width=True,
+                             caption="Flagged cells are boxed and numbered; the legend "
+                                     "below the grid explains each one.")
+                    st.download_button(
+                        "⬇ Download annotated report (.png)", data=annotated,
+                        file_name=f"{Path(f.name).stem}_annotated.png",
+                        mime="image/png", key=f"annpng_{f.name}")
+                elif rtype in ('metallurgical', 'coating'):
+                    st.caption("Annotated grid unavailable (image libraries not installed).")
+                if micrographs:
+                    st.markdown("**Annotated micrographs** — legend / scale-bar regions "
+                                "boxed, contrast and any burned-in thickness flagged.")
+                    mcols = st.columns(2)
+                    for i, (mname, mbytes, mcap) in enumerate(micrographs):
+                        mcols[i % 2].image(mbytes, caption=mcap, use_container_width=True)
 
         if rtype in ('metallurgical', 'coating'):
             if st.button("📁 Add this report's micrographs to the library",

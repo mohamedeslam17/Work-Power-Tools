@@ -159,22 +159,32 @@ def _find(ws, pattern, col=None, max_row=None):
     return None
 
 
-def _value_right(ws, row, col, max_scan=12):
-    """First non-empty cell value to the right of (row, col), same row."""
+def _value_right_loc(ws, row, col, max_scan=12):
+    """(value, (row, col)) of the first non-empty cell to the right, else (None, None)."""
     for c in range(col + 1, col + 1 + max_scan):
         t = _txt(ws.cell(row=row, column=c).value)
         if t:
-            return t
-    return None
+            return t, (row, c)
+    return None, None
+
+
+def _value_below_loc(ws, row, col, max_scan=6):
+    """(value, (row, col)) of the first non-empty cell below, else (None, None)."""
+    for r in range(row + 1, row + 1 + max_scan):
+        t = _txt(ws.cell(row=r, column=col).value)
+        if t:
+            return t, (r, col)
+    return None, None
+
+
+def _value_right(ws, row, col, max_scan=12):
+    """First non-empty cell value to the right of (row, col), same row."""
+    return _value_right_loc(ws, row, col, max_scan)[0]
 
 
 def _value_below(ws, row, col, max_scan=6):
     """First non-empty cell value below (row, col), same column."""
-    for r in range(row + 1, row + 1 + max_scan):
-        t = _txt(ws.cell(row=r, column=col).value)
-        if t:
-            return t
-    return None
+    return _value_below_loc(ws, row, col, max_scan)[0]
 
 
 def _is_placeholder(v):
@@ -216,7 +226,7 @@ def _met_sheet(wb):
 
 
 def _header(ws):
-    out = {}
+    out, loc = {}, {}
     labels = {
         'customer':     r'^Customer\s*:',
         'customer_ref': r'Customer\s*Ref',
@@ -227,18 +237,19 @@ def _header(ws):
         'eoh':          r'\bEOH\b',
     }
     for key, pat in labels.items():
-        loc = _find(ws, pat)
-        if loc:
-            out[key] = _value_right(ws, *loc)
-    return out
+        lbl = _find(ws, pat)
+        if lbl:
+            out[key], vloc = _value_right_loc(ws, *lbl)
+            loc[key] = {'label': lbl, 'value': vloc}
+    return out, loc
 
 
 def _sample(ws):
-    loc = _find(ws, r'Sample\s*nr')
-    out = {}
-    if not loc:
-        return out
-    hrow = loc[0]
+    hdr = _find(ws, r'Sample\s*nr')
+    out, loc = {}, {}
+    if not hdr:
+        return out, loc
+    hrow = hdr[0]
     headers = {}
     for cell in ws[hrow]:
         t = _txt(cell.value).lower()
@@ -248,40 +259,43 @@ def _sample(ws):
     def below(substr):
         for h, c in headers.items():
             if substr in h:
-                return _value_below(ws, hrow, c)
-        return None
+                val, vloc = _value_below_loc(ws, hrow, c)
+                return val, {'label': (hrow, c), 'value': vloc}
+        return None, None
 
-    out['description'] = below('description')
-    out['serial']      = below('s/n')
-    out['location']    = below('location')
-    out['material']    = below('material')
-    out['result']      = below('result')
-    return out
+    for key, substr in (('description', 'description'), ('serial', 's/n'),
+                        ('location', 'location'), ('material', 'material'),
+                        ('result', 'result')):
+        out[key], lc = below(substr)
+        if lc:
+            loc[key] = lc
+    return out, loc
 
 
 def _hardness(ws):
-    out = {}
+    out, loc = {}, {}
     for key, pat in (('pre', r'Pre-?\s*Solution'), ('post', r'Post-?\s*Solution')):
-        loc = _find(ws, pat)
-        if loc:
-            raw = _value_right(ws, *loc)
+        lbl = _find(ws, pat)
+        if lbl:
+            raw, vloc = _value_right_loc(ws, *lbl)
             out[key] = {'raw': raw, 'value': _num(raw)}
-    return out
+            loc[key] = {'label': lbl, 'value': vloc}
+    return out, loc
 
 
 def _coating(ws):
     """Coating presence / type as recorded in the structured cells."""
     out = {'present': None, 'type': None, 'received': None, 'outgoing': None}
-    loc = _find(ws, r'^Coating\s*$')
-    if loc:
-        out['present'] = _value_below(ws, *loc)
-    for key, pat in (('type', r'^Type of Coating'),
+    loc = {}
+    for key, pat in (('present', r'^Coating\s*$'),
+                     ('type', r'^Type of Coating'),
                      ('received', r'Received\s*Coating'),
                      ('outgoing', r'Outgoing\s*Coating')):
-        loc = _find(ws, pat)
-        if loc:
-            out[key] = _value_below(ws, *loc)
-    return out
+        lbl = _find(ws, pat)
+        if lbl:
+            out[key], vloc = _value_below_loc(ws, *lbl)
+            loc[key] = {'label': lbl, 'value': vloc}
+    return out, loc
 
 
 def _composition(ws, which):
@@ -293,11 +307,11 @@ def _composition(ws, which):
     typo for 'Nominal'.
     """
     pat = r'\(\s*(?:Nominal|Minimal)\s*\)' if which == 'Nominal' else r'\(\s*Actual\s*\)'
-    loc = _find(ws, pat)
-    comp = {}
-    if not loc:
-        return comp
-    lrow = loc[0]
+    lbl = _find(ws, pat)
+    comp, loc = {}, {}
+    if not lbl:
+        return comp, loc
+    lrow = lbl[0]
 
     def elem_cells(r):
         return [c for c in ws[r] if r >= 1 and _txt(c.value).capitalize() in ELEMENTS]
@@ -307,54 +321,107 @@ def _composition(ws, which):
     elif lrow > 1 and len(elem_cells(lrow - 1)) >= 2:   # elements above, values in label row
         ehdr, vrow = lrow - 1, lrow
     else:
-        return comp
+        return comp, loc
     for cell in elem_cells(ehdr):
         val = _num(ws.cell(row=vrow, column=cell.column).value)
         if val is not None:
-            comp[_txt(cell.value).capitalize()] = val
-    return comp
+            el = _txt(cell.value).capitalize()
+            comp[el] = val
+            loc[el] = (vrow, cell.column)
+    return comp, loc
 
 
 def _comment(ws):
-    loc = _find(ws, r'^Comment\s*:')
-    return _value_below(ws, *loc) if loc else None
+    lbl = _find(ws, r'^Comment\s*:')
+    if not lbl:
+        return None, {}
+    val, vloc = _value_below_loc(ws, *lbl)
+    return val, {'label': lbl, 'value': vloc}
 
 
 def _pictures(ws):
     rx = re.compile(r'Picture\s*\d+\s*:', re.I)
-    pics = []
+    pics, loc = [], []
     for row in ws.iter_rows():
         for cell in row:
             if rx.search(_txt(cell.value)):
-                pics.append((_txt(cell.value), _value_right(ws, cell.row, cell.column)))
-    return pics
+                cap, vloc = _value_right_loc(ws, cell.row, cell.column)
+                pics.append((_txt(cell.value), cap))
+                loc.append({'label': (cell.row, cell.column), 'value': vloc})
+    return pics, loc
 
 
 def _signoff(ws):
-    out = {}
+    out, loc = {}, {}
     for key, pat in (('met_lab', r'Met\.?\s*Lab'),
                      ('mat_eng', r'(?:Mat|Met)\.?\s*Eng'),
                      ('date',    r'^Date\s*:')):
-        loc = _find(ws, pat)
-        if loc:
-            out[key] = _value_right(ws, *loc)
-    return out
+        lbl = _find(ws, pat)
+        if lbl:
+            out[key], vloc = _value_right_loc(ws, *lbl)
+            loc[key] = {'label': lbl, 'value': vloc}
+    return out, loc
 
 
 def parse_metallurgical(wb, media=0):
     ws = _met_sheet(wb)
+    header, lh    = _header(ws)
+    sample, ls    = _sample(ws)
+    hardness, lhd = _hardness(ws)
+    nominal, ln   = _composition(ws, 'Nominal')
+    actual, la    = _composition(ws, 'Actual')
+    coating, lc   = _coating(ws)
+    comment, lcm  = _comment(ws)
+    pictures, lp  = _pictures(ws)
+    signoff, lso  = _signoff(ws)
     return {
-        'header':    _header(ws),
-        'sample':    _sample(ws),
-        'hardness':  _hardness(ws),
-        'nominal':   _composition(ws, 'Nominal'),
-        'actual':    _composition(ws, 'Actual'),
-        'coating':   _coating(ws),
-        'comment':   _comment(ws),
-        'pictures':  _pictures(ws),
-        'signoff':   _signoff(ws),
+        'header':    header,
+        'sample':    sample,
+        'hardness':  hardness,
+        'nominal':   nominal,
+        'actual':    actual,
+        'coating':   coating,
+        'comment':   comment,
+        'pictures':  pictures,
+        'signoff':   signoff,
         'media':     media,
+        'loc': {
+            'sheet':    ws.title,
+            'header':   lh,
+            'sample':   ls,
+            'hardness': lhd,
+            'nominal':  ln,
+            'actual':   la,
+            'coating':  lc,
+            'comment':  lcm,
+            'pictures': lp,
+            'signoff':  lso,
+        },
     }
+
+
+def _composition_deviations(nominal, actual):
+    """Elements whose Actual is out of tolerance vs Nominal.
+
+    Returns (deviations, systemic) where deviations is a list of
+    (element, nominal, actual, rel%) and `systemic` is True when so many
+    elements are off that the actual material likely isn't the stated alloy.
+    """
+    deviations = []
+    if not nominal or not actual:
+        return deviations, False
+    common = sorted(set(nominal) & set(actual))
+    for el in common:
+        nom, act = nominal[el], actual[el]
+        if nom == 0:
+            continue
+        dev = act - nom
+        rel = dev / abs(nom) * 100.0
+        if abs(rel) >= COMP_WARN_REL and abs(dev) >= COMP_WARN_ABS:
+            deviations.append((el, nom, act, rel))
+    n_dev, n_common = len(deviations), len(common)
+    systemic = n_dev >= 4 or (n_dev >= 3 and n_common and n_dev / n_common >= 0.5)
+    return deviations, systemic
 
 
 def _review_composition(nominal, actual):
@@ -365,21 +432,12 @@ def _review_composition(nominal, actual):
         return findings
 
     common = sorted(set(nominal) & set(actual))
-    deviations = []
-    for el in common:
-        nom, act = nominal[el], actual[el]
-        if nom == 0:
-            continue
-        dev = act - nom
-        rel = dev / abs(nom) * 100.0
-        if abs(rel) >= COMP_WARN_REL and abs(dev) >= COMP_WARN_ABS:
-            deviations.append((el, nom, act, rel))
+    deviations, systemic = _composition_deviations(nominal, actual)
+    n_dev, n_common = len(deviations), len(common)
 
     # A few elements off is normal service depletion / EDS scatter → warnings.
     # Many elements off together signals the actual material doesn't match the
     # stated alloy → one consolidated FAIL ("verify material/grade").
-    n_dev, n_common = len(deviations), len(common)
-    systemic = n_dev >= 4 or (n_dev >= 3 and n_common and n_dev / n_common >= 0.5)
     if systemic:
         worst = sorted(deviations, key=lambda d: -abs(d[3]))[:4]
         detail = ", ".join(f"{el} {rel:+.0f}%" for el, _, _, rel in worst)
@@ -807,17 +865,18 @@ def review_metallurgical(parsed):
 # COATING REPORTS
 # ════════════════════════════════════════════════════════════════════════
 def _coating_signoff(wb):
-    out = {}
+    out, loc = {}, {}
     for ws in wb.worksheets:
         for key, pat in (('prepared', r'Prepared\s*by'),
                          ('approved', r'Approved\s*by'),
                          ('date',     r'^Date\s*:')):
             if key in out:
                 continue
-            loc = _find(ws, pat)
-            if loc:
-                out[key] = _value_right(ws, *loc)
-    return out
+            lbl = _find(ws, pat)
+            if lbl:
+                out[key], vloc = _value_right_loc(ws, *lbl)
+                loc[key] = {'sheet': ws.title, 'label': lbl, 'value': vloc}
+    return out, loc
 
 
 def parse_coating(wb, media=0):
@@ -830,8 +889,11 @@ def parse_coating(wb, media=0):
             aws = ws
             break
 
+    signoff, signoff_loc = _coating_signoff(wb)
     data = {'title': None, 'report_no': None, 'component': None, 'rows': [],
-            'signoff': _coating_signoff(wb), 'media': media}
+            'signoff': signoff, 'media': media,
+            'loc': {'sheet': aws.title if aws is not None else None,
+                    'signoff': signoff_loc}}
 
     cover = wb.worksheets[0]
     t = _find(cover, r'Coating')
@@ -875,12 +937,12 @@ def parse_coating(wb, media=0):
             cur_min = m
         if x is not None:
             cur_max = x
-        vals = [_num(aws.cell(row=r, column=c).value) for c in meas_cols]
-        vals = [v for v in vals if v is not None]
-        if not vals:
+        cells = [(c, _num(aws.cell(row=r, column=c).value)) for c in meas_cols]
+        cells = [(c, v) for c, v in cells if v is not None]
+        if not cells:
             continue
-        data['rows'].append({'row': r, 'values': vals,
-                             'min': cur_min, 'max': cur_max})
+        data['rows'].append({'row': r, 'values': [v for _, v in cells],
+                             'cells': cells, 'min': cur_min, 'max': cur_max})
     return data
 
 
@@ -1324,6 +1386,99 @@ def summarize(findings):
     out = {'critical': 0, 'warning': 0, 'info': 0, 'pass': 0}
     for sev, _, _ in findings:
         out[sev] = out.get(sev, 0) + 1
+    return out
+
+
+def collect_highlights(parsed):
+    """Map the cell-anchored findings to worksheet cells, for the annotated view.
+
+    Returns a list of {'cell': (row, col), 'severity', 'category', 'tag', 'note'}
+    on the sheet named in parsed['loc']['sheet']. `tag` is a short label drawn on
+    the image; `note` is the full sentence shown in the legend. Findings with no
+    single cell to point at (e.g. "no embedded images") are intentionally omitted
+    here — they still appear in the textual findings list.
+    """
+    loc = parsed.get('loc') or {}
+    out = []
+
+    def add(cell, severity, category, tag, note):
+        if cell:
+            out.append({'cell': tuple(cell), 'severity': severity,
+                        'category': category, 'tag': tag, 'note': note})
+
+    def anchor(entry):
+        """Prefer the value cell; fall back to the label cell."""
+        entry = entry or {}
+        return entry.get('value') or entry.get('label')
+
+    # ── Composition — Actual cells out of tolerance vs Nominal ──
+    deviations, systemic = _composition_deviations(
+        parsed.get('nominal') or {}, parsed.get('actual') or {})
+    aloc = loc.get('actual') or {}
+    for el, nom, act, rel in deviations:
+        sev = 'critical' if systemic else 'warning'
+        add(aloc.get(el), sev, 'Composition', f'{el} {rel:+.0f}%',
+            f'{el}: actual {act:g} vs nominal {nom:g} wt% ({rel:+.0f}%).')
+
+    # ── Hardness — post-solution should not exceed pre-solution ──
+    hd = parsed.get('hardness') or {}
+    pre = (hd.get('pre') or {}).get('value')
+    post = (hd.get('post') or {}).get('value')
+    hloc = loc.get('hardness') or {}
+    if pre is not None and post is not None and post > pre + 0.5:
+        note = (f'Post-solution hardness ({post:g} HRC) exceeds pre-solution '
+                f'({pre:g} HRC) — solution treatment normally softens the material.')
+        for key in ('pre', 'post'):
+            add(anchor(hloc.get(key)), 'warning', 'Hardness', 'post > pre', note)
+
+    # ── Completeness — blank header fields / material ──
+    hdr = parsed.get('header') or {}
+    hdr_loc = loc.get('header') or {}
+    for key, label in (('customer', 'Customer'), ('job', 'AEG Job No'),
+                       ('machine', 'Machine type')):
+        if _is_placeholder(hdr.get(key)):
+            add(anchor(hdr_loc.get(key)), 'warning', 'Completeness',
+                f'{label} blank', f'{label} is blank or a placeholder.')
+    smp = parsed.get('sample') or {}
+    if _is_placeholder(smp.get('material')):
+        add(anchor((loc.get('sample') or {}).get('material')), 'warning',
+            'Completeness', 'Material blank', 'Sample material/alloy not stated.')
+
+    # ── Completeness — missing or very short comment ──
+    if len((parsed.get('comment') or '').strip()) < 40:
+        add(anchor(loc.get('comment')), 'warning', 'Completeness',
+            'Short comment', 'Comment / discussion is missing or very short.')
+
+    # ── Sign-off — missing fields (point at the label) ──
+    so = parsed.get('signoff') or {}
+    so_loc = loc.get('signoff') or {}
+    for key, label in (('met_lab', 'Met. Lab'), ('mat_eng', 'Mat. Eng'),
+                       ('date', 'Date')):
+        if _is_placeholder(so.get(key)):
+            entry = so_loc.get(key) or {}
+            add(entry.get('label') or entry.get('value'), 'warning',
+                'Sign-off', f'{label} missing', f'Missing sign-off field: {label}.')
+
+    # ── Captions — no etch status stated ──
+    pics = parsed.get('pictures') or []
+    ploc = loc.get('pictures') or []
+    for i, (label, cap) in enumerate(pics):
+        if not _ETCH_PAT.search(f"{label} {cap or ''}"):
+            entry = ploc[i] if i < len(ploc) else {}
+            add(anchor(entry), 'warning', 'Captions', 'No etch status',
+                f'No etch status in caption: {(label or "?").rstrip(":")}.')
+
+    # ── Coating — thickness measurements outside design limits ──
+    for entry in parsed.get('rows') or []:
+        lo, hi = entry.get('min'), entry.get('max')
+        if lo is None or hi is None:
+            continue
+        for col, v in entry.get('cells', []):
+            if not (lo <= v <= hi):
+                add((entry['row'], col), 'critical', 'Coating', f'{v:g} mm',
+                    f'Row {entry["row"]}: thickness {v:g} mm outside design '
+                    f'limit {lo:g}–{hi:g} mm.')
+
     return out
 
 
