@@ -1536,28 +1536,35 @@ def collect_highlights(parsed):
             'Short comment', 'Comment / discussion is missing or very short.')
 
     # ── Sign-off — missing fields (point at the label) ──
+    # One combined note (matching the textual finding) shared across the cells,
+    # so the box and the findings list don't double-report it.
     so = parsed.get('signoff') or {}
     so_loc = loc.get('signoff') or {}
-    for key, label in (('met_lab', 'Met. Lab'), ('mat_eng', 'Mat. Eng'),
-                       ('date', 'Date')):
-        if _is_placeholder(so.get(key)):
-            entry = so_loc.get(key) or {}
-            add(entry.get('label') or entry.get('value'), 'warning',
-                'Sign-off', f'{label} missing', f'Missing sign-off field: {label}.')
+    so_fields = (('met_lab', 'Met. Lab'), ('mat_eng', 'Mat. Eng'), ('date', 'Date'))
+    so_missing = [label for key, label in so_fields if _is_placeholder(so.get(key))]
+    if so_missing:
+        so_note = f'Missing sign-off field(s): {", ".join(so_missing)}.'
+        for key, label in so_fields:
+            if _is_placeholder(so.get(key)):
+                entry = so_loc.get(key) or {}
+                add(entry.get('label') or entry.get('value'), 'warning',
+                    'Sign-off', f'{label} missing', so_note)
 
     # ── Captions — no etch status, or explicitly unetched ──
     pics = parsed.get('pictures') or []
     ploc = loc.get('pictures') or []
+    no_etch = [(label or '?').rstrip(':') for label, cap in pics
+               if not _ETCH_PAT.search(f"{label} {cap or ''}")]
+    no_etch_note = f'No etch status in caption(s): {", ".join(no_etch)}.'
     for i, (label, cap) in enumerate(pics):
         text = f"{label} {cap or ''}"
         entry = ploc[i] if i < len(ploc) else {}
         if not _ETCH_PAT.search(text):
-            add(anchor(entry), 'warning', 'Captions', 'No etch status',
-                f'No etch status in caption: {(label or "?").rstrip(":")}.')
+            add(anchor(entry), 'warning', 'Captions', 'No etch status', no_etch_note)
         elif _UNETCHED_PAT.search(text):
             add(anchor(entry), 'info', 'Captions', 'Unetched',
-                f'{(label or "?").rstrip(":")} caption states unetched / as-polished '
-                f'— confirm intended.')
+                f'{(label or "?").rstrip(":")} caption states unetched / as-polished — '
+                f'confirm intended (a microstructure assessment is normally etched).')
 
     # ── Photo etch — per-picture caption↔contrast mismatch (anchor to caption) ──
     for v in parsed.get('photo_etch') or []:
@@ -1574,8 +1581,8 @@ def collect_highlights(parsed):
         outliers = [u for u in sorted(comment_um) if u < lo_p * 0.5 or u > hi_p * 2]
         if outliers:
             add(anchor(loc.get('comment')), 'warning', 'Thickness', 'thickness?',
-                f'Comment thickness {", ".join(f"{u} µm" for u in outliers)} far from the '
-                f'photo measurements ({lo_p}–{hi_p} µm) — verify.')
+                f'Comment thickness {", ".join(f"{u} µm" for u in outliers)} is far from '
+                f'the photo measurements ({lo_p}–{hi_p} µm) — verify.')
 
     # ── Coating — thickness measurements outside design limits ──
     for entry in parsed.get('rows') or []:

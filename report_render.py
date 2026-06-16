@@ -213,12 +213,12 @@ def _render(data, parsed, findings, filename, max_rows, max_cols, scale):
         wrapped = textwrap.wrap(f"{cat} — {note}", wrap_chars) or ['']
         leg_lines.append((num[note], sev, wrapped))
 
-    # Warning/critical findings whose category produced no box (filename, photo
-    # legends, …) — listed so nothing is silently missing from the image.
-    localized = {h['category'] for h in highlights}
+    # Warning/critical findings not represented by a box (filename, photo
+    # legends, caption numbering, …) — listed so nothing is silently missing.
+    boxed_notes = {h['note'] for h in highlights}
     extra_lines = []
     for sev, cat, msg in (findings or []):
-        if sev in ('critical', 'warning') and cat not in localized:
+        if sev in ('critical', 'warning') and msg not in boxed_notes:
             extra_lines.append((sev, textwrap.wrap(f"{cat} — {msg}", wrap_chars) or ['']))
 
     def _block_h(lines):
@@ -558,11 +558,11 @@ def _faithful(data, parsed, findings, filename, dpi, timeout):
         keys.append({'num': i + 1, 'severity': sev, 'notes': g['notes'],
                      'rgb': rgb, 'ref': f'{get_column_letter(c)}{r}'})
 
-    # Warning/critical findings whose category produced no box (filename, photo
-    # legends, …) — listed in the legend so nothing is silently missing.
-    localized = {h['category'] for h in highlights}
+    # Warning/critical findings not represented by a box (filename, photo
+    # legends, caption numbering, …) — listed so nothing is silently missing.
+    boxed_notes = {h['note'] for h in highlights}
     extras = [(sev, cat, msg) for (sev, cat, msg) in (findings or [])
-              if sev in ('critical', 'warning') and cat not in localized]
+              if sev in ('critical', 'warning') and msg not in boxed_notes]
 
     # Bound output to the used range and fit to one page wide.
     try:
