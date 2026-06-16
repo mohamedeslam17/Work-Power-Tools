@@ -37,6 +37,20 @@ def _review_and_render(name, data, ocr, faithful=True):
     micrographs = report_render.annotate_micrographs(data, parsed)
     return rtype, parsed, findings, annotated, micrographs, mode, status
 
+
+@st.cache_data(show_spinner=False, ttl=120)
+def _gallery_counts():
+    """Alloy → micrograph count from the (possibly remote) library index, cached
+    so the backend isn't hit on every rerun. Raises on backend failure — the
+    caller catches it so a flaky backend can't take the whole app down."""
+    return alloy_counts()
+
+
+@st.cache_data(show_spinner=False, ttl=120)
+def _gallery_photos(alloy):
+    return photos_for(alloy)
+
+
 # Light polish: a comfortable max width (wider than the old centred column, so the
 # annotated report image is large), tidier metrics, tabs and dividers.
 _PAGE_CSS = """
@@ -404,7 +418,17 @@ def render_gallery():
         "came from. Add micrographs from the **Lab Report Review** tab."
     )
     st.caption(f"Storage backend: **{backend_name()}**")
-    counts = alloy_counts()
+    try:
+        counts = _gallery_counts()
+    except Exception as e:
+        st.error(f"Couldn't reach the photo-library backend (**{backend_name()}**) — "
+                 f"the library is unavailable right now. The other tools are unaffected.")
+        st.caption(f"{type(e).__name__}: {e}")
+        if st.button("↻ Retry", key="gallery_retry"):
+            _gallery_counts.clear()
+            _gallery_photos.clear()
+            st.rerun()
+        return
     total = sum(counts.values())
     if not total:
         st.info("The library is empty. Review a report and click "
@@ -414,7 +438,7 @@ def render_gallery():
     st.caption(f"{total} micrograph(s) across {len(counts)} alloy(s)")
     pick = st.selectbox("Alloy", [f"{a} ({n})" for a, n in sorted(counts.items())])
     alloy = pick.rsplit(" (", 1)[0]
-    recs = photos_for(alloy)
+    recs = _gallery_photos(alloy)
 
     # Segregate within the alloy by either heat-treatment condition or etchant.
     dim = st.selectbox("Segregate by", ["Heat treatment", "Etchant"])
@@ -646,17 +670,20 @@ def main():
     st.markdown(_PAGE_CSS, unsafe_allow_html=True)
     st.title("AEG Materials Engineering Tools")
 
-    tab_conv, tab_review, tab_gallery, tab_iir = st.tabs(
+    tabs = st.tabs(
         ["🔬 SEM Report Converter", "🧪 Lab Report Review", "🖼️ Photo Library",
          "🛠️ IIR Review"])
-    with tab_conv:
-        render_converter()
-    with tab_review:
-        render_reviewer()
-    with tab_gallery:
-        render_gallery()
-    with tab_iir:
-        render_iir_tool()
+    # Isolate each tab: a failure in one tool (e.g. an unreachable photo-library
+    # backend) shows a contained message instead of crashing the whole app.
+    for tab, render in zip(tabs, (render_converter, render_reviewer,
+                                  render_gallery, render_iir_tool)):
+        with tab:
+            try:
+                render()
+            except Exception as e:
+                st.error("This tool hit an error and couldn't finish — the other "
+                         "tabs are unaffected.")
+                st.caption(f"{type(e).__name__}: {e}")
 
 
 if __name__ == "__main__":
