@@ -262,6 +262,9 @@ def _render_annotated(f, annotated, micrographs, mode, status, faithful, rtype, 
         if st.button("📁 Add this report's micrographs to the library",
                      key=f"add_{f.name}"):
             added = add_to_library(f.name, f.getvalue(), parsed, rtype)
+            if added:
+                _gallery_counts.clear()      # let the gallery reflect the add now
+                _gallery_photos.clear()
             st.success(f"Added {added} micrograph(s) to the library."
                        if added else "No new micrographs added (already in library).")
 
