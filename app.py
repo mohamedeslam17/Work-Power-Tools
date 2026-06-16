@@ -37,11 +37,18 @@ def _review_and_render(name, data, ocr, faithful=True):
     micrographs = report_render.annotate_micrographs(data, parsed)
     return rtype, parsed, findings, annotated, micrographs, mode, status
 
-st.set_page_config(
-    page_title="AEG Materials Tools",
-    page_icon="🔬",
-    layout="centered"
-)
+# Light polish: a comfortable max width (wider than the old centred column, so the
+# annotated report image is large), tidier metrics, tabs and dividers.
+_PAGE_CSS = """
+<style>
+  .block-container {max-width: 1280px; padding-top: 1.4rem; padding-bottom: 3rem;}
+  [data-testid="stMetricValue"] {font-size: 1.5rem;}
+  [data-testid="stMetricLabel"] p {font-size: .82rem; opacity: .85;}
+  .stTabs [data-baseweb="tab-list"] {gap: .25rem;}
+  .stTabs [data-baseweb="tab"] {padding: .35rem .9rem;}
+  hr {margin: .8rem 0;}
+</style>
+"""
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -184,6 +191,66 @@ _SEV = {
 }
 _SEV_ORDER = ['critical', 'warning', 'info', 'pass']
 
+# severity → (accent colour, light tint, label) for the compact HTML findings list
+_SEV_STYLE = {
+    'critical': ('#d62d38', '#fdecee', 'Fail'),
+    'warning':  ('#e07b16', '#fdf2e3', 'Warning'),
+    'info':     ('#1a6ed6', '#e9f1fc', 'Note'),
+    'pass':     ('#1f9e50', '#e8f6ee', 'Pass'),
+}
+
+
+def _render_findings(findings):
+    """Compact, colour-coded, scannable findings list (fails first)."""
+    import html as _html
+    ordered = sorted(findings, key=lambda f: _SEV_ORDER.index(f[0]))
+    rows = []
+    for sev, cat, msg in ordered:
+        color, tint, label = _SEV_STYLE[sev]
+        rows.append(
+            f'<div style="display:flex;align-items:baseline;gap:.6rem;'
+            f'padding:.38rem .7rem;margin:.28rem 0;border-left:4px solid {color};'
+            f'background:{tint};border-radius:5px;">'
+            f'<span style="color:{color};font-weight:700;font-size:.72rem;'
+            f'letter-spacing:.03em;text-transform:uppercase;min-width:58px;">{label}</span>'
+            f'<span style="line-height:1.35;"><b>{_html.escape(cat)}</b> — '
+            f'{_html.escape(msg)}</span></div>')
+    st.markdown('<div>' + ''.join(rows) + '</div>', unsafe_allow_html=True)
+
+
+def _render_annotated(f, annotated, micrographs, mode, status, faithful, rtype, parsed):
+    """The 'Annotated view' sub-tab: report image, micrographs, add-to-library."""
+    if annotated:
+        if mode == 'faithful':
+            cap = ("Pixel-faithful LibreOffice render — flagged cells highlighted and "
+                   "numbered to the legend.")
+        else:
+            cap = "Drawn-grid view — flagged cells boxed and numbered to the legend."
+            if faithful and status:
+                cap += f"  (Pixel-faithful render unavailable: {status}.)"
+        st.image(annotated, caption=cap, width="stretch")
+        st.download_button(
+            "⬇ Download annotated report (.png)", data=annotated,
+            file_name=f"{Path(f.name).stem}_annotated.png",
+            mime="image/png", key=f"annpng_{f.name}")
+    elif rtype in ('metallurgical', 'coating'):
+        st.caption("Annotated view unavailable (image libraries not installed).")
+
+    if micrographs:
+        st.markdown("**Annotated micrographs** — legend / scale-bar regions boxed; "
+                    "contrast and any burned-in thickness flagged.")
+        mcols = st.columns(3)
+        for i, (mname, mbytes, mcap) in enumerate(micrographs):
+            mcols[i % 3].image(mbytes, caption=mcap, width="stretch")
+
+    if rtype in ('metallurgical', 'coating'):
+        st.divider()
+        if st.button("📁 Add this report's micrographs to the library",
+                     key=f"add_{f.name}"):
+            added = add_to_library(f.name, f.getvalue(), parsed, rtype)
+            st.success(f"Added {added} micrograph(s) to the library."
+                       if added else "No new micrographs added (already in library).")
+
 
 def _render_parsed(rtype, parsed):
     """Show the facts the reviewer extracted, for transparency."""
@@ -279,76 +346,53 @@ def render_reviewer():
         return
 
     for f in files:
-        st.divider()
-        st.subheader(f.name)
-
         try:
-            with st.spinner("Reviewing…"):
+            with st.spinner(f"Reviewing {f.name}…"):
                 rtype, parsed, findings, annotated, micrographs, mode, status = \
                     _review_and_render(f.name, f.getvalue(), ocr, faithful)
         except Exception as e:
-            st.error(f"Could not read report — {e}")
+            st.error(f"Could not read **{f.name}** — {e}")
             continue
 
         counts = summarize(findings)
-        st.caption(f"Detected report type: **{rtype}**")
+        verdict = ('critical' if counts['critical'] else
+                   'warning' if counts['warning'] else 'pass')
+        vcolor, vtint, vlabel = _SEV_STYLE[verdict]
+        vtext = ("Needs attention — critical findings present." if counts['critical']
+                 else "Review recommended — warnings present." if counts['warning']
+                 else "Looks good — no warnings or failures.")
 
-        m = st.columns(4)
-        m[0].metric("🔴 Fail", counts['critical'])
-        m[1].metric("🟠 Warning", counts['warning'])
-        m[2].metric("🔵 Note", counts['info'])
-        m[3].metric("🟢 Pass", counts['pass'])
+        st.write("")
+        with st.container(border=True):
+            head = st.columns([7, 2])
+            head[0].markdown(f"#### {f.name}")
+            head[0].caption(f"Detected report type: **{rtype}**")
+            head[1].markdown(
+                f'<div style="text-align:right;padding-top:.4rem;">'
+                f'<span style="background:{vtint};color:{vcolor};font-weight:700;'
+                f'padding:.32rem .8rem;border-radius:999px;font-size:.85rem;'
+                f'border:1px solid {vcolor}33;">{vlabel}</span></div>',
+                unsafe_allow_html=True)
 
-        if counts['critical']:
-            st.error("**Needs attention** — critical findings present.")
-        elif counts['warning']:
-            st.warning("**Review recommended** — warnings present.")
-        else:
-            st.success("**Looks good** — no warnings or failures.")
+            m = st.columns(4)
+            m[0].metric("🔴 Fail", counts['critical'])
+            m[1].metric("🟠 Warning", counts['warning'])
+            m[2].metric("🔵 Note", counts['info'])
+            m[3].metric("🟢 Pass", counts['pass'])
 
-        for sev in _SEV_ORDER:
-            items = [(cat, msg) for s, cat, msg in findings if s == sev]
-            if not items:
-                continue
-            fn, icon, _ = _SEV[sev]
-            render = getattr(st, fn)
-            for cat, msg in items:
-                render(f"{icon} **{cat}** — {msg}")
-
-        with st.expander("Extracted data"):
-            _render_parsed(rtype, parsed)
-
-        if annotated or micrographs:
-            flagged = bool(counts['critical'] or counts['warning'])
-            with st.expander("🖼 Annotated report view — issue areas highlighted",
-                             expanded=flagged):
-                if annotated:
-                    if mode == 'faithful':
-                        note = "Pixel-faithful LibreOffice render — flagged cells highlighted, numbered to the legend."
-                    else:
-                        note = "Drawn-grid view — flagged cells boxed and numbered to the legend."
-                        if faithful and status:
-                            note += f"  (Pixel-faithful render unavailable: {status}.)"
-                    st.image(annotated, use_container_width=True, caption=note)
-                    st.download_button(
-                        "⬇ Download annotated report (.png)", data=annotated,
-                        file_name=f"{Path(f.name).stem}_annotated.png",
-                        mime="image/png", key=f"annpng_{f.name}")
-                elif rtype in ('metallurgical', 'coating'):
-                    st.caption("Annotated view unavailable (image libraries not installed).")
-                if micrographs:
-                    st.markdown("**Annotated micrographs** — legend / scale-bar regions "
-                                "boxed, contrast and any burned-in thickness flagged.")
-                    mcols = st.columns(2)
-                    for i, (mname, mbytes, mcap) in enumerate(micrographs):
-                        mcols[i % 2].image(mbytes, caption=mcap, use_container_width=True)
-
-        if rtype in ('metallurgical', 'coating'):
-            if st.button("📁 Add this report's micrographs to the library",
-                         key=f"add_{f.name}"):
-                added = add_to_library(f.name, f.getvalue(), parsed, rtype)
-                st.success(f"Added {added} micrograph(s) to the library."
-                           if added else "No new micrographs added (already in library).")
+            ftab, atab, dtab = st.tabs(
+                ["📋 Findings", "🖼 Annotated view", "🔬 Extracted data"])
+            with ftab:
+                st.markdown(
+                    f'<div style="padding:.5rem .8rem;margin-bottom:.4rem;border-radius:6px;'
+                    f'background:{vtint};color:{vcolor};font-weight:600;">{vtext}</div>',
+                    unsafe_allow_html=True)
+                _render_findings(findings)
+            with atab:
+                _render_annotated(f, annotated, micrographs, mode, status,
+                                  faithful, rtype, parsed)
+            with dtab:
+                _render_parsed(rtype, parsed)
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -446,7 +490,6 @@ def render_iir_tool():
                     )
         return chosen
 
-    st.title("IIR Quality Review")
     st.markdown(
         "Upload one or more **Incoming Inspection Reports** (Detailed Assessment "
         "Customer Reports) as `.xlsx`. Each workbook is checked for internal "
@@ -598,16 +641,23 @@ def render_iir_tool():
 
 
 # ════════════════════════════════════════════════════════════════════════
-st.title("AEG Materials Engineering Tools")
+def main():
+    st.set_page_config(page_title="AEG Materials Tools", page_icon="🔬", layout="wide")
+    st.markdown(_PAGE_CSS, unsafe_allow_html=True)
+    st.title("AEG Materials Engineering Tools")
 
-tab_conv, tab_review, tab_gallery, tab_iir = st.tabs(
-    ["🔬 SEM Report Converter", "🧪 Lab Report Review", "🖼️ Photo Library",
-     "🛠️ IIR Review"])
-with tab_conv:
-    render_converter()
-with tab_review:
-    render_reviewer()
-with tab_gallery:
-    render_gallery()
-with tab_iir:
-    render_iir_tool()
+    tab_conv, tab_review, tab_gallery, tab_iir = st.tabs(
+        ["🔬 SEM Report Converter", "🧪 Lab Report Review", "🖼️ Photo Library",
+         "🛠️ IIR Review"])
+    with tab_conv:
+        render_converter()
+    with tab_review:
+        render_reviewer()
+    with tab_gallery:
+        render_gallery()
+    with tab_iir:
+        render_iir_tool()
+
+
+if __name__ == "__main__":
+    main()

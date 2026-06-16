@@ -650,6 +650,10 @@ def _review_completeness(parsed):
 _PICNUM   = re.compile(r'picture\s*(\d+)', re.I)
 _ETCH_PAT = re.compile(r'etch|unetched|as[-\s]?polished|kalling|glyceregia|oxalic|'
                        r'marble|nital|vilella|murakami|aqua\s*regia|electrolytic', re.I)
+# Captions that explicitly state the section was NOT etched (vs simply omitting
+# the etch status). 'etch' in _ETCH_PAT also matches 'unetched', so these are
+# recognised as *having* an etch status — they just need surfacing on their own.
+_UNETCHED_PAT = re.compile(r'\bunetched\b|as[-\s]?polished', re.I)
 _ALLOY_PAT = re.compile(
     r'\b(?:IN[-\s]?\d{3}(?:LC)?|GTD[-\s]?\d{3}|Ren[eé][-\s]?\d+|Nimonic[-\s]?\d+|'
     r'Inconel[-\s]?\d+|Hastelloy[-\s]?\w?|Waspaloy|Mar[-\s]?M[-\s]?\d+|'
@@ -784,12 +788,19 @@ def _anchor_order(data):
             rels = z.read(d.replace('drawings/', 'drawings/_rels/') + '.rels').decode('utf-8', 'ignore')
         except Exception:
             continue
-        rid2media = {i: t.split('/')[-1]
-                     for i, t in re.findall(r'Id="(rId\d+)"[^>]*Target="([^"]+)"', rels)}
+        rid2media = {}                       # parse Id/Target independently of order
+        for rel in re.findall(r'<Relationship\b[^>]*>', rels):
+            rid = re.search(r'Id="([^"]+)"', rel)
+            tgt = re.search(r'Target="([^"]+)"', rel)
+            if rid and tgt:
+                rid2media[rid.group(1)] = tgt.group(1).split('/')[-1]
         xml = z.read(d).decode('utf-8', 'ignore')
-        for anc in re.findall(r'<xdr:(?:two|one)CellAnchor.*?</xdr:(?:two|one)CellAnchor>', xml, re.DOTALL):
-            fm = re.search(r'<xdr:from>.*?<xdr:col>(\d+)</xdr:col>.*?<xdr:row>(\d+)</xdr:row>', anc, re.DOTALL)
-            em = re.search(r'r:embed="(rId\d+)"', anc)
+        # Tolerate both the xdr:-prefixed (Excel) and bare (openpyxl) namespaces.
+        for anc in re.findall(r'<(?:xdr:)?(?:two|one)CellAnchor\b.*?'
+                              r'</(?:xdr:)?(?:two|one)CellAnchor>', xml, re.DOTALL):
+            fm = re.search(r'<(?:xdr:)?from>.*?<(?:xdr:)?col>(\d+)</(?:xdr:)?col>.*?'
+                           r'<(?:xdr:)?row>(\d+)</(?:xdr:)?row>', anc, re.DOTALL)
+            em = re.search(r'r:embed="([^"]+)"', anc)
             if fm and em and rid2media.get(em.group(1)) in real:
                 placed.append((int(fm.group(2)), int(fm.group(1)), rid2media[em.group(1)]))
     placed.sort()
@@ -808,6 +819,26 @@ def image_captions(data, pictures):
     if not order or len(order) != len(caps):
         return {}
     return dict(zip(order, caps))
+
+
+def _picture_image_pairs(data, pictures, images):
+    """Align captions to embedded micrographs by anchor order.
+
+    Returns [(label, caption, image_entry), …] when the picture count matches the
+    embedded-micrograph count (so the pairing is trustworthy), else [].
+    """
+    order = _anchor_order(data)
+    pics = sorted((int(m.group(1)), l, c) for l, c in (pictures or [])
+                  for m in [_PICNUM.search(l or '')] if m)
+    if not order or len(order) != len(pics):
+        return []
+    by_name = {im.get('image'): im for im in (images or [])}
+    pairs = []
+    for (_, label, cap), name in zip(pics, order):
+        im = by_name.get(name)
+        if im is not None:
+            pairs.append((label, cap, im))
+    return pairs
 
 
 def _review_captions(parsed):
@@ -841,6 +872,15 @@ def _review_captions(parsed):
                          f'No etch status in caption(s): {", ".join(no_etch)}.'))
     else:
         findings.append(('pass', 'Captions', 'Every caption states an etch status.'))
+
+    # Surface captions that explicitly state unetched / as-polished — legitimate
+    # for thickness / crack work, but worth confirming for a microstructure report.
+    for label, cap in pics:
+        if _UNETCHED_PAT.search(f"{label} {cap or ''}"):
+            findings.append(('info', 'Captions',
+                             f'{(label or "?").rstrip(":")} caption states unetched / '
+                             f'as-polished — confirm intended (a microstructure '
+                             f'assessment is normally etched).'))
 
     refs = [int(m.group(1)) for m in
             re.finditer(r'pic(?:ture)?\.?\s*(?:no\.?\s*)?(\d+)', comment, re.I)]
@@ -1132,22 +1172,47 @@ def _comment_thickness_um(comment):
     return out
 
 
-def _review_etch(images, pictures):
-    """A5 — advisory contrast info (caption-only etch enforcement lives in captions)."""
+def _review_etch(images, pictures, data=None):
+    """Per-picture caption↔contrast consistency, plus an aggregate summary.
+
+    Contrast comes from edge density and is advisory (faint post-HT etching reads
+    as low-contrast), so mismatches are phrased as "verify", never hard failures.
+    When captions can be mapped 1:1 to the embedded micrographs we check each
+    picture; otherwise we fall back to the aggregate unetched-vs-low-contrast count.
+    """
     findings = []
     scored = [im for im in images if im.get('strong') is not None]
     if not scored:
         return findings
     n_low = sum(1 for im in scored if not im.get('etched'))
-    n_cap = sum(1 for label, cap in (pictures or [])
-                if re.search(r'\bunetched\b|as[-\s]?polished', f"{label} {cap or ''}", re.I))
     findings.append(('info', 'Photo etch',
                      f'{len(scored) - n_low} of {len(scored)} micrograph(s) show etched-type '
                      f'contrast; {n_low} low-contrast (unetched / faint post-HT).'))
-    if n_low != n_cap:
-        findings.append(('info', 'Photo etch',
-                         f'{n_low} micrograph(s) read as low-contrast vs {n_cap} caption(s) '
-                         f'marked "unetched" — worth a glance (faint post-HT etch reads low).'))
+
+    pairs = _picture_image_pairs(data, pictures, images) if data else []
+    if pairs:
+        for label, cap, im in pairs:
+            if im.get('strong') is None:
+                continue
+            pic = (label or 'Picture').rstrip(':')
+            et = caption_etchant(f"{label} {cap or ''}")
+            named = et and et not in ('Unetched', 'Etched (unspecified)')
+            if named and not im.get('etched'):
+                findings.append(('warning', 'Photo etch',
+                                 f'{pic}: caption names {et} but the micrograph reads '
+                                 f'low-contrast — the etch may not have developed; verify '
+                                 f'(contrast is advisory).'))
+            elif et == 'Unetched' and im.get('etched'):
+                findings.append(('warning', 'Photo etch',
+                                 f'{pic}: caption says unetched but the micrograph reads '
+                                 f'etched-type contrast — verify (contrast is advisory).'))
+    else:
+        n_cap = sum(1 for label, cap in (pictures or [])
+                    if _UNETCHED_PAT.search(f"{label} {cap or ''}"))
+        if n_low != n_cap:
+            findings.append(('info', 'Photo etch',
+                             f'{n_low} micrograph(s) read as low-contrast vs {n_cap} caption(s) '
+                             f'marked "unetched" — worth a glance (faint post-HT etch reads low).'))
     return findings
 
 
@@ -1374,7 +1439,7 @@ def review_report(filename, data, ocr=True):
         cap_mags = _caption_mags(parsed.get('pictures', []))
         report_job = parsed.get('header', {}).get('job')
         findings += _review_legends(legends, ocr_used, cap_mags, report_job)
-        findings += _review_etch(images, parsed.get('pictures', []))
+        findings += _review_etch(images, parsed.get('pictures', []), data)
         findings += _review_thickness(parsed, images)
     parsed['images'] = images
     parsed['legends'] = [im for im in images if im.get('mag') or im.get('scale')]
@@ -1459,14 +1524,19 @@ def collect_highlights(parsed):
             add(entry.get('label') or entry.get('value'), 'warning',
                 'Sign-off', f'{label} missing', f'Missing sign-off field: {label}.')
 
-    # ── Captions — no etch status stated ──
+    # ── Captions — no etch status, or explicitly unetched ──
     pics = parsed.get('pictures') or []
     ploc = loc.get('pictures') or []
     for i, (label, cap) in enumerate(pics):
-        if not _ETCH_PAT.search(f"{label} {cap or ''}"):
-            entry = ploc[i] if i < len(ploc) else {}
+        text = f"{label} {cap or ''}"
+        entry = ploc[i] if i < len(ploc) else {}
+        if not _ETCH_PAT.search(text):
             add(anchor(entry), 'warning', 'Captions', 'No etch status',
                 f'No etch status in caption: {(label or "?").rstrip(":")}.')
+        elif _UNETCHED_PAT.search(text):
+            add(anchor(entry), 'info', 'Captions', 'Unetched',
+                f'{(label or "?").rstrip(":")} caption states unetched / as-polished '
+                f'— confirm intended.')
 
     # ── Coating — thickness measurements outside design limits ──
     for entry in parsed.get('rows') or []:

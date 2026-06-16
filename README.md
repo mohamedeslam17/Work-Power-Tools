@@ -101,6 +101,15 @@ post-HT etching reads as low-contrast); and reads burned-in thickness labels
 needs the **Tesseract** engine (`packages.txt` installs `tesseract-ocr`; the app
 degrades gracefully without it).
 
+**Etch handling.** A caption that explicitly states *unetched / as-polished* is
+surfaced on its own (legitimate for thickness / crack work, but worth confirming
+for a microstructure assessment) — separate from the *no etch status* warning for
+captions that say nothing. When captions can be mapped one-to-one to the embedded
+micrographs (by drawing-anchor order), each picture is checked for a caption↔image
+mismatch: a caption naming an etchant whose micrograph reads low-contrast (the etch
+may not have developed), or a caption saying unetched whose micrograph reads
+etched. Contrast is advisory, so mismatches read "verify", not fail.
+
 ### 🛠️ IIR Review *(new)*
 Automated consistency/completeness QA of **Incoming Inspection Reports** (Detailed
 Assessment Customer Reports) delivered as `.xlsx`. Upload one or more workbooks for a
