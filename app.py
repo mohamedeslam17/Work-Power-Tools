@@ -20,13 +20,22 @@ def _lib_image(path, drive_id):
 
 
 @st.cache_data(show_spinner=False)
-def _review_and_render(name, data, ocr):
+def _review_and_render(name, data, ocr, faithful=True):
     """Review a report and build its annotated images, cached on the bytes so
-    re-runs (and the check toggles) don't re-parse or re-render."""
+    re-runs (and the check toggles) don't re-parse or re-render. The annotated
+    view is the pixel-faithful LibreOffice render when available, else the
+    drawn-grid fallback; `mode`/`status` say which (and why)."""
     rtype, parsed, findings = review_report(name, data, ocr=ocr)
-    annotated = report_render.render_report_image(data, parsed, findings, rtype, filename=name)
+    annotated, mode, status = None, 'none', ''
+    if faithful:
+        annotated, status = report_render.render_report_faithful(data, parsed, filename=name)
+        if annotated:
+            mode = 'faithful'
+    if not annotated:
+        annotated = report_render.render_report_image(data, parsed, findings, rtype, filename=name)
+        mode = 'grid' if annotated else 'none'
     micrographs = report_render.annotate_micrographs(data, parsed)
-    return rtype, parsed, findings, annotated, micrographs
+    return rtype, parsed, findings, annotated, micrographs, mode, status
 
 st.set_page_config(
     page_title="AEG Materials Tools",
@@ -248,12 +257,21 @@ def render_reviewer():
         key="lab_files",
     )
 
-    ocr = st.checkbox(
+    oc1, oc2 = st.columns(2)
+    ocr = oc1.checkbox(
         "🔍 Analyse micrographs (legends, etch, thickness)",
         value=True,
         help="Reads each micrograph's burned-in legend (magnification / scale), gauges "
              "etched-vs-low-contrast, and reads any burned-in thickness measurements — "
              "cross-checking against the captions and comment. Requires the Tesseract OCR engine.",
+    )
+    faithful = oc2.checkbox(
+        "🖼 Pixel-faithful report image (LibreOffice)",
+        value=True,
+        help="Renders the real workbook with LibreOffice — original fonts, column widths, "
+             "borders and embedded micrographs — and overlays the flagged cells. Falls back "
+             "to a fast drawn grid when LibreOffice isn't available (the first render of a "
+             "report can take a few seconds).",
     )
 
     if not files:
@@ -266,8 +284,8 @@ def render_reviewer():
 
         try:
             with st.spinner("Reviewing…"):
-                rtype, parsed, findings, annotated, micrographs = \
-                    _review_and_render(f.name, f.getvalue(), ocr)
+                rtype, parsed, findings, annotated, micrographs, mode, status = \
+                    _review_and_render(f.name, f.getvalue(), ocr, faithful)
         except Exception as e:
             st.error(f"Could not read report — {e}")
             continue
@@ -305,15 +323,19 @@ def render_reviewer():
             with st.expander("🖼 Annotated report view — issue areas highlighted",
                              expanded=flagged):
                 if annotated:
-                    st.image(annotated, use_container_width=True,
-                             caption="Flagged cells are boxed and numbered; the legend "
-                                     "below the grid explains each one.")
+                    if mode == 'faithful':
+                        note = "Pixel-faithful LibreOffice render — flagged cells highlighted, numbered to the legend."
+                    else:
+                        note = "Drawn-grid view — flagged cells boxed and numbered to the legend."
+                        if faithful and status:
+                            note += f"  (Pixel-faithful render unavailable: {status}.)"
+                    st.image(annotated, use_container_width=True, caption=note)
                     st.download_button(
                         "⬇ Download annotated report (.png)", data=annotated,
                         file_name=f"{Path(f.name).stem}_annotated.png",
                         mime="image/png", key=f"annpng_{f.name}")
                 elif rtype in ('metallurgical', 'coating'):
-                    st.caption("Annotated grid unavailable (image libraries not installed).")
+                    st.caption("Annotated view unavailable (image libraries not installed).")
                 if micrographs:
                     st.markdown("**Annotated micrographs** — legend / scale-bar regions "
                                 "boxed, contrast and any burned-in thickness flagged.")

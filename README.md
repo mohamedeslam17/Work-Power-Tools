@@ -24,15 +24,27 @@ Two report families are recognised automatically:
 
 Findings are graded **🔴 Fail / 🟠 Warning / 🔵 Note / 🟢 Pass** and shown on screen.
 
-**Annotated report view.** Alongside the findings list, the reviewer renders the
-report's data region as a spreadsheet-like image with the offending cells boxed,
-numbered and explained in a baked-in legend — composition deviations, hardness,
-blank header/sign-off fields, captions without an etch status, and coating
-thickness outside the design limits. The embedded micrographs are annotated too:
-the burned-in legend / scale-bar regions are boxed, and low contrast or any
-burned-in thickness reading is flagged. Implemented in
-[`report_render.py`](report_render.py) — pure [Pillow](https://python-pillow.org/),
-no extra system dependencies (cell anchoring comes from `lab_review.collect_highlights`).
+**Annotated report view.** Alongside the findings list, the reviewer shows the
+report *with the issue areas highlighted and numbered to a legend*. By default this
+is a **pixel-faithful** render: the real workbook is converted with **LibreOffice**
+(original fonts, column widths, borders and embedded micrographs intact) and each
+flagged cell is filled, badged and explained. When LibreOffice isn't available it
+falls back automatically to a **drawn-grid** view (pure [Pillow](https://python-pillow.org/),
+no system dependencies) that reconstructs the data region as a spreadsheet-like image
+with the same boxed-and-numbered cells. Either way it covers composition deviations,
+hardness, blank header/sign-off fields, captions without an etch status, and coating
+thickness outside the design limits — and the embedded micrographs are separately
+annotated (legend / scale-bar regions boxed, low contrast and any burned-in thickness
+flagged). Implemented in [`report_render.py`](report_render.py); cell anchoring comes
+from `lab_review.collect_highlights`.
+
+The pixel-faithful path needs LibreOffice — `packages.txt` installs `libreoffice-calc`,
+and the PDF is rasterised with the existing **PyMuPDF** dependency. The cell highlights
+are placed by filling each flagged cell with a uniquely-detectable colour in the
+workbook, rendering, then finding that colour back in the raster — so a badge lands
+exactly on the cell with no spreadsheet-to-pixel geometry. Toggle it off in the UI to
+force the fast grid view (the first faithful render of a report can take a few seconds
+while LibreOffice warms up).
 
 ### 🖼️ Photo Library *(new)*
 Extracts the embedded micrographs from a reviewed report into a **per-alloy**

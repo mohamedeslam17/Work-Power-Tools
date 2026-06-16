@@ -16,17 +16,28 @@ Cell anchoring comes from lab_review.collect_highlights(); this module only
 draws. It never raises into the caller — on any trouble it returns None / [].
 """
 import io
+import os
+import shutil
+import subprocess
+import tempfile
 import textwrap
 import zipfile
 
 try:
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageChops, ImageDraw, ImageFont
     _PIL = True
 except Exception:                       # pragma: no cover - exercised by guard
     _PIL = False
 
+try:
+    import fitz                          # PyMuPDF — rasterises the LibreOffice PDF
+    _FITZ = True
+except Exception:                       # pragma: no cover - exercised by guard
+    _FITZ = False
+
 import openpyxl
 from openpyxl.utils import get_column_letter
+from openpyxl.styles import Border, PatternFill, Side
 
 from lab_review import collect_highlights, analyze_images
 
@@ -402,4 +413,259 @@ def _annotate_one(im, entry):
 
     out = io.BytesIO()
     im.save(out, format='PNG')
+    return out.getvalue()
+
+
+# ════════════════════════════════════════════════════════════════════════
+# PIXEL-FAITHFUL VIEW  (LibreOffice render of the real workbook + overlays)
+# ════════════════════════════════════════════════════════════════════════
+# How it works: the flagged cells are filled in the workbook with an
+# exactly-known colour (a severity tint, perturbed per finding so each is
+# unique) and given a medium border in the severity colour. LibreOffice then
+# renders the *real* workbook — original fonts, column widths, borders, merged
+# cells and embedded micrographs intact — to PDF, which PyMuPDF rasterises.
+# Each finding's cell is then found back by its unique fill colour (no fragile
+# cell→pixel maths), so a numbered badge lands exactly on it and a legend ties
+# the numbers to the findings. Falls back (caller's job) to the drawn grid when
+# LibreOffice or PyMuPDF is unavailable.
+
+_TINT = {                       # light fills (kept readable over the cell text)
+    'critical': (255, 214, 217),
+    'warning':  (255, 232, 200),
+    'info':     (210, 228, 250),
+    'pass':     (212, 240, 222),
+}
+_BORDER_HEX = {'critical': 'C62D38', 'warning': 'D9821A',
+               'info': '1A6ED6', 'pass': '1F9E50'}
+
+
+def libreoffice_available():
+    """True when a pixel-faithful render is possible here."""
+    return bool(_PIL and _FITZ and _find_soffice())
+
+
+def _find_soffice():
+    for name in ('soffice', 'libreoffice'):
+        p = shutil.which(name)
+        if p:
+            return p
+    for p in ('/usr/bin/soffice', '/usr/bin/libreoffice',
+              '/opt/libreoffice/program/soffice'):
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def _unique_fill(i, sev):
+    """A severity-tinted fill that is unique per finding index (so it can be
+    found back in the raster by exact colour). Steps of 6 keep masks (±2) apart."""
+    r, g, b = _TINT.get(sev, _TINT['warning'])
+    b = max(140, b - (i % 8) * 6)
+    g = max(140, g - (i // 8) * 6)
+    return (r, g, b)
+
+
+def render_report_faithful(data, parsed, filename=None, dpi=160, timeout=120):
+    """Return (png_bytes, status). status is 'ok' or a short reason on failure
+    (so the caller can fall back to render_report_image)."""
+    if not _PIL:
+        return None, 'Pillow unavailable'
+    if not _FITZ:
+        return None, 'PyMuPDF unavailable'
+    if not _find_soffice():
+        return None, 'LibreOffice not installed'
+    try:
+        return _faithful(data, parsed, filename, dpi, timeout)
+    except subprocess.TimeoutExpired:
+        return None, 'LibreOffice timed out'
+    except Exception as e:
+        return None, f'{type(e).__name__}: {e}'
+
+
+def _faithful(data, parsed, filename, dpi, timeout):
+    loc = parsed.get('loc') or {}
+    highlights = sorted((h for h in collect_highlights(parsed) if h.get('cell')),
+                        key=lambda h: (h['cell'][0], h['cell'][1]))
+
+    wb = openpyxl.load_workbook(io.BytesIO(data))      # keep styles + images
+    sheet = loc.get('sheet')
+    ws = wb[sheet] if sheet and sheet in wb.sheetnames else wb.active
+
+    span = {}
+    for rng in ws.merged_cells.ranges:
+        for rr in range(rng.min_row, rng.max_row + 1):
+            for cc in range(rng.min_col, rng.max_col + 1):
+                span[(rr, cc)] = rng
+
+    keys = []                                          # (num, sev, note, rgb, ref)
+    for i, h in enumerate(highlights):
+        r, c = h['cell']
+        sev = h['severity']
+        rgb = _unique_fill(i, sev)
+        fill = PatternFill('solid', fgColor='%02X%02X%02X' % rgb)
+        side = Side(style='medium', color=_BORDER_HEX.get(sev, 'D9821A'))
+        border = Border(left=side, right=side, top=side, bottom=side)
+        rng = span.get((r, c))
+        cells = ([(rr, cc) for rr in range(rng.min_row, rng.max_row + 1)
+                  for cc in range(rng.min_col, rng.max_col + 1)]
+                 if rng else [(r, c)])
+        for rr, cc in cells:
+            cell = ws.cell(row=rr, column=cc)
+            cell.fill = fill
+            cell.border = border
+        keys.append((i + 1, sev, h['note'], rgb, f'{get_column_letter(c)}{r}'))
+
+    # Bound output to the used range and fit to one page wide.
+    try:
+        from openpyxl.worksheet.properties import PageSetupProperties
+        ws.print_area = ws.dimensions
+        ws.page_setup.orientation = 'landscape'
+        ws.page_setup.fitToWidth = 1
+        ws.page_setup.fitToHeight = 0
+        ws.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
+    except Exception:
+        pass
+
+    with tempfile.TemporaryDirectory() as tmp:
+        xpath = os.path.join(tmp, 'annotated.xlsx')
+        wb.save(xpath)
+        pdf = _xlsx_to_pdf(xpath, tmp, timeout)
+        if not pdf:
+            return None, 'LibreOffice conversion failed'
+        pages = _raster_pdf(pdf, dpi)
+    if not pages:
+        return None, 'no pages rendered'
+    return _compose_faithful(pages, keys, filename, dpi), 'ok'
+
+
+def _xlsx_to_pdf(xlsx_path, outdir, timeout):
+    exe = _find_soffice()
+    profile = 'file://' + os.path.join(outdir, 'lo_profile')
+    cmd = [exe, '--headless', '--norestore', '--invisible', '--nologo',
+           '-env:UserInstallation=' + profile,
+           '--convert-to', 'pdf:calc_pdf_Export', '--outdir', outdir, xlsx_path]
+    subprocess.run(cmd, timeout=timeout, stdout=subprocess.PIPE,
+                   stderr=subprocess.PIPE, check=True)
+    pdf = os.path.join(outdir, os.path.splitext(os.path.basename(xlsx_path))[0] + '.pdf')
+    return pdf if os.path.exists(pdf) else None
+
+
+def _raster_pdf(pdf, dpi):
+    doc = fitz.open(pdf)
+    mat = fitz.Matrix(dpi / 72.0, dpi / 72.0)
+    pages = []
+    for pg in doc:
+        pix = pg.get_pixmap(matrix=mat, alpha=False)
+        pages.append(Image.frombytes('RGB', (pix.width, pix.height), pix.samples).copy())
+    doc.close()
+    return pages
+
+
+def _color_bbox(img, rgb, tol=2):
+    """Bounding box of pixels matching rgb within tol on every channel, or None."""
+    bands = []
+    for ch, v in zip(img.split()[:3], rgb):
+        lo, hi = v - tol, v + tol
+        bands.append(ch.point(lambda p: 255 if lo <= p <= hi else 0))
+    mask = ImageChops.multiply(ImageChops.multiply(bands[0], bands[1]), bands[2])
+    return mask.getbbox()
+
+
+def _compose_faithful(pages, keys, filename, dpi):
+    margin = 16
+    gap = 12
+    content_w = max(p.width for p in pages)
+    page_w = content_w + 2 * margin
+
+    # Locate every flagged cell on whichever page carries its unique fill.
+    located = {}                                       # num -> (page_index, bbox)
+    for num, sev, note, rgb, ref in keys:
+        for pi, pg in enumerate(pages):
+            bb = _color_bbox(pg, rgb)
+            if bb:
+                located[num] = (pi, bb)
+                break
+
+    fsz = max(15, int(content_w / 78))
+    f_title = _font(int(fsz * 1.5), bold=True)
+    f_sub   = _font(int(fsz * 0.95))
+    f_leg   = _font(fsz)
+    f_legb  = _font(fsz, bold=True)
+    f_badge = _font(int(fsz * 0.95), bold=True)
+    title_h = int(fsz * 3.2)
+
+    # Wrapped legend lines.
+    wrap_chars = max(48, int((page_w - 90) / (fsz * 0.56)))
+    leg_lines = []
+    for num, sev, note, rgb, ref in keys:
+        wrapped = textwrap.wrap(f'[{ref}]  {note}', wrap_chars) or ['']
+        leg_lines.append((num, sev, wrapped))
+    leg_h = int(fsz * 2.2)
+    for _, _, wrapped in leg_lines:
+        leg_h += int(fsz * 1.5) * len(wrapped) + int(fsz * 0.6)
+
+    # Page vertical offsets in the stacked canvas.
+    y = title_h + margin
+    offs = []
+    for pg in pages:
+        offs.append(y)
+        y += pg.height + gap
+    total_h = y - gap + margin + (leg_h if keys else int(fsz * 2))
+
+    canvas = Image.new('RGB', (page_w, total_h), _WHITE)
+    d = ImageDraw.Draw(canvas)
+
+    # Title band.
+    d.rectangle([0, 0, page_w, title_h], fill=_TITLE_BG)
+    d.text((margin, int(fsz * 0.5)),
+           _fit(d, filename or 'Lab report', f_title, page_w - 2 * margin),
+           font=f_title, fill=_WHITE)
+    counts = {}
+    for _, sev, _, _, _ in keys:
+        counts[sev] = counts.get(sev, 0) + 1
+    sub = 'Pixel-faithful annotated review — ' + (
+        ', '.join(f'{counts[s]} {s}' for s in ('critical', 'warning', 'info')
+                  if counts.get(s)) or 'no cell-level issues flagged')
+    d.text((margin + 1, int(fsz * 2.0)), sub, font=f_sub, fill=(200, 208, 220))
+
+    # Paste the faithful pages, framed.
+    for pg, oy in zip(pages, offs):
+        canvas.paste(pg, (margin, oy))
+        d.rectangle([margin, oy, margin + pg.width, oy + pg.height],
+                    outline=(210, 214, 220), width=1)
+
+    # Numbered badges on the located cells.
+    br = int(dpi * 0.085)
+    for num, sev, note, rgb, ref in keys:
+        if num not in located:
+            continue
+        pi, bb = located[num]
+        ox, oy = margin, offs[pi]
+        cx = ox + bb[2]
+        cy = oy + bb[1]
+        color = _SEV_RGB[sev]
+        d.ellipse([cx - br, cy - br, cx + br, cy + br], fill=color, outline=_WHITE, width=2)
+        d.text((cx, cy), str(num), font=f_badge, fill=_WHITE, anchor='mm')
+
+    # Legend.
+    ly = (offs[-1] + pages[-1].height + gap + margin) if pages else title_h + margin
+    if keys:
+        d.text((margin, ly), 'Findings', font=f_legb, fill=_TEXT)
+        ly += int(fsz * 1.8)
+        for num, sev, wrapped in leg_lines:
+            color = _SEV_RGB[sev]
+            rr = int(fsz * 0.7)
+            d.ellipse([margin, ly, margin + 2 * rr, ly + 2 * rr], fill=color)
+            d.text((margin + rr, ly + rr), str(num), font=f_badge, fill=_WHITE, anchor='mm')
+            d.text((margin + 2 * rr + 10, ly - 1), wrapped[0], font=f_leg, fill=_TEXT)
+            for extra in wrapped[1:]:
+                ly += int(fsz * 1.5)
+                d.text((margin + 2 * rr + 10, ly - 1), extra, font=f_leg, fill=_MUTED)
+            ly += int(fsz * 1.5) + int(fsz * 0.6)
+    else:
+        d.text((margin, ly), 'No cell-level issues to highlight on this sheet.',
+               font=f_leg, fill=_MUTED)
+
+    out = io.BytesIO()
+    canvas.save(out, format='PNG')
     return out.getvalue()
