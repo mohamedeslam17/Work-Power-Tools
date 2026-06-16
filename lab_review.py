@@ -1172,13 +1172,47 @@ def _comment_thickness_um(comment):
     return out
 
 
-def _review_etch(images, pictures, data=None):
-    """Per-picture caption↔contrast consistency, plus an aggregate summary.
+def picture_etch_verdicts(images, pictures, data):
+    """Per-picture caption↔contrast verdicts via 1:1 caption/micrograph pairing.
 
-    Contrast comes from edge density and is advisory (faint post-HT etching reads
-    as low-contrast), so mismatches are phrased as "verify", never hard failures.
-    When captions can be mapped 1:1 to the embedded micrographs we check each
-    picture; otherwise we fall back to the aggregate unetched-vs-low-contrast count.
+    Returns a list of {'index', 'label', 'severity', 'note'} (possibly empty) when
+    captions pair to micrographs, else None (caller falls back to the aggregate
+    count). `index` is the position in `pictures`, so a caller can find the caption
+    cell. Contrast is advisory, so verdicts read "verify".
+    """
+    if not data:
+        return None
+    pairs = _picture_image_pairs(data, pictures, images)
+    if not pairs:
+        return None
+    idx_of = {}
+    for i, (label, _) in enumerate(pictures or []):
+        idx_of.setdefault(label, i)
+    out = []
+    for label, cap, im in pairs:
+        if im.get('strong') is None:
+            continue
+        pic = (label or 'Picture').rstrip(':')
+        et = caption_etchant(f"{label} {cap or ''}")
+        named = et and et not in ('Unetched', 'Etched (unspecified)')
+        note = None
+        if named and not im.get('etched'):
+            note = (f'{pic}: caption names {et} but the micrograph reads low-contrast — '
+                    f'the etch may not have developed; verify (contrast is advisory).')
+        elif et == 'Unetched' and im.get('etched'):
+            note = (f'{pic}: caption says unetched but the micrograph reads etched-type '
+                    f'contrast — verify (contrast is advisory).')
+        if note:
+            out.append({'index': idx_of.get(label), 'label': label,
+                        'severity': 'warning', 'note': note})
+    return out
+
+
+def _review_etch(images, pictures, verdicts):
+    """Aggregate contrast summary plus the per-picture caption↔contrast verdicts.
+
+    `verdicts` is picture_etch_verdicts(...): a list (per-picture findings) or
+    None (couldn't pair 1:1 → fall back to the aggregate unetched-vs-low count).
     """
     findings = []
     scored = [im for im in images if im.get('strong') is not None]
@@ -1188,24 +1222,9 @@ def _review_etch(images, pictures, data=None):
     findings.append(('info', 'Photo etch',
                      f'{len(scored) - n_low} of {len(scored)} micrograph(s) show etched-type '
                      f'contrast; {n_low} low-contrast (unetched / faint post-HT).'))
-
-    pairs = _picture_image_pairs(data, pictures, images) if data else []
-    if pairs:
-        for label, cap, im in pairs:
-            if im.get('strong') is None:
-                continue
-            pic = (label or 'Picture').rstrip(':')
-            et = caption_etchant(f"{label} {cap or ''}")
-            named = et and et not in ('Unetched', 'Etched (unspecified)')
-            if named and not im.get('etched'):
-                findings.append(('warning', 'Photo etch',
-                                 f'{pic}: caption names {et} but the micrograph reads '
-                                 f'low-contrast — the etch may not have developed; verify '
-                                 f'(contrast is advisory).'))
-            elif et == 'Unetched' and im.get('etched'):
-                findings.append(('warning', 'Photo etch',
-                                 f'{pic}: caption says unetched but the micrograph reads '
-                                 f'etched-type contrast — verify (contrast is advisory).'))
+    if verdicts is not None:
+        for v in verdicts:
+            findings.append((v['severity'], 'Photo etch', v['note']))
     else:
         n_cap = sum(1 for label, cap in (pictures or [])
                     if _UNETCHED_PAT.search(f"{label} {cap or ''}"))
@@ -1439,8 +1458,10 @@ def review_report(filename, data, ocr=True):
         cap_mags = _caption_mags(parsed.get('pictures', []))
         report_job = parsed.get('header', {}).get('job')
         findings += _review_legends(legends, ocr_used, cap_mags, report_job)
-        findings += _review_etch(images, parsed.get('pictures', []), data)
+        etch_verdicts = picture_etch_verdicts(images, parsed.get('pictures', []), data)
+        findings += _review_etch(images, parsed.get('pictures', []), etch_verdicts)
         findings += _review_thickness(parsed, images)
+        parsed['photo_etch'] = etch_verdicts or []
     parsed['images'] = images
     parsed['legends'] = [im for im in images if im.get('mag') or im.get('scale')]
     return rtype, parsed, findings
@@ -1537,6 +1558,24 @@ def collect_highlights(parsed):
             add(anchor(entry), 'info', 'Captions', 'Unetched',
                 f'{(label or "?").rstrip(":")} caption states unetched / as-polished '
                 f'— confirm intended.')
+
+    # ── Photo etch — per-picture caption↔contrast mismatch (anchor to caption) ──
+    for v in parsed.get('photo_etch') or []:
+        idx = v.get('index')
+        entry = ploc[idx] if (idx is not None and 0 <= idx < len(ploc)) else {}
+        add(anchor(entry), v.get('severity', 'warning'), 'Photo etch', 'etch?', v['note'])
+
+    # ── Thickness — comment value far from the in-photo measurements ──
+    comment_um = _comment_thickness_um(parsed.get('comment'))
+    photo_um = sorted({u for im in (parsed.get('images') or [])
+                       for u in im.get('measurements', [])})
+    if comment_um and photo_um:
+        lo_p, hi_p = min(photo_um), max(photo_um)
+        outliers = [u for u in sorted(comment_um) if u < lo_p * 0.5 or u > hi_p * 2]
+        if outliers:
+            add(anchor(loc.get('comment')), 'warning', 'Thickness', 'thickness?',
+                f'Comment thickness {", ".join(f"{u} µm" for u in outliers)} far from the '
+                f'photo measurements ({lo_p}–{hi_p} µm) — verify.')
 
     # ── Coating — thickness measurements outside design limits ──
     for entry in parsed.get('rows') or []:

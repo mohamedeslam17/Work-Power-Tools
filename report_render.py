@@ -102,12 +102,12 @@ def render_report_image(data, parsed, findings=None, rtype=None, filename=None,
     if not _PIL:
         return None
     try:
-        return _render(data, parsed, filename, max_rows, max_cols, scale)
+        return _render(data, parsed, findings, filename, max_rows, max_cols, scale)
     except Exception:
         return None
 
 
-def _render(data, parsed, filename, max_rows, max_cols, scale):
+def _render(data, parsed, findings, filename, max_rows, max_cols, scale):
     loc = parsed.get('loc') or {}
     wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True)
     sheet_name = loc.get('sheet')
@@ -212,10 +212,24 @@ def _render(data, parsed, filename, max_rows, max_cols, scale):
         sev, cat = meta[note]
         wrapped = textwrap.wrap(f"{cat} — {note}", wrap_chars) or ['']
         leg_lines.append((num[note], sev, wrapped))
-    if order:
-        leg_h = 16 + 28
-        for _, _, wrapped in leg_lines:
-            leg_h += 22 + 18 * (len(wrapped) - 1) + 8
+
+    # Warning/critical findings whose category produced no box (filename, photo
+    # legends, …) — listed so nothing is silently missing from the image.
+    localized = {h['category'] for h in highlights}
+    extra_lines = []
+    for sev, cat, msg in (findings or []):
+        if sev in ('critical', 'warning') and cat not in localized:
+            extra_lines.append((sev, textwrap.wrap(f"{cat} — {msg}", wrap_chars) or ['']))
+
+    def _block_h(lines):
+        return 28 + sum(22 + 18 * (len(w) - 1) + 8 for *_, w in lines)
+
+    if order or extra_lines:
+        leg_h = 16
+        if order:
+            leg_h += _block_h(leg_lines)
+        if extra_lines:
+            leg_h += _block_h(extra_lines)
     else:
         leg_h = 44
     W = int(content_w + 16)
@@ -299,19 +313,31 @@ def _render(data, parsed, filename, max_rows, max_cols, scale):
 
     # Legend panel.
     ly = grid_bottom + 16
-    if order:
-        d.text((S(14), S(ly)), "Findings", font=f_legbS, fill=_TEXT)
-        ly += 26
-        for i, sev, wrapped in leg_lines:
-            color = _SEV_RGB[sev]
-            d.rounded_rectangle([S(14), S(ly), S(34), S(ly + 18)],
-                                radius=4 * scale, fill=color)
-            d.text((S(24), S(ly + 9)), str(i), font=f_badge, fill=_WHITE, anchor='mm')
-            d.text((S(44), S(ly)), wrapped[0], font=f_legS, fill=_TEXT)
-            for extra in wrapped[1:]:
-                ly += 18
-                d.text((S(44), S(ly)), extra, font=f_legS, fill=_MUTED)
+    if order or extra_lines:
+        if order:
+            d.text((S(14), S(ly)), "Findings", font=f_legbS, fill=_TEXT)
             ly += 26
+            for i, sev, wrapped in leg_lines:
+                color = _SEV_RGB[sev]
+                d.rounded_rectangle([S(14), S(ly), S(34), S(ly + 18)],
+                                    radius=4 * scale, fill=color)
+                d.text((S(24), S(ly + 9)), str(i), font=f_badge, fill=_WHITE, anchor='mm')
+                d.text((S(44), S(ly)), wrapped[0], font=f_legS, fill=_TEXT)
+                for ex in wrapped[1:]:
+                    ly += 18
+                    d.text((S(44), S(ly)), ex, font=f_legS, fill=_MUTED)
+                ly += 26
+        if extra_lines:
+            d.text((S(14), S(ly)), "Also flagged (not tied to a cell)",
+                   font=f_legbS, fill=_TEXT)
+            ly += 26
+            for sev, wrapped in extra_lines:
+                d.ellipse([S(17), S(ly + 4), S(31), S(ly + 18)], fill=_SEV_RGB[sev])
+                d.text((S(44), S(ly)), wrapped[0], font=f_legS, fill=_TEXT)
+                for ex in wrapped[1:]:
+                    ly += 18
+                    d.text((S(44), S(ly)), ex, font=f_legS, fill=_MUTED)
+                ly += 26
     else:
         d.text((S(14), S(ly)), "No cell-level issues to highlight on this sheet.",
                font=f_legS, fill=_MUTED)
@@ -465,9 +491,10 @@ def _unique_fill(i, sev):
     return (r, g, b)
 
 
-def render_report_faithful(data, parsed, filename=None, dpi=160, timeout=120):
+def render_report_faithful(data, parsed, findings=None, filename=None, dpi=160, timeout=120):
     """Return (png_bytes, status). status is 'ok' or a short reason on failure
-    (so the caller can fall back to render_report_image)."""
+    (so the caller can fall back to render_report_image). `findings` lets the
+    legend also list warning/critical findings that aren't tied to a cell."""
     if not _PIL:
         return None, 'Pillow unavailable'
     if not _FITZ:
@@ -475,14 +502,14 @@ def render_report_faithful(data, parsed, filename=None, dpi=160, timeout=120):
     if not _find_soffice():
         return None, 'LibreOffice not installed'
     try:
-        return _faithful(data, parsed, filename, dpi, timeout)
+        return _faithful(data, parsed, findings, filename, dpi, timeout)
     except subprocess.TimeoutExpired:
         return None, 'LibreOffice timed out'
     except Exception as e:
         return None, f'{type(e).__name__}: {e}'
 
 
-def _faithful(data, parsed, filename, dpi, timeout):
+def _faithful(data, parsed, findings, filename, dpi, timeout):
     loc = parsed.get('loc') or {}
     highlights = sorted((h for h in collect_highlights(parsed) if h.get('cell')),
                         key=lambda h: (h['cell'][0], h['cell'][1]))
@@ -497,10 +524,25 @@ def _faithful(data, parsed, filename, dpi, timeout):
             for cc in range(rng.min_col, rng.max_col + 1):
                 span[(rr, cc)] = rng
 
-    keys = []                                          # (num, sev, note, rgb, ref)
-    for i, h in enumerate(highlights):
-        r, c = h['cell']
-        sev = h['severity']
+    # Group highlights by cell: one fill + one badge per cell, even when a cell
+    # carries several findings (e.g. unetched note + contrast mismatch).
+    groups, by_cell = [], {}
+    for h in highlights:
+        cell = tuple(h['cell'])
+        g = by_cell.get(cell)
+        if g is None:
+            g = {'cell': cell, 'severity': h['severity'], 'notes': [h['note']]}
+            by_cell[cell] = g
+            groups.append(g)
+        else:
+            g['notes'].append(h['note'])
+            if _SEV_RANK[h['severity']] > _SEV_RANK[g['severity']]:
+                g['severity'] = h['severity']
+
+    keys = []
+    for i, g in enumerate(groups):
+        r, c = g['cell']
+        sev = g['severity']
         rgb = _unique_fill(i, sev)
         fill = PatternFill('solid', fgColor='%02X%02X%02X' % rgb)
         side = Side(style='medium', color=_BORDER_HEX.get(sev, 'D9821A'))
@@ -513,7 +555,14 @@ def _faithful(data, parsed, filename, dpi, timeout):
             cell = ws.cell(row=rr, column=cc)
             cell.fill = fill
             cell.border = border
-        keys.append((i + 1, sev, h['note'], rgb, f'{get_column_letter(c)}{r}'))
+        keys.append({'num': i + 1, 'severity': sev, 'notes': g['notes'],
+                     'rgb': rgb, 'ref': f'{get_column_letter(c)}{r}'})
+
+    # Warning/critical findings whose category produced no box (filename, photo
+    # legends, …) — listed in the legend so nothing is silently missing.
+    localized = {h['category'] for h in highlights}
+    extras = [(sev, cat, msg) for (sev, cat, msg) in (findings or [])
+              if sev in ('critical', 'warning') and cat not in localized]
 
     # Bound output to the used range and fit to one page wide.
     try:
@@ -535,7 +584,7 @@ def _faithful(data, parsed, filename, dpi, timeout):
         pages = _raster_pdf(pdf, dpi)
     if not pages:
         return None, 'no pages rendered'
-    return _compose_faithful(pages, keys, filename, dpi), 'ok'
+    return _compose_faithful(pages, keys, extras, filename, dpi), 'ok'
 
 
 def _xlsx_to_pdf(xlsx_path, outdir, timeout):
@@ -551,6 +600,10 @@ def _xlsx_to_pdf(xlsx_path, outdir, timeout):
 
 
 def _raster_pdf(pdf, dpi):
+    try:                       # quieten benign 'structure tree' notices on tagged PDFs
+        fitz.TOOLS.mupdf_display_errors(False)
+    except Exception:
+        pass
     doc = fitz.open(pdf)
     mat = fitz.Matrix(dpi / 72.0, dpi / 72.0)
     pages = []
@@ -571,7 +624,7 @@ def _color_bbox(img, rgb, tol=2):
     return mask.getbbox()
 
 
-def _compose_faithful(pages, keys, filename, dpi):
+def _compose_faithful(pages, keys, extras, filename, dpi):
     margin = 16
     gap = 12
     content_w = max(p.width for p in pages)
@@ -579,11 +632,11 @@ def _compose_faithful(pages, keys, filename, dpi):
 
     # Locate every flagged cell on whichever page carries its unique fill.
     located = {}                                       # num -> (page_index, bbox)
-    for num, sev, note, rgb, ref in keys:
+    for k in keys:
         for pi, pg in enumerate(pages):
-            bb = _color_bbox(pg, rgb)
+            bb = _color_bbox(pg, k['rgb'])
             if bb:
-                located[num] = (pi, bb)
+                located[k['num']] = (pi, bb)
                 break
 
     fsz = max(15, int(content_w / 78))
@@ -593,16 +646,37 @@ def _compose_faithful(pages, keys, filename, dpi):
     f_legb  = _font(fsz, bold=True)
     f_badge = _font(int(fsz * 0.95), bold=True)
     title_h = int(fsz * 3.2)
-
-    # Wrapped legend lines.
+    line_h = int(fsz * 1.5)
+    entry_gap = int(fsz * 0.6)
+    head_h = int(fsz * 1.8)
     wrap_chars = max(48, int((page_w - 90) / (fsz * 0.56)))
-    leg_lines = []
-    for num, sev, note, rgb, ref in keys:
-        wrapped = textwrap.wrap(f'[{ref}]  {note}', wrap_chars) or ['']
-        leg_lines.append((num, sev, wrapped))
-    leg_h = int(fsz * 2.2)
-    for _, _, wrapped in leg_lines:
-        leg_h += int(fsz * 1.5) * len(wrapped) + int(fsz * 0.6)
+
+    def wrap_notes(notes):
+        lines = []
+        for note in notes:
+            lines += textwrap.wrap(note, wrap_chars) or ['']
+        return lines or ['']
+
+    # Boxed findings (numbered) then report-level extras (bulleted).
+    key_entries = []
+    for k in keys:
+        notes = list(k['notes'])
+        notes[0] = f"[{k['ref']}]  {notes[0]}"
+        key_entries.append({'badge': str(k['num']), 'severity': k['severity'],
+                            'lines': wrap_notes(notes)})
+    extra_entries = [{'badge': None, 'severity': sev, 'lines': wrap_notes([f'{cat} — {msg}'])}
+                     for sev, cat, msg in extras]
+
+    def block_h(entries):
+        return sum(line_h * len(e['lines']) + entry_gap for e in entries)
+
+    leg_h = entry_gap
+    if key_entries:
+        leg_h += head_h + block_h(key_entries)
+    if extra_entries:
+        leg_h += head_h + block_h(extra_entries)
+    if not key_entries and not extra_entries:
+        leg_h += int(fsz * 2)
 
     # Page vertical offsets in the stacked canvas.
     y = title_h + margin
@@ -610,7 +684,7 @@ def _compose_faithful(pages, keys, filename, dpi):
     for pg in pages:
         offs.append(y)
         y += pg.height + gap
-    total_h = y - gap + margin + (leg_h if keys else int(fsz * 2))
+    total_h = y - gap + margin + leg_h
 
     canvas = Image.new('RGB', (page_w, total_h), _WHITE)
     d = ImageDraw.Draw(canvas)
@@ -621,8 +695,8 @@ def _compose_faithful(pages, keys, filename, dpi):
            _fit(d, filename or 'Lab report', f_title, page_w - 2 * margin),
            font=f_title, fill=_WHITE)
     counts = {}
-    for _, sev, _, _, _ in keys:
-        counts[sev] = counts.get(sev, 0) + 1
+    for k in keys:
+        counts[k['severity']] = counts.get(k['severity'], 0) + 1
     sub = 'Pixel-faithful annotated review — ' + (
         ', '.join(f'{counts[s]} {s}' for s in ('critical', 'warning', 'info')
                   if counts.get(s)) or 'no cell-level issues flagged')
@@ -636,33 +710,44 @@ def _compose_faithful(pages, keys, filename, dpi):
 
     # Numbered badges on the located cells.
     br = int(dpi * 0.085)
-    for num, sev, note, rgb, ref in keys:
-        if num not in located:
+    for k in keys:
+        if k['num'] not in located:
             continue
-        pi, bb = located[num]
-        ox, oy = margin, offs[pi]
-        cx = ox + bb[2]
-        cy = oy + bb[1]
-        color = _SEV_RGB[sev]
+        pi, bb = located[k['num']]
+        cx, cy = margin + bb[2], offs[pi] + bb[1]
+        color = _SEV_RGB[k['severity']]
         d.ellipse([cx - br, cy - br, cx + br, cy + br], fill=color, outline=_WHITE, width=2)
-        d.text((cx, cy), str(num), font=f_badge, fill=_WHITE, anchor='mm')
+        d.text((cx, cy), str(k['num']), font=f_badge, fill=_WHITE, anchor='mm')
 
     # Legend.
+    rr = int(fsz * 0.7)
+    tx = margin + 2 * rr + 10
+
+    def draw_block(entries, ly):
+        for e in entries:
+            color = _SEV_RGB[e['severity']]
+            if e['badge'] is not None:
+                d.ellipse([margin, ly, margin + 2 * rr, ly + 2 * rr], fill=color)
+                d.text((margin + rr, ly + rr), e['badge'], font=f_badge,
+                       fill=_WHITE, anchor='mm')
+            else:
+                dot = int(fsz * 0.3)
+                d.ellipse([margin + rr - dot, ly + rr - dot,
+                           margin + rr + dot, ly + rr + dot], fill=color)
+            for j, line in enumerate(e['lines']):
+                d.text((tx, ly + j * line_h - 1), line, font=f_leg,
+                       fill=_TEXT if j == 0 else _MUTED)
+            ly += line_h * len(e['lines']) + entry_gap
+        return ly
+
     ly = (offs[-1] + pages[-1].height + gap + margin) if pages else title_h + margin
-    if keys:
+    if key_entries:
         d.text((margin, ly), 'Findings', font=f_legb, fill=_TEXT)
-        ly += int(fsz * 1.8)
-        for num, sev, wrapped in leg_lines:
-            color = _SEV_RGB[sev]
-            rr = int(fsz * 0.7)
-            d.ellipse([margin, ly, margin + 2 * rr, ly + 2 * rr], fill=color)
-            d.text((margin + rr, ly + rr), str(num), font=f_badge, fill=_WHITE, anchor='mm')
-            d.text((margin + 2 * rr + 10, ly - 1), wrapped[0], font=f_leg, fill=_TEXT)
-            for extra in wrapped[1:]:
-                ly += int(fsz * 1.5)
-                d.text((margin + 2 * rr + 10, ly - 1), extra, font=f_leg, fill=_MUTED)
-            ly += int(fsz * 1.5) + int(fsz * 0.6)
-    else:
+        ly = draw_block(key_entries, ly + head_h)
+    if extra_entries:
+        d.text((margin, ly), 'Also flagged (not tied to a cell)', font=f_legb, fill=_TEXT)
+        ly = draw_block(extra_entries, ly + head_h)
+    if not key_entries and not extra_entries:
         d.text((margin, ly), 'No cell-level issues to highlight on this sheet.',
                font=f_leg, fill=_MUTED)
 

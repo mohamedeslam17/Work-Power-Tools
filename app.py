@@ -28,7 +28,8 @@ def _review_and_render(name, data, ocr, faithful=True):
     rtype, parsed, findings = review_report(name, data, ocr=ocr)
     annotated, mode, status = None, 'none', ''
     if faithful:
-        annotated, status = report_render.render_report_faithful(data, parsed, filename=name)
+        annotated, status = report_render.render_report_faithful(
+            data, parsed, findings, filename=name)
         if annotated:
             mode = 'faithful'
     if not annotated:
