@@ -28,14 +28,32 @@ def _review_and_render(name, data, ocr, faithful=True):
     rtype, parsed, findings = review_report(name, data, ocr=ocr)
     annotated, mode, status = None, 'none', ''
     if faithful:
-        annotated, status = report_render.render_report_faithful(
-            data, parsed, findings, filename=name)
+        try:
+            annotated, status = report_render.render_report_faithful(
+                data, parsed, findings=findings, filename=name)
+        except TypeError:
+            # Tolerate a stale/cached report_render module on redeploy (older
+            # signature without `findings`); render without the extra legend.
+            try:
+                annotated, status = report_render.render_report_faithful(
+                    data, parsed, filename=name)
+            except Exception as e:
+                status = f'{type(e).__name__}: {e}'
+        except Exception as e:
+            status = f'{type(e).__name__}: {e}'
         if annotated:
             mode = 'faithful'
     if not annotated:
-        annotated = report_render.render_report_image(data, parsed, findings, rtype, filename=name)
+        try:
+            annotated = report_render.render_report_image(
+                data, parsed, findings, rtype, filename=name)
+        except Exception:
+            annotated = None
         mode = 'grid' if annotated else 'none'
-    micrographs = report_render.annotate_micrographs(data, parsed)
+    try:
+        micrographs = report_render.annotate_micrographs(data, parsed)
+    except Exception:
+        micrographs = []
     return rtype, parsed, findings, annotated, micrographs, mode, status
 
 
