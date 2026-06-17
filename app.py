@@ -69,21 +69,59 @@ def _gallery_photos(alloy):
     return photos_for(alloy)
 
 
-# Global visual polish — a comfortable max width, calmer type, tidier metrics,
-# tabs, cards, buttons and dividers. Restrained on purpose (it's an engineering tool).
+# Global visual polish. The colour theme lives in .streamlit/config.toml; this
+# adds depth (cards, shadows, rounded controls) and tightens spacing/typography.
 _PAGE_CSS = """
 <style>
-  .block-container {max-width: 1180px; padding-top: 1.1rem; padding-bottom: 4rem;}
-  h1, h2, h3, h4 {letter-spacing: -.01em;}
-  [data-testid="stMetricValue"] {font-size: 1.55rem; font-weight: 700;}
-  [data-testid="stMetricLabel"] p {font-size: .8rem; opacity: .8;}
-  .stTabs [data-baseweb="tab-list"] {gap: .15rem; border-bottom: 1px solid rgba(130,140,155,.25);}
-  .stTabs [data-baseweb="tab"] {padding: .4rem 1rem; font-weight: 600;}
-  [data-testid="stExpander"] details {border-radius: 10px; border-color: rgba(130,140,155,.25);}
-  [data-testid="stVerticalBlockBorderWrapper"] {border-radius: 12px;}
-  .stButton button, .stDownloadButton button {border-radius: 8px; font-weight: 600;}
-  [data-testid="stFileUploaderDropzone"] {border-radius: 10px;}
-  hr {margin: .7rem 0; opacity: .45;}
+  .stApp {background: #f5f8fd;}
+  .block-container {max-width: 1160px; padding-top: 1rem; padding-bottom: 4rem;}
+  h1,h2,h3,h4 {letter-spacing:-.012em; color:#16202e;}
+  p, li, label, .stMarkdown {color:#28323f;}
+
+  /* Cards (st.container(border=True)) */
+  [data-testid="stVerticalBlockBorderWrapper"] {
+    background:#fff; border:1px solid #e7ecf3 !important; border-radius:16px;
+    box-shadow:0 1px 2px rgba(16,24,40,.04), 0 6px 20px rgba(16,24,40,.05);
+    padding:.25rem .35rem;}
+
+  /* Inputs, selects, textareas */
+  .stTextInput input, .stTextArea textarea,
+  div[data-baseweb="select"] > div, div[data-baseweb="input"] > div {
+    background:#fff !important; border:1px solid #d9e0ea !important;
+    border-radius:10px !important;}
+  .stTextInput input:focus, .stTextArea textarea:focus {
+    border-color:#2563eb !important; box-shadow:0 0 0 3px rgba(37,99,235,.12) !important;}
+
+  /* Buttons */
+  .stButton button, .stDownloadButton button {
+    border-radius:10px; font-weight:600; border:1px solid #d9e0ea; transition:all .12s ease;}
+  .stButton button:hover, .stDownloadButton button:hover {
+    border-color:#2563eb; color:#2563eb; box-shadow:0 2px 8px rgba(37,99,235,.12);}
+  .stButton button[kind="primary"], .stDownloadButton button[kind="primary"] {
+    background:#2563eb; border-color:#2563eb; color:#fff;}
+  .stButton button[kind="primary"]:hover {background:#1d4ed8; color:#fff;}
+
+  /* Metrics as soft tiles */
+  [data-testid="stMetric"] {
+    background:#f8fafd; border:1px solid #eaeff6; border-radius:12px; padding:.5rem .85rem;}
+  [data-testid="stMetricValue"] {font-size:1.55rem; font-weight:800;}
+  [data-testid="stMetricLabel"] p {font-size:.8rem; opacity:.85;}
+
+  /* Tabs */
+  .stTabs [data-baseweb="tab-list"] {gap:.15rem; border-bottom:1px solid #e7ecf3;}
+  .stTabs [data-baseweb="tab"] {padding:.45rem 1.05rem; font-weight:600; color:#5b6573;}
+  .stTabs [aria-selected="true"] {color:#2563eb;}
+
+  /* File uploader */
+  [data-testid="stFileUploaderDropzone"] {
+    background:#fbfcfe; border:1.5px dashed #c9d4e6; border-radius:14px;}
+
+  /* Expander */
+  [data-testid="stExpander"] details {
+    border:1px solid #e7ecf3 !important; border-radius:12px; background:#fff;}
+
+  hr {border-color:#e7ecf3; margin:.7rem 0;}
+  [data-testid="stHeader"] {background:transparent;}
 </style>
 """
 

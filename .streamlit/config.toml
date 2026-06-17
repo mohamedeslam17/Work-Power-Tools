@@ -1,0 +1,14 @@
+[theme]
+# Brand palette — a confident blue accent (replaces Streamlit's default red),
+# a light app background with white cards/inputs, and calm slate text.
+primaryColor = "#2563eb"
+backgroundColor = "#f5f8fd"
+secondaryBackgroundColor = "#ffffff"
+textColor = "#1f2a37"
+font = "sans serif"
+
+[server]
+runOnSave = false
+
+[browser]
+gatherUsageStats = false

@@ -9,3 +9,6 @@ __pycache__/
 # customer-derived micrographs — keep the folder, not its contents
 photo_library/*
 !photo_library/.gitkeep
+
+# Streamlit secrets (never commit)
+.streamlit/secrets.toml
