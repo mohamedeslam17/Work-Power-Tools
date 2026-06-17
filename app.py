@@ -69,72 +69,94 @@ def _gallery_photos(alloy):
     return photos_for(alloy)
 
 
-# Global visual polish. The colour theme lives in .streamlit/config.toml; this
-# adds depth (cards, shadows, rounded controls) and tightens spacing/typography.
-_PAGE_CSS = """
+# Complete UI redesign: Inter type, a light sidebar-nav dashboard shell, a
+# branded page header, and designed cards / inputs / metrics / controls.
+_CSS = """
 <style>
-  .stApp {background: #f5f8fd;}
-  .block-container {max-width: 1160px; padding-top: 1rem; padding-bottom: 4rem;}
-  h1,h2,h3,h4 {letter-spacing:-.012em; color:#16202e;}
-  p, li, label, .stMarkdown {color:#28323f;}
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+  html, body, .stApp, button, input, textarea, select,
+  [class*="css"] { font-family:'Inter',-apple-system,system-ui,Segoe UI,sans-serif !important; }
+  .stApp { background:#eef2f8; }
+  .block-container { max-width:1140px; padding-top:1.3rem; padding-bottom:4rem; }
+  h1,h2,h3,h4 { letter-spacing:-.018em; color:#0f172a; font-weight:700; }
+  p,li,label,.stMarkdown { color:#334155; }
+  #MainMenu, footer, [data-testid="stDecoration"] { display:none; }
+  [data-testid="stHeader"] { background:transparent; height:0; }
 
-  /* Cards (st.container(border=True)) */
+  /* Sidebar */
+  [data-testid="stSidebar"] { background:#ffffff; border-right:1px solid #e6eaf2; }
+  [data-testid="stSidebar"] > div { padding-top:.6rem; }
+  [data-testid="stSidebar"] [role="radiogroup"] { gap:.18rem; }
+  [data-testid="stSidebar"] [role="radiogroup"] label {
+    display:flex; align-items:center; width:100%; padding:.62rem .85rem; margin:0;
+    border-radius:11px; cursor:pointer; font-weight:600; font-size:.95rem;
+    color:#475569; transition:all .12s; }
+  [data-testid="stSidebar"] [role="radiogroup"] label:hover { background:#f1f5f9; }
+  [data-testid="stSidebar"] [role="radiogroup"] label > div:first-child { display:none; }
+  [data-testid="stSidebar"] [role="radiogroup"] label:has(input:checked) {
+    background:#eaf1ff; color:#1d4ed8; box-shadow:inset 3px 0 0 #2563eb; }
+
+  /* Branded page header */
+  .pagehead { display:flex; align-items:center; gap:.9rem; margin:.1rem 0 1.2rem; }
+  .pagehead .ic { width:48px; height:48px; flex:none; border-radius:14px;
+    display:flex; align-items:center; justify-content:center; font-size:1.5rem;
+    background:linear-gradient(135deg,#2563eb,#4f46e5); color:#fff;
+    box-shadow:0 8px 18px rgba(37,99,235,.28); }
+  .pagehead h2 { margin:0; font-size:1.55rem; }
+  .pagehead .sub { color:#64748b; font-size:.92rem; margin-top:.12rem; }
+
+  /* Cards */
   [data-testid="stVerticalBlockBorderWrapper"] {
-    background:#fff; border:1px solid #e7ecf3 !important; border-radius:16px;
-    box-shadow:0 1px 2px rgba(16,24,40,.04), 0 6px 20px rgba(16,24,40,.05);
-    padding:.25rem .35rem;}
+    background:#fff; border:1px solid #e8ecf4 !important; border-radius:18px;
+    box-shadow:0 1px 2px rgba(15,23,42,.04), 0 12px 32px rgba(15,23,42,.06); }
 
-  /* Inputs, selects, textareas */
+  /* Inputs */
   .stTextInput input, .stTextArea textarea,
   div[data-baseweb="select"] > div, div[data-baseweb="input"] > div {
-    background:#fff !important; border:1px solid #d9e0ea !important;
-    border-radius:10px !important;}
+    background:#fff !important; border:1px solid #dbe2ec !important; border-radius:11px !important; }
   .stTextInput input:focus, .stTextArea textarea:focus {
-    border-color:#2563eb !important; box-shadow:0 0 0 3px rgba(37,99,235,.12) !important;}
+    border-color:#2563eb !important; box-shadow:0 0 0 3px rgba(37,99,235,.13) !important; }
 
   /* Buttons */
   .stButton button, .stDownloadButton button {
-    border-radius:10px; font-weight:600; border:1px solid #d9e0ea; transition:all .12s ease;}
+    border-radius:11px; font-weight:600; border:1px solid #dbe2ec; padding:.45rem 1rem; transition:all .12s; }
   .stButton button:hover, .stDownloadButton button:hover {
-    border-color:#2563eb; color:#2563eb; box-shadow:0 2px 8px rgba(37,99,235,.12);}
+    border-color:#2563eb; color:#2563eb; box-shadow:0 3px 10px rgba(37,99,235,.13); }
   .stButton button[kind="primary"], .stDownloadButton button[kind="primary"] {
-    background:#2563eb; border-color:#2563eb; color:#fff;}
-  .stButton button[kind="primary"]:hover {background:#1d4ed8; color:#fff;}
+    background:#2563eb; border-color:#2563eb; color:#fff; }
+  .stButton button[kind="primary"]:hover { background:#1d4ed8; color:#fff; }
 
-  /* Metrics as soft tiles */
+  /* Metrics */
   [data-testid="stMetric"] {
-    background:#f8fafd; border:1px solid #eaeff6; border-radius:12px; padding:.5rem .85rem;}
-  [data-testid="stMetricValue"] {font-size:1.55rem; font-weight:800;}
-  [data-testid="stMetricLabel"] p {font-size:.8rem; opacity:.85;}
+    background:#f8fafc; border:1px solid #eef2f8; border-radius:14px; padding:.55rem .9rem; }
+  [data-testid="stMetricValue"] { font-size:1.6rem; font-weight:800; }
+  [data-testid="stMetricLabel"] p { font-size:.78rem; opacity:.85; }
 
-  /* Tabs */
-  .stTabs [data-baseweb="tab-list"] {gap:.15rem; border-bottom:1px solid #e7ecf3;}
-  .stTabs [data-baseweb="tab"] {padding:.45rem 1.05rem; font-weight:600; color:#5b6573;}
-  .stTabs [aria-selected="true"] {color:#2563eb;}
+  /* Sub-tabs */
+  .stTabs [data-baseweb="tab-list"] { gap:.15rem; border-bottom:1px solid #e8ecf4; }
+  .stTabs [data-baseweb="tab"] { padding:.45rem 1.05rem; font-weight:600; color:#64748b; }
+  .stTabs [aria-selected="true"] { color:#2563eb; }
 
-  /* File uploader */
-  [data-testid="stFileUploaderDropzone"] {
-    background:#fbfcfe; border:1.5px dashed #c9d4e6; border-radius:14px;}
-
-  /* Expander */
-  [data-testid="stExpander"] details {
-    border:1px solid #e7ecf3 !important; border-radius:12px; background:#fff;}
-
-  hr {border-color:#e7ecf3; margin:.7rem 0;}
-  [data-testid="stHeader"] {background:transparent;}
+  /* Uploader / expander / divider */
+  [data-testid="stFileUploaderDropzone"] { background:#f8fafe; border:1.5px dashed #c6d2e6; border-radius:14px; }
+  [data-testid="stExpander"] details { border:1px solid #e8ecf4 !important; border-radius:13px; background:#fff; }
+  hr { border-color:#e8ecf4; margin:.7rem 0; }
 </style>
 """
 
-# A compact gradient app header shown at the top of the app.
-_APP_HEADER = (
-    '<div style="background:linear-gradient(100deg,#1f3a57,#27405e 60%,#33597e);'
-    'border-radius:14px;padding:1rem 1.3rem;margin-bottom:1rem;color:#fff;">'
-    '<div style="font-size:1.55rem;font-weight:800;letter-spacing:-.02em;">'
-    '🔬 AEG Materials Engineering Tools</div>'
-    '<div style="opacity:.82;font-size:.92rem;margin-top:.15rem;">'
-    'SEM report conversion · lab-report QA · micrograph library · '
-    'incoming-inspection review</div></div>'
+_BRAND = (
+    '<div style="display:flex;align-items:center;gap:.6rem;padding:.4rem .35rem 1rem;">'
+    '<div style="width:40px;height:40px;border-radius:12px;'
+    'background:linear-gradient(135deg,#2563eb,#4f46e5);display:flex;align-items:center;'
+    'justify-content:center;font-size:1.35rem;box-shadow:0 8px 18px rgba(37,99,235,.3);">🔬</div>'
+    '<div><div style="font-weight:800;font-size:1.05rem;color:#0f172a;line-height:1.1;">AEG Tools</div>'
+    '<div style="font-size:.74rem;color:#94a3b8;">Materials Engineering</div></div></div>'
 )
+
+
+def _page_header(icon, title, sub):
+    return (f'<div class="pagehead"><div class="ic">{icon}</div>'
+            f'<div><h2>{title}</h2><div class="sub">{sub}</div></div></div>')
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -746,25 +768,33 @@ def render_iir_tool():
 
 
 # ════════════════════════════════════════════════════════════════════════
-def main():
-    st.set_page_config(page_title="AEG Materials Tools", page_icon="🔬", layout="wide")
-    st.markdown(_PAGE_CSS, unsafe_allow_html=True)
-    st.markdown(_APP_HEADER, unsafe_allow_html=True)
+_TOOLS = [
+    ("🧪", "Lab Report Review", "Automated QA of AEG metallurgical & coating reports",
+     "render_reviewer"),
+    ("🔬", "SEM Converter", "Vendor SEM PDF → formatted Ansaldo Word report",
+     "render_converter"),
+    ("🖼️", "Photo Library", "Browse stored micrographs by alloy", "render_gallery"),
+    ("🛠️", "IIR Review", "Incoming-inspection report consistency QA", "render_iir_tool"),
+]
 
-    tabs = st.tabs(
-        ["🔬 SEM Report Converter", "🧪 Lab Report Review", "🖼️ Photo Library",
-         "🛠️ IIR Review"])
-    # Isolate each tab: a failure in one tool (e.g. an unreachable photo-library
-    # backend) shows a contained message instead of crashing the whole app.
-    for tab, render in zip(tabs, (render_converter, render_reviewer,
-                                  render_gallery, render_iir_tool)):
-        with tab:
-            try:
-                render()
-            except Exception as e:
-                st.error("This tool hit an error and couldn't finish — the other "
-                         "tabs are unaffected.")
-                st.caption(f"{type(e).__name__}: {e}")
+
+def main():
+    st.set_page_config(page_title="AEG Materials Tools", page_icon="🔬",
+                       layout="wide", initial_sidebar_state="expanded")
+    st.markdown(_CSS, unsafe_allow_html=True)
+
+    labels = [f"{ic}  {name}" for ic, name, _, _ in _TOOLS]
+    with st.sidebar:
+        st.markdown(_BRAND, unsafe_allow_html=True)
+        choice = st.radio("nav", labels, label_visibility="collapsed")
+    icon, name, sub, fn_name = _TOOLS[labels.index(choice)]
+
+    st.markdown(_page_header(icon, name, sub), unsafe_allow_html=True)
+    try:
+        globals()[fn_name]()
+    except Exception as e:
+        st.error("This tool hit an error and couldn't finish.")
+        st.caption(f"{type(e).__name__}: {e}")
 
 
 if __name__ == "__main__":
