@@ -20,41 +20,40 @@ def _lib_image(path, drive_id):
 
 
 @st.cache_data(show_spinner=False)
-def _review_and_render(name, data, ocr, faithful=True):
-    """Review a report and build its annotated images, cached on the bytes so
-    re-runs (and the check toggles) don't re-parse or re-render. The annotated
-    view is the pixel-faithful LibreOffice render when available, else the
-    drawn-grid fallback; `mode`/`status` say which (and why)."""
-    rtype, parsed, findings = review_report(name, data, ocr=ocr)
-    annotated, mode, status = None, 'none', ''
-    if faithful:
-        try:
-            annotated, status = report_render.render_report_faithful(
-                data, parsed, findings=findings, filename=name)
-        except TypeError:
-            # Tolerate a stale/cached report_render module on redeploy (older
-            # signature without `findings`); render without the extra legend.
-            try:
-                annotated, status = report_render.render_report_faithful(
-                    data, parsed, filename=name)
-            except Exception as e:
-                status = f'{type(e).__name__}: {e}'
-        except Exception as e:
-            status = f'{type(e).__name__}: {e}'
-        if annotated:
-            mode = 'faithful'
-    if not annotated:
-        try:
-            annotated = report_render.render_report_image(
-                data, parsed, findings, rtype, filename=name)
-        except Exception:
-            annotated = None
-        mode = 'grid' if annotated else 'none'
+def _review(name, data, ocr):
+    """Parse + rule-check one report (fast). Cached on the file bytes."""
+    return review_report(name, data, ocr=ocr)
+
+
+@st.cache_data(show_spinner=False)
+def _grid_and_micros(name, data, ocr):
+    """The instant annotated view: the drawn-grid image + annotated micrographs."""
+    rtype, parsed, findings = _review(name, data, ocr)
     try:
-        micrographs = report_render.annotate_micrographs(data, parsed)
+        grid = report_render.render_report_image(data, parsed, findings, rtype, filename=name)
     except Exception:
-        micrographs = []
-    return rtype, parsed, findings, annotated, micrographs, mode, status
+        grid = None
+    try:
+        micros = report_render.annotate_micrographs(data, parsed)
+    except Exception:
+        micros = []
+    return grid, micros
+
+
+@st.cache_data(show_spinner=False)
+def _faithful_image(name, data, ocr):
+    """The slow pixel-faithful LibreOffice render — built only on demand, so a
+    big report never blocks the review. Returns (png_or_None, status)."""
+    _, parsed, findings = _review(name, data, ocr)
+    try:
+        return report_render.render_report_faithful(data, parsed, findings=findings, filename=name)
+    except TypeError:                       # tolerate a stale report_render on redeploy
+        try:
+            return report_render.render_report_faithful(data, parsed, filename=name)
+        except Exception as e:
+            return None, f'{type(e).__name__}: {e}'
+    except Exception as e:
+        return None, f'{type(e).__name__}: {e}'
 
 
 @st.cache_data(show_spinner=False, ttl=120)
@@ -70,18 +69,34 @@ def _gallery_photos(alloy):
     return photos_for(alloy)
 
 
-# Light polish: a comfortable max width (wider than the old centred column, so the
-# annotated report image is large), tidier metrics, tabs and dividers.
+# Global visual polish — a comfortable max width, calmer type, tidier metrics,
+# tabs, cards, buttons and dividers. Restrained on purpose (it's an engineering tool).
 _PAGE_CSS = """
 <style>
-  .block-container {max-width: 1280px; padding-top: 1.4rem; padding-bottom: 3rem;}
-  [data-testid="stMetricValue"] {font-size: 1.5rem;}
-  [data-testid="stMetricLabel"] p {font-size: .82rem; opacity: .85;}
-  .stTabs [data-baseweb="tab-list"] {gap: .25rem;}
-  .stTabs [data-baseweb="tab"] {padding: .35rem .9rem;}
-  hr {margin: .8rem 0;}
+  .block-container {max-width: 1180px; padding-top: 1.1rem; padding-bottom: 4rem;}
+  h1, h2, h3, h4 {letter-spacing: -.01em;}
+  [data-testid="stMetricValue"] {font-size: 1.55rem; font-weight: 700;}
+  [data-testid="stMetricLabel"] p {font-size: .8rem; opacity: .8;}
+  .stTabs [data-baseweb="tab-list"] {gap: .15rem; border-bottom: 1px solid rgba(130,140,155,.25);}
+  .stTabs [data-baseweb="tab"] {padding: .4rem 1rem; font-weight: 600;}
+  [data-testid="stExpander"] details {border-radius: 10px; border-color: rgba(130,140,155,.25);}
+  [data-testid="stVerticalBlockBorderWrapper"] {border-radius: 12px;}
+  .stButton button, .stDownloadButton button {border-radius: 8px; font-weight: 600;}
+  [data-testid="stFileUploaderDropzone"] {border-radius: 10px;}
+  hr {margin: .7rem 0; opacity: .45;}
 </style>
 """
+
+# A compact gradient app header shown at the top of the app.
+_APP_HEADER = (
+    '<div style="background:linear-gradient(100deg,#1f3a57,#27405e 60%,#33597e);'
+    'border-radius:14px;padding:1rem 1.3rem;margin-bottom:1rem;color:#fff;">'
+    '<div style="font-size:1.55rem;font-weight:800;letter-spacing:-.02em;">'
+    '🔬 AEG Materials Engineering Tools</div>'
+    '<div style="opacity:.82;font-size:.92rem;margin-top:.15rem;">'
+    'SEM report conversion · lab-report QA · micrograph library · '
+    'incoming-inspection review</div></div>'
+)
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -251,23 +266,40 @@ def _render_findings(findings):
     st.markdown('<div>' + ''.join(rows) + '</div>', unsafe_allow_html=True)
 
 
-def _render_annotated(f, annotated, micrographs, mode, status, faithful, rtype, parsed):
-    """The 'Annotated view' sub-tab: report image, micrographs, add-to-library."""
-    if annotated:
-        if mode == 'faithful':
-            cap = ("Pixel-faithful LibreOffice render — flagged cells highlighted and "
-                   "numbered to the legend.")
-        else:
-            cap = "Drawn-grid view — flagged cells boxed and numbered to the legend."
-            if faithful and status:
-                cap += f"  (Pixel-faithful render unavailable: {status}.)"
-        st.image(annotated, caption=cap, width="stretch")
+def _render_annotated(f, rtype, parsed, ocr):
+    """Annotated view: an instant drawn-grid render + annotated micrographs, with
+    the heavy pixel-faithful LibreOffice render available on demand."""
+    data = f.getvalue()
+    grid, micrographs = _grid_and_micros(f.name, data, ocr)
+    if grid:
+        st.image(grid, width="stretch",
+                 caption="Quick annotated view — flagged cells boxed and numbered to the legend.")
         st.download_button(
-            "⬇ Download annotated report (.png)", data=annotated,
+            "⬇ Download annotated view (.png)", data=grid,
             file_name=f"{Path(f.name).stem}_annotated.png",
-            mime="image/png", key=f"annpng_{f.name}")
+            mime="image/png", key=f"gridpng_{f.name}")
     elif rtype in ('metallurgical', 'coating'):
         st.caption("Annotated view unavailable (image libraries not installed).")
+
+    # The pixel-faithful render runs LibreOffice (seconds, more on a big report),
+    # so build it only when asked — the review above is already on screen.
+    if report_render.libreoffice_available():
+        fkey = f"faithful_{f.name}"
+        if st.button("🖼 Render pixel-faithful view  ·  exact workbook look (slower)",
+                     key=f"fbtn_{f.name}"):
+            st.session_state[fkey] = True
+        if st.session_state.get(fkey):
+            with st.spinner("Rendering the exact workbook with LibreOffice…"):
+                png, status = _faithful_image(f.name, data, ocr)
+            if png:
+                st.image(png, width="stretch",
+                         caption="Pixel-faithful render — original fonts, layout and embedded micrographs.")
+                st.download_button(
+                    "⬇ Download pixel-faithful (.png)", data=png,
+                    file_name=f"{Path(f.name).stem}_faithful.png",
+                    mime="image/png", key=f"fpng_{f.name}")
+            else:
+                st.caption(f"Pixel-faithful render unavailable — {status}")
 
     if micrographs:
         st.markdown("**Annotated micrographs** — legend / scale-bar regions boxed; "
@@ -280,7 +312,7 @@ def _render_annotated(f, annotated, micrographs, mode, status, faithful, rtype, 
         st.divider()
         if st.button("📁 Add this report's micrographs to the library",
                      key=f"add_{f.name}"):
-            added = add_to_library(f.name, f.getvalue(), parsed, rtype)
+            added = add_to_library(f.name, data, parsed, rtype)
             if added:
                 _gallery_counts.clear()      # let the gallery reflect the add now
                 _gallery_photos.clear()
@@ -360,21 +392,12 @@ def render_reviewer():
         key="lab_files",
     )
 
-    oc1, oc2 = st.columns(2)
-    ocr = oc1.checkbox(
+    ocr = st.checkbox(
         "🔍 Analyse micrographs (legends, etch, thickness)",
         value=True,
         help="Reads each micrograph's burned-in legend (magnification / scale), gauges "
              "etched-vs-low-contrast, and reads any burned-in thickness measurements — "
              "cross-checking against the captions and comment. Requires the Tesseract OCR engine.",
-    )
-    faithful = oc2.checkbox(
-        "🖼 Pixel-faithful report image (LibreOffice)",
-        value=True,
-        help="Renders the real workbook with LibreOffice — original fonts, column widths, "
-             "borders and embedded micrographs — and overlays the flagged cells. Falls back "
-             "to a fast drawn grid when LibreOffice isn't available (the first render of a "
-             "report can take a few seconds).",
     )
 
     if not files:
@@ -384,8 +407,7 @@ def render_reviewer():
     for f in files:
         try:
             with st.spinner(f"Reviewing {f.name}…"):
-                rtype, parsed, findings, annotated, micrographs, mode, status = \
-                    _review_and_render(f.name, f.getvalue(), ocr, faithful)
+                rtype, parsed, findings = _review(f.name, f.getvalue(), ocr)
         except Exception as e:
             st.error(f"Could not read **{f.name}** — {e}")
             continue
@@ -425,8 +447,7 @@ def render_reviewer():
                     unsafe_allow_html=True)
                 _render_findings(findings)
             with atab:
-                _render_annotated(f, annotated, micrographs, mode, status,
-                                  faithful, rtype, parsed)
+                _render_annotated(f, rtype, parsed, ocr)
             with dtab:
                 _render_parsed(rtype, parsed)
 
@@ -690,7 +711,7 @@ def render_iir_tool():
 def main():
     st.set_page_config(page_title="AEG Materials Tools", page_icon="🔬", layout="wide")
     st.markdown(_PAGE_CSS, unsafe_allow_html=True)
-    st.title("AEG Materials Engineering Tools")
+    st.markdown(_APP_HEADER, unsafe_allow_html=True)
 
     tabs = st.tabs(
         ["🔬 SEM Report Converter", "🧪 Lab Report Review", "🖼️ Photo Library",
