@@ -294,13 +294,19 @@ def _sample(ws):
     return out, loc
 
 
+def _hardness_unit(raw):
+    """Hardness scale named in a cell (HRC / HV / HBW / HRB / …), or None."""
+    m = re.search(r'\b(HRC|HRB|HRA|HV|HBW|HB|HK)\b', str(raw or ''), re.I)
+    return m.group(1).upper() if m else None
+
+
 def _hardness(ws):
     out, loc = {}, {}
     for key, pat in (('pre', r'Pre-?\s*Solution'), ('post', r'Post-?\s*Solution')):
         lbl = _find(ws, pat)
         if lbl:
             raw, vloc = _value_right_loc(ws, *lbl)
-            out[key] = {'raw': raw, 'value': _num(raw)}
+            out[key] = {'raw': raw, 'value': _num(raw), 'unit': _hardness_unit(raw)}
             loc[key] = {'label': lbl, 'value': vloc}
     return out, loc
 
@@ -594,14 +600,29 @@ def _review_hardness(hardness, material):
         findings.append(('warning', 'Hardness', 'Hardness section present but no values parsed.'))
         return findings
 
-    # Real check: solution treatment should soften the material (post ≤ pre).
-    if pre is not None and post is not None and post > pre + 0.5:
+    # Determine the scale: explicit unit from a cell, else inferred (HRC tops out
+    # near 70; a bigger number is HV/HBW). This stops HV microhardness (e.g. 420)
+    # being compared to — and flagged against — the HRC reference.
+    vals = [v for v in (pre, post) if v is not None]
+    units = {hardness.get(k, {}).get('unit') for k in ('pre', 'post')} - {None}
+    unit = next(iter(units)) if len(units) == 1 else None
+    is_hrc = (unit == 'HRC') or (unit is None and all(v <= 72 for v in vals))
+    ustr = unit or ('HRC' if is_hrc else 'HV')
+
+    # Solution treatment should soften the material (post ≤ pre) — scale-agnostic.
+    # ±2 guard band so measurement scatter doesn't trip a false warning.
+    if pre is not None and post is not None and post > pre + 2:
         findings.append(('warning', 'Hardness',
-                         f'Post-solution hardness ({post:g} HRC) exceeds pre-solution '
-                         f'({pre:g} HRC) — solution treatment normally softens the material.'))
+                         f'Post-solution hardness ({post:g} {ustr}) exceeds pre-solution '
+                         f'({pre:g} {ustr}) — solution treatment normally softens the material.'))
 
     ref = HARDNESS_REF.get(_alloy_key(material))
-    if ref:
+    if not is_hrc:
+        parts = [f'{k}={v["value"]:g}' for k, v in hardness.items() if v.get('value') is not None]
+        findings.append(('info', 'Hardness',
+                         f'Hardness recorded in {ustr}: {", ".join(parts)} — not compared '
+                         f'to the HRC reference.'))
+    elif ref:
         lo, hi = ref['hrc']
         note = (' ' + ref['note']) if ref['note'] else ''
         findings.append(('info', 'Hardness',
@@ -625,7 +646,7 @@ def _review_hardness(hardness, material):
 
     if not any(s == 'warning' for s, _, _ in findings):
         parts = [f'{k}={v["value"]:g}' for k, v in hardness.items() if v.get('value') is not None]
-        findings.append(('pass', 'Hardness', f'Hardness values recorded: {", ".join(parts)} HRC.'))
+        findings.append(('pass', 'Hardness', f'Hardness values recorded: {", ".join(parts)} {ustr}.'))
     return findings
 
 
@@ -878,8 +899,13 @@ def parse_coating(wb, media=0):
         return data
 
     hrow = meas_loc[0]
-    meas_cols = list(range(meas_loc[1], avg_loc[1]))     # measurement value columns
     min_col, max_col = min_loc[1], max_loc[1]
+    # Measurement value columns run from 'Measurements' up to the first summary
+    # column (Average / MIN / MAX), and never include MIN/MAX/Average themselves
+    # — otherwise a MIN/MAX in that span gets range-checked as a measurement.
+    rights = [c for c in (avg_loc[1], min_col, max_col) if c > meas_loc[1]]
+    right_bound = min(rights) if rights else aws.max_column + 1
+    meas_cols = [c for c in range(meas_loc[1], right_bound) if c not in (min_col, max_col)]
 
     cur_min = cur_max = None
     for r in range(hrow + 1, aws.max_row + 1):
