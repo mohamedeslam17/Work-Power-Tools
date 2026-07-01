@@ -169,19 +169,23 @@ def _image_anchors_per_sheet(path, sheetnames):
             ordered.append((name, sf))
 
         for name, sf in ordered:
-            base = os.path.basename(sf)
-            relpath = f'xl/worksheets/_rels/{base}.rels'
-            if relpath not in names:
+            try:            # per-sheet — a single malformed drawing must not
+                            # abort the walk and leave every later sheet at 0
+                base = os.path.basename(sf)
+                relpath = f'xl/worksheets/_rels/{base}.rels'
+                if relpath not in names:
+                    continue
+                srel = z.read(relpath).decode('utf-8', 'ignore')
+                dm = re.search(r'Target="([^"]*drawing\d+\.xml)"', srel)
+                if not dm:
+                    continue
+                draw = 'xl/drawings/' + os.path.basename(dm.group(1))
+                if draw not in names:
+                    continue
+                dxml = z.read(draw).decode('utf-8', 'ignore')
+                result[name] = len(re.findall(r'<xdr:pic\b', dxml))
+            except Exception:
                 continue
-            srel = z.read(relpath).decode('utf-8', 'ignore')
-            dm = re.search(r'Target="([^"]*drawing\d+\.xml)"', srel)
-            if not dm:
-                continue
-            draw = 'xl/drawings/' + os.path.basename(dm.group(1))
-            if draw not in names:
-                continue
-            dxml = z.read(draw).decode('utf-8', 'ignore')
-            result[name] = len(re.findall(r'<xdr:pic\b', dxml))
         z.close()
     except Exception:
         pass
@@ -383,8 +387,12 @@ def parse_iir(path):
                 rp['rows'] += 1
                 for k in ('required', 'received', 'scrap', 'reconditionable'):
                     val = _num(recv.cell(r, idx[k]).value) if idx[k] else None
-                    if val:
+                    if val is not None:            # 'if val' dropped legitimate 0 counts
                         rp[k] += val
+    # Part tallies are whole numbers — a stray '5.0' cell made the totals floats
+    # (shown as '33.0' and fragile in the quantity checks). Coerce to int.
+    for k in ('required', 'received', 'scrap', 'reconditionable'):
+        rp[k] = int(round(rp[k]))
     data['received_parts'] = rp
 
     # ── serial-number protocol (all "Serial Number*" sheets) ─────────────────
