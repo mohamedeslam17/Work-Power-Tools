@@ -89,12 +89,17 @@ def _put(path, content_bytes, message, sha=None):
 def _read_index():
     r = _get(f"{base()}/{_INDEX_NAME}")
     if r is None:
-        return None, []
+        return None, []                     # index absent — safe to create a new one
     j = r.json()
     try:
         return j.get('sha'), json.loads(base64.b64decode(j['content']).decode('utf-8'))
-    except Exception:
-        return j.get('sha'), []
+    except Exception as e:
+        # The index exists but couldn't be read/parsed. Do NOT return an empty
+        # list — add_records would then commit it over the real index and wipe
+        # the whole library. Refuse instead.
+        raise RuntimeError(
+            f"photo-library index {base()}/{_INDEX_NAME} exists but is unreadable "
+            f"({type(e).__name__}: {e}); refusing to overwrite it and lose the library.")
 
 
 def add_records(records):

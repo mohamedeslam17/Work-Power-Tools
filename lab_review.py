@@ -200,13 +200,27 @@ def _is_placeholder(v):
 
 
 def _num(v):
-    """Parse a float from a cell that may carry units/symbols; else None."""
+    """Parse a float from a cell that may carry units/symbols. Handles both the
+    English '12.5' / '1,234.56' and the European '12,5' / '1.234,56' forms
+    (common on Italian-lab reports); returns None when there's no number."""
     if v is None:
         return None
     if isinstance(v, (int, float)):
         return float(v)
-    m = re.search(r'-?\d+(?:\.\d+)?', str(v))
-    return float(m.group()) if m else None
+    m = re.search(r'-?\d[\d.,  ]*\d|-?\d', str(v))
+    if not m:
+        return None
+    s = re.sub(r'[ \s]', '', m.group())     # drop spaces / non-breaking spaces
+    # The decimal separator is whichever of '.' / ',' appears LAST; the other is
+    # a thousands grouper. (No separator ⇒ plain integer.)
+    if s.rfind(',') > s.rfind('.'):
+        s = s.replace('.', '').replace(',', '.')  # European: comma is the decimal
+    else:
+        s = s.replace(',', '')                    # English: comma groups thousands
+    try:
+        return float(s)
+    except ValueError:
+        return None
 
 
 # ── Report-type detection ─────────────────────────────────────────────────
@@ -708,8 +722,11 @@ def image_captions(data, pictures):
     caption count (caller falls back to magnification matching).
     """
     order = _anchor_order(data)
-    caps = [c for _, c in sorted((int(m.group(1)), c) for l, c in (pictures or [])
-                                 for m in [_PICNUM.search(l or '')] if m)]
+    numbered = [(int(m.group(1)), c) for l, c in (pictures or [])
+                for m in [_PICNUM.search(l or '')] if m]
+    # None-safe key: duplicate picture numbers with a missing caption would make
+    # Python compare None to str and raise (crashing the whole review).
+    caps = [c for _, c in sorted(numbered, key=lambda t: (t[0], t[1] or ''))]
     if not order or len(order) != len(caps):
         return {}
     return dict(zip(order, caps))
@@ -722,8 +739,9 @@ def _picture_image_pairs(data, pictures, images):
     embedded-micrograph count (so the pairing is trustworthy), else [].
     """
     order = _anchor_order(data)
-    pics = sorted((int(m.group(1)), l, c) for l, c in (pictures or [])
-                  for m in [_PICNUM.search(l or '')] if m)
+    pics = sorted(((int(m.group(1)), l, c) for l, c in (pictures or [])
+                   for m in [_PICNUM.search(l or '')] if m),
+                  key=lambda t: (t[0], t[1] or '', t[2] or ''))   # None-safe
     if not order or len(order) != len(pics):
         return []
     by_name = {im.get('image'): im for im in (images or [])}

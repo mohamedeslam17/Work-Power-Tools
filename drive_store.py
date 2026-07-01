@@ -113,12 +113,16 @@ def _root_id(svc):
 def _read_index(svc, root):
     fid = _find_child(svc, _INDEX_NAME, root)
     if not fid:
-        return None, []
+        return None, []                     # index absent — safe to create a new one
     try:
         raw = svc.files().get_media(fileId=fid).execute()
         return fid, json.loads(raw.decode('utf-8'))
-    except Exception:
-        return fid, []
+    except Exception as e:
+        # The index exists but couldn't be read. Do NOT return an empty list —
+        # add_records would overwrite the real index and orphan every image.
+        raise RuntimeError(
+            f"photo-library index in Drive exists but is unreadable "
+            f"({type(e).__name__}: {e}); refusing to overwrite it and lose the library.")
 
 
 def _write_index(svc, root, index, fid=None):

@@ -220,7 +220,9 @@ def render_converter():
         with st.spinner(f"Processing {len(vendor_files)} PDF(s)..."):
             for vendor_file in vendor_files:
                 with tempfile.TemporaryDirectory() as tmp:
-                    vendor_path = os.path.join(tmp, vendor_file.name)
+                    # Fixed temp name — never join an upload's raw name to a path
+                    # (a crafted "../.." name would be a path-traversal write).
+                    vendor_path = os.path.join(tmp, "vendor.pdf")
                     with open(vendor_path, "wb") as f:
                         f.write(vendor_file.getvalue())
 
@@ -655,8 +657,10 @@ def render_iir_tool():
         parsed, errors = [], []
         with st.spinner(f"Reading {len(iir_files)} report(s)..."):
             with tempfile.TemporaryDirectory() as tmp:
-                for f in iir_files:
-                    path = os.path.join(tmp, f.name)
+                for i, f in enumerate(iir_files):
+                    # Index-prefixed fixed name — never join the upload's raw name
+                    # (path-traversal safety); f.name is kept only as a label.
+                    path = os.path.join(tmp, f"iir_{i}.xlsx")
                     with open(path, "wb") as fh:
                         fh.write(f.getvalue())
                     try:
