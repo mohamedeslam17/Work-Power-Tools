@@ -1,16 +1,29 @@
 import streamlit as st
 import tempfile
 import os
+import io
+import html as _html
 from pathlib import Path
+from openpyxl.utils import get_column_letter
 from sem_convert import parse, extract_figures, build
 from lab_review import review_report, summarize
 try:
     from lab_review import HT_ORDER
 except ImportError:   # tolerate a stale/cached lab_review module on redeploy
     HT_ORDER = ['As-received', 'Post-solution', 'Post stress-relief', 'Post-ageing', 'Unspecified']
+try:
+    from lab_review import COMP_WARN_REL, COMP_CRIT_REL
+except Exception:     # display-only tolerance hint; authoritative logic lives in lab_review
+    COMP_WARN_REL, COMP_CRIT_REL = 10.0, 25.0
 import report_render
+import iir_review
 from photo_lib import (add_to_library, alloy_counts, photos_for,
                        get_image_bytes, backend_name, LIBRARY_DIR)
+
+try:
+    import pandas as pd
+except Exception:     # pandas ships with Streamlit; guard just in case
+    pd = None
 
 
 @st.cache_data(show_spinner=False)
@@ -54,6 +67,29 @@ def _faithful_image(name, data, ocr):
             return None, f'{type(e).__name__}: {e}'
     except Exception as e:
         return None, f'{type(e).__name__}: {e}'
+
+
+@st.cache_data(show_spinner=False)
+def _parse_iir(name, data):
+    """Parse one IIR workbook, cached on the file bytes so tweaking the check
+    severities re-checks instantly without re-reading the file."""
+    with tempfile.TemporaryDirectory() as tmp:
+        # Fixed temp name — never join the upload's raw name to a path.
+        path = os.path.join(tmp, "iir.xlsx")
+        with open(path, "wb") as fh:
+            fh.write(data)
+        return iir_review.parse_iir(path)
+
+
+@st.cache_data(show_spinner=False)
+def _ocr_available():
+    """Whether the Tesseract engine is actually installed at runtime."""
+    try:
+        import pytesseract
+        pytesseract.get_tesseract_version()
+        return True
+    except Exception:
+        return False
 
 
 @st.cache_data(show_spinner=False, ttl=120)
@@ -141,6 +177,13 @@ _CSS = """
   [data-testid="stFileUploaderDropzone"] { background:#f8fafe; border:1.5px dashed #c6d2e6; border-radius:14px; }
   [data-testid="stExpander"] details { border:1px solid #e8ecf4 !important; border-radius:13px; background:#fff; }
   hr { border-color:#e8ecf4; margin:.7rem 0; }
+
+  /* Filter pills / segmented control */
+  [data-testid="stPills"] button, [data-testid="stButtonGroup"] button {
+    border-radius:999px !important; font-weight:600 !important; }
+  /* Dataframes read as part of the card */
+  [data-testid="stDataFrame"] { border-radius:12px; }
+  [data-testid="stPopover"] button { border-radius:11px; font-weight:600; }
 </style>
 """
 
@@ -157,6 +200,46 @@ _BRAND = (
 def _page_header(icon, title, sub):
     return (f'<div class="pagehead"><div class="ic">{icon}</div>'
             f'<div><h2>{title}</h2><div class="sub">{sub}</div></div></div>')
+
+
+# ── Shared UI helpers (used by both revamped tools) ──────────────────────
+def _chip(label, color, tint, icon=""):
+    """A small rounded status pill (returns HTML)."""
+    ic = f'{icon} ' if icon else ''
+    return (f'<span style="display:inline-flex;align-items:center;gap:.3rem;'
+            f'padding:.18rem .62rem;border-radius:999px;background:{tint};color:{color};'
+            f'font-weight:700;font-size:.78rem;border:1px solid {color}33;">{ic}{label}</span>')
+
+
+def _chips(items):
+    """items: list of (label, color, tint, icon) → one inline chip row."""
+    inner = ' '.join(_chip(l, c, t, i) for l, c, t, i in items)
+    return f'<div style="display:flex;gap:.45rem;flex-wrap:wrap;margin:.15rem 0 .5rem;">{inner}</div>'
+
+
+def _sevbar(segments):
+    """A slim proportional severity bar. segments: list of (count, color)."""
+    total = sum(c for c, _ in segments) or 1
+    cells = ''.join(
+        f'<div style="width:{c / total * 100:.4f}%;background:{col};"></div>'
+        for c, col in segments if c)
+    return ('<div style="display:flex;height:8px;width:100%;border-radius:999px;'
+            f'overflow:hidden;background:#eef2f8;margin:.2rem 0 .6rem;">{cells}</div>')
+
+
+def _finding_rows_html(rows):
+    """rows: list of (color, tint, label, category, message) → full-wrap colored rows."""
+    out = []
+    for color, tint, label, cat, msg in rows:
+        out.append(
+            f'<div style="display:flex;align-items:baseline;gap:.6rem;'
+            f'padding:.45rem .8rem;margin:.32rem 0;border-left:4px solid {color};'
+            f'background:{tint};border-radius:8px;">'
+            f'<span style="color:{color};font-weight:700;font-size:.68rem;'
+            f'letter-spacing:.04em;text-transform:uppercase;min-width:54px;">{_html.escape(label)}</span>'
+            f'<span style="line-height:1.45;color:#28323f;">'
+            f'<b>{_html.escape(str(cat))}</b> — {_html.escape(str(msg))}</span></div>')
+    return '<div>' + ''.join(out) + '</div>'
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -292,57 +375,21 @@ def render_converter():
 # ════════════════════════════════════════════════════════════════════════
 # TAB 2 — Lab Report Review (rule-based QA on AEG Excel reports)
 # ════════════════════════════════════════════════════════════════════════
-# severity → (streamlit render fn, icon, label)
-_SEV = {
-    'critical': ('error',   '🔴', 'Fail'),
-    'warning':  ('warning', '🟠', 'Warning'),
-    'info':     ('info',    '🔵', 'Note'),
-    'pass':     ('success', '🟢', 'Pass'),
-}
+# severity → (accent colour, light tint, label)
 _SEV_ORDER = ['critical', 'warning', 'info', 'pass']
-
-# severity → (accent colour, light tint, label) for the compact HTML findings list
 _SEV_STYLE = {
     'critical': ('#d62d38', '#fdecee', 'Fail'),
     'warning':  ('#e07b16', '#fdf2e3', 'Warning'),
     'info':     ('#1a6ed6', '#e9f1fc', 'Note'),
     'pass':     ('#1f9e50', '#e8f6ee', 'Pass'),
 }
-
-
-def _findings_html(items, sev):
-    """Compact colour-coded rows for one severity (items = [(category, msg), …])."""
-    import html as _html
-    color, tint, label = _SEV_STYLE[sev]
-    rows = [
-        f'<div style="display:flex;align-items:baseline;gap:.6rem;'
-        f'padding:.42rem .75rem;margin:.3rem 0;border-left:4px solid {color};'
-        f'background:{tint};border-radius:8px;">'
-        f'<span style="color:{color};font-weight:700;font-size:.7rem;letter-spacing:.03em;'
-        f'text-transform:uppercase;min-width:56px;">{label}</span>'
-        f'<span style="line-height:1.4;color:#28323f;"><b>{_html.escape(cat)}</b> — '
-        f'{_html.escape(msg)}</span></div>'
-        for cat, msg in items]
-    return '<div>' + ''.join(rows) + '</div>'
-
-
-def _render_findings(findings):
-    """Triage: fails + warnings up front; notes and passes tucked behind
-    disclosures so the things that need attention aren't buried."""
-    by = {s: [(c, m) for ss, c, m in findings if ss == s] for s in _SEV_ORDER}
-    if by['critical']:
-        st.markdown(_findings_html(by['critical'], 'critical'), unsafe_allow_html=True)
-    if by['warning']:
-        st.markdown(_findings_html(by['warning'], 'warning'), unsafe_allow_html=True)
-    if not by['critical'] and not by['warning']:
-        st.markdown(_findings_html([('Result', 'No fails or warnings.')], 'pass'),
-                    unsafe_allow_html=True)
-    if by['info']:
-        with st.expander(f"🔵  {len(by['info'])} note{'s' if len(by['info']) != 1 else ''}"):
-            st.markdown(_findings_html(by['info'], 'info'), unsafe_allow_html=True)
-    if by['pass']:
-        with st.expander(f"🟢  {len(by['pass'])} check{'s' if len(by['pass']) != 1 else ''} passed"):
-            st.markdown(_findings_html(by['pass'], 'pass'), unsafe_allow_html=True)
+_SEV_LABELS = {'critical': 'Fail', 'warning': 'Warning', 'info': 'Note', 'pass': 'Pass'}
+_LAB_EMOJI = {'critical': '🔴', 'warning': '🟠', 'info': '🔵', 'pass': '🟢'}
+_LAB_VERDICT = {
+    'critical': ('#d62d38', '#fdecee', 'Needs attention'),
+    'warning':  ('#e07b16', '#fdf2e3', 'Review recommended'),
+    'pass':     ('#1f9e50', '#e8f6ee', 'Looks good'),
+}
 
 
 def _key_facts(rtype, parsed):
@@ -354,45 +401,125 @@ def _key_facts(rtype, parsed):
     elif rtype == 'coating':
         bits = [('Report', parsed.get('report_no')), ('Component', parsed.get('component'))]
     else:
-        return f"Detected report type: **{rtype}**"
+        return ""
     shown = [f"{k}: **{v}**" for k, v in bits if v and str(v).strip()]
-    return f"*{rtype}*  ·  " + "  ·  ".join(shown) if shown else f"*{rtype}*"
+    return "  ·  ".join(shown)
 
 
-def _render_annotated(f, rtype, parsed, ocr):
-    """Annotated view: an instant drawn-grid render + annotated micrographs, with
-    the heavy pixel-faithful LibreOffice render available on demand."""
+def _lab_rows(findings):
+    """Lab (sev, cat, msg) tuples → styled rows, sorted by severity."""
+    rank = {s: i for i, s in enumerate(_SEV_ORDER)}
+    out = []
+    for sev, cat, msg in sorted(findings, key=lambda t: rank.get(t[0], 9)):
+        color, tint, label = _SEV_STYLE.get(sev, ('#64748b', '#f1f5f9', sev))
+        out.append((color, tint, label, cat, msg))
+    return out
+
+
+def _lab_findings_csv(findings):
+    """Findings → CSV bytes (Severity / Category / Finding)."""
+    rows = [{'Severity': _SEV_LABELS.get(s, s), 'Category': c, 'Finding': m}
+            for s, c, m in findings]
+    if pd is not None:
+        return pd.DataFrame(rows).to_csv(index=False).encode('utf-8')
+    import csv
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=['Severity', 'Category', 'Finding'])
+    w.writeheader()
+    w.writerows(rows)
+    return buf.getvalue().encode('utf-8')
+
+
+def _lab_findings_tab(findings, name):
+    """Filterable findings: severity pills + text search, full-wrap colored rows."""
+    if not findings:
+        st.caption("No findings.")
+        return
+    counts = {s: sum(1 for x, _, _ in findings if x == s) for s in _SEV_ORDER}
+    sev_opts = [s for s in _SEV_ORDER if counts[s]]
+    default_sev = [s for s in ('critical', 'warning', 'info') if counts[s]] or sev_opts
+
+    c1, c2 = st.columns([3, 2])
+    with c1:
+        picked = st.pills(
+            "Severity", sev_opts, selection_mode="multi", default=default_sev,
+            format_func=lambda s: f"{_LAB_EMOJI[s]} {_SEV_STYLE[s][2]} ({counts[s]})",
+            label_visibility="collapsed", key=f"labsev_{name}")
+    query = c2.text_input("Search findings", key=f"labq_{name}",
+                          placeholder="🔍 search findings…", label_visibility="collapsed")
+
+    picked = picked or sev_opts
+    q = (query or "").lower().strip()
+    shown = [(s, c, m) for s, c, m in findings
+             if s in picked and (not q or q in f"{c} {m}".lower())]
+    if not shown:
+        st.caption("No findings match the filter.")
+        return
+    st.markdown(_finding_rows_html(_lab_rows(shown)), unsafe_allow_html=True)
+
+
+def _flagged_cells(parsed):
+    """Cell-anchored findings (from collect_highlights) as spreadsheet refs."""
+    try:
+        from lab_review import collect_highlights
+        hi = collect_highlights(parsed)
+    except Exception:
+        return
+    if not hi:
+        return
+    rows = []
+    for h in hi:
+        cell = h.get('cell') or (None, None)
+        r, c = (cell + (None, None))[:2]
+        ref = f"{get_column_letter(c)}{r}" if (r and c) else "—"
+        rows.append({'Cell': ref,
+                     'Severity': _SEV_LABELS.get(h.get('severity'), h.get('severity') or ''),
+                     'Category': h.get('category', ''),
+                     'Note': h.get('note', '')})
+    with st.expander(f"📍 Flagged cells ({len(rows)})"):
+        st.caption("Where each cell-anchored finding sits in the workbook — matches the "
+                   "boxed & numbered cells in the annotated view.")
+        st.dataframe(rows, width="stretch", hide_index=True,
+                     column_config={"Note": st.column_config.TextColumn(width="large")})
+
+
+def _render_annotated(r, ocr):
+    """Annotated view: instant drawn-grid render + annotated micrographs, with the
+    heavy pixel-faithful LibreOffice render available on demand."""
+    f, rtype, parsed = r['f'], r['rtype'], r['parsed']
     data = f.getvalue()
     grid, micrographs = _grid_and_micros(f.name, data, ocr)
     if grid:
         st.image(grid, width="stretch",
                  caption="Quick annotated view — flagged cells boxed and numbered to the legend.")
         st.download_button(
-            "⬇ Download annotated view (.png)", data=grid,
+            "⬇ Annotated view (.png)", data=grid,
             file_name=f"{Path(f.name).stem}_annotated.png",
             mime="image/png", key=f"gridpng_{f.name}")
     elif rtype in ('metallurgical', 'coating'):
         st.caption("Annotated view unavailable (image libraries not installed).")
 
     # The pixel-faithful render runs LibreOffice (seconds, more on a big report),
-    # so build it only when asked — the review above is already on screen.
+    # so build it only when asked — the quick view above is already on screen.
     if report_render.libreoffice_available():
         fkey = f"faithful_{f.name}"
-        if st.button("🖼 Render pixel-faithful view  ·  exact workbook look (slower)",
+        if st.button("🖼 Render pixel-faithful view — exact workbook look (slower)",
                      key=f"fbtn_{f.name}"):
             st.session_state[fkey] = True
         if st.session_state.get(fkey):
-            with st.spinner("Rendering the exact workbook with LibreOffice…"):
-                png, status = _faithful_image(f.name, data, ocr)
+            with st.status("Rendering the exact workbook with LibreOffice…", expanded=False) as status:
+                png, stat = _faithful_image(f.name, data, ocr)
+                status.update(
+                    label=("Pixel-faithful render ready" if png
+                           else f"Pixel-faithful render unavailable — {stat}"),
+                    state=("complete" if png else "error"))
             if png:
                 st.image(png, width="stretch",
                          caption="Pixel-faithful render — original fonts, layout and embedded micrographs.")
                 st.download_button(
-                    "⬇ Download pixel-faithful (.png)", data=png,
+                    "⬇ Pixel-faithful (.png)", data=png,
                     file_name=f"{Path(f.name).stem}_faithful.png",
                     mime="image/png", key=f"fpng_{f.name}")
-            else:
-                st.caption(f"Pixel-faithful render unavailable — {status}")
 
     if micrographs:
         st.markdown("**Annotated micrographs** — legend / scale-bar regions boxed; "
@@ -400,17 +527,6 @@ def _render_annotated(f, rtype, parsed, ocr):
         mcols = st.columns(3)
         for i, (mname, mbytes, mcap) in enumerate(micrographs):
             mcols[i % 3].image(mbytes, caption=mcap, width="stretch")
-
-    if rtype in ('metallurgical', 'coating'):
-        st.divider()
-        if st.button("📁 Add this report's micrographs to the library",
-                     key=f"add_{f.name}"):
-            added = add_to_library(f.name, data, parsed, rtype)
-            if added:
-                _gallery_counts.clear()      # let the gallery reflect the add now
-                _gallery_photos.clear()
-            st.success(f"Added {added} micrograph(s) to the library."
-                       if added else "No new micrographs added (already in library).")
 
 
 def _render_parsed(rtype, parsed):
@@ -436,14 +552,25 @@ def _render_parsed(rtype, parsed):
             rows = []
             for el in sorted(set(nom) | set(act)):
                 n, a = nom.get(el), act.get(el)
-                dev = f"{(a - n) / abs(n) * 100:+.0f}%" if (n not in (None, 0) and a is not None) else "—"
+                if n not in (None, 0) and a is not None:
+                    dev_pct = (a - n) / abs(n) * 100
+                    dev = f"{dev_pct:+.0f}%"
+                    flag = ("🔴" if abs(dev_pct) >= COMP_CRIT_REL
+                            else "🟠" if abs(dev_pct) >= COMP_WARN_REL else "")
+                else:
+                    dev, flag = "—", ""
                 rows.append({
+                    "": flag,
                     "Element": el,
                     "Nominal": f"{n:g}" if n is not None else "—",
                     "Actual":  f"{a:g}" if a is not None else "—",
                     "Δ":       dev,
                 })
-            st.table(rows)
+            st.dataframe(rows, width="stretch", hide_index=True,
+                         column_config={"": st.column_config.TextColumn(width="small")})
+            st.caption("Colour is an at-a-glance deviation hint (🟠 ≥ %g%%, 🔴 ≥ %g%%); "
+                       "the **Findings** tab holds the authoritative result."
+                       % (COMP_WARN_REL, COMP_CRIT_REL))
 
     elif rtype == 'coating':
         st.write(f"**Report No.:** {parsed.get('report_no') or '—'}")
@@ -453,97 +580,165 @@ def _render_parsed(rtype, parsed):
             lo, hi = rows[0].get('min'), rows[0].get('max')
             if lo is not None and hi is not None:
                 st.write(f"**Design limit:** {lo:g} – {hi:g} mm")
-            st.table([
+            st.dataframe([
                 {"Row": e['row'], "Measurements (mm)": ", ".join(f"{v:g}" for v in e['values'])}
                 for e in rows
-            ])
+            ], width="stretch", hide_index=True,
+                column_config={"Measurements (mm)": st.column_config.TextColumn(width="large")})
 
     legends = parsed.get('legends') or []
     if legends:
         st.markdown("**Micrograph legends — read from the images**")
-        st.table([
+        st.dataframe([
             {"Image": l.get('image', '—'), "Magnification": l.get('mag', '—'),
              "Scale": l.get('scale', '—'), "Legend ID": l.get('id', '—')}
             for l in legends
-        ])
+        ], width="stretch", hide_index=True)
+
+    _flagged_cells(parsed)
+
+
+def _render_lab_detail(r, ocr):
+    """One report's full detail card: header + actions, verdict bar, metrics, tabs."""
+    with st.container(border=True):
+        head, actions = st.columns([3, 2])
+        with head:
+            st.markdown(f"#### {_LAB_EMOJI[r['verdict']]} {r['name']}")
+            color, tint, vlabel = _LAB_VERDICT[r['verdict']]
+            type_lbl = r['rtype'].capitalize() if r['rtype'] != 'unknown' else 'Unknown type'
+            st.markdown(
+                _chips([(vlabel, color, tint, _LAB_EMOJI[r['verdict']]),
+                        (type_lbl, '#475569', '#eef2f6', '')]),
+                unsafe_allow_html=True)
+            if r['facts']:
+                st.caption(r['facts'])
+        with actions:
+            b1, b2 = st.columns(2)
+            if r['rtype'] in ('metallurgical', 'coating'):
+                if b1.button("📁 Add to library", key=f"add_{r['name']}", width="stretch"):
+                    added = add_to_library(r['name'], r['f'].getvalue(), r['parsed'], r['rtype'])
+                    if added:
+                        _gallery_counts.clear()
+                        _gallery_photos.clear()
+                    st.toast(f"Added {added} micrograph(s) to the library." if added
+                             else "No new micrographs (already in library).")
+            b2.download_button(
+                "⬇ Findings (.csv)", data=_lab_findings_csv(r['findings']),
+                file_name=f"{Path(r['name']).stem}_findings.csv", mime="text/csv",
+                key=f"labcsv_{r['name']}", width="stretch")
+
+        if r['rtype'] == 'unknown':
+            st.warning("This workbook didn't match a metallurgical or coating layout, so only "
+                       "a limited review ran. Check it's an AEG lab report `.xlsx`.")
+
+        c = r['counts']
+        st.markdown(_sevbar([(c['critical'], '#d62d38'), (c['warning'], '#e07b16'),
+                             (c['info'], '#1a6ed6'), (c['pass'], '#1f9e50')]),
+                    unsafe_allow_html=True)
+        m = st.columns(4)
+        m[0].metric("🔴 Fail", c['critical'])
+        m[1].metric("🟠 Warning", c['warning'])
+        m[2].metric("🔵 Note", c['info'])
+        m[3].metric("🟢 Pass", c['pass'])
+
+        ftab, atab, dtab = st.tabs(["📋 Findings", "🖼 Annotated view", "🔬 Extracted data"])
+        with ftab:
+            _lab_findings_tab(r['findings'], r['name'])
+        with atab:
+            _render_annotated(r, ocr)
+        with dtab:
+            _render_parsed(r['rtype'], r['parsed'])
 
 
 def render_reviewer():
-    st.markdown(
-        "Upload one or more AEG lab reports (`.xlsx`) — **metallurgical** or "
-        "**coating** — for an automated QA review. Each report is checked against "
-        "its own stated spec (Nominal composition / design limits), plus hardness, "
-        "completeness and sign-off."
+    st.caption(
+        "Automated QA of AEG lab reports (`.xlsx`) — **metallurgical** or **coating**. "
+        "Each report is checked against its own stated spec (nominal composition / design "
+        "limits), plus hardness, completeness and sign-off."
     )
 
-    st.divider()
+    up, opt = st.columns([3, 1])
+    with up:
+        files = st.file_uploader(
+            "Lab report(s) (.xlsx)", type=["xlsx"], accept_multiple_files=True,
+            key="lab_files", label_visibility="collapsed")
+    with opt:
+        ocr = st.toggle(
+            "Analyse micrographs", value=True,
+            help="Reads each micrograph's burned-in legend (magnification / scale), gauges "
+                 "etched-vs-low-contrast, and reads any burned-in thickness measurements. "
+                 "Requires the Tesseract OCR engine.")
 
-    files = st.file_uploader(
-        "Lab report(s) *(.xlsx)*",
-        type=["xlsx"],
-        accept_multiple_files=True,
-        key="lab_files",
-    )
-
-    ocr = st.checkbox(
-        "🔍 Analyse micrographs (legends, etch, thickness)",
-        value=True,
-        help="Reads each micrograph's burned-in legend (magnification / scale), gauges "
-             "etched-vs-low-contrast, and reads any burned-in thickness measurements — "
-             "cross-checking against the captions and comment. Requires the Tesseract OCR engine.",
-    )
+    ocr_ok = _ocr_available()
+    lo_ok = report_render.libreoffice_available()
+    _ok, _off = ('#1f9e50', '#e8f6ee', '✓'), ('#94a3b8', '#f1f5f9', '○')
+    st.markdown(_chips([
+        ("OCR ready" if ocr_ok else "OCR unavailable", *(_ok if ocr_ok else _off)),
+        ("Pixel-faithful ready" if lo_ok else "Grid view only", *(_ok if lo_ok else _off)),
+    ]), unsafe_allow_html=True)
 
     if not files:
         st.info("Upload one or more `.xlsx` lab reports above to review.")
         return
 
+    # Review every file (cached), collecting results for a batch overview.
+    reviewed = []
     for f in files:
         try:
             with st.spinner(f"Reviewing {f.name}…"):
                 rtype, parsed, findings = _review(f.name, f.getvalue(), ocr)
         except Exception as e:
-            st.error(f"Could not read **{f.name}** — {e}")
+            reviewed.append({'name': f.name, 'error': str(e)})
             continue
-
         counts = summarize(findings)
         verdict = ('critical' if counts['critical'] else
                    'warning' if counts['warning'] else 'pass')
-        vcolor, vtint, vlabel = _SEV_STYLE[verdict]
-        vtext = ("Needs attention — critical findings present." if counts['critical']
-                 else "Review recommended — warnings present." if counts['warning']
-                 else "Looks good — no warnings or failures.")
+        reviewed.append({'f': f, 'name': f.name, 'rtype': rtype, 'parsed': parsed,
+                         'findings': findings, 'counts': counts, 'verdict': verdict,
+                         'facts': _key_facts(rtype, parsed)})
 
-        st.write("")
+    for r in [x for x in reviewed if 'error' in x]:
+        st.error(f"Could not read **{r['name']}** — {r['error']}")
+    ok = [r for r in reviewed if 'error' not in r]
+    if not ok:
+        return
+
+    # ── Batch overview (only worth showing for more than one report) ──
+    if len(ok) > 1:
         with st.container(border=True):
-            st.markdown(f"#### {f.name}")
-            facts = _key_facts(rtype, parsed)
-            if facts:
-                st.caption(facts)
-
-            # One clear verdict banner (replaces the old pill + duplicate banner).
-            vicon = {'critical': '🔴', 'warning': '🟠', 'pass': '🟢'}[verdict]
-            st.markdown(
-                f'<div style="display:flex;align-items:center;gap:.55rem;padding:.65rem 1rem;'
-                f'border-radius:12px;background:{vtint};border:1px solid {vcolor}2e;'
-                f'margin:.1rem 0 .7rem;"><span style="font-size:1.1rem;">{vicon}</span>'
-                f'<span style="color:{vcolor};font-weight:700;">{vlabel}</span>'
-                f'<span style="color:#475569;"> — {vtext}</span></div>',
-                unsafe_allow_html=True)
-
+            tot = {k: sum(r['counts'][k] for r in ok)
+                   for k in ('critical', 'warning', 'info', 'pass')}
+            need = sum(1 for r in ok if r['verdict'] != 'pass')
+            st.markdown(f"**Batch overview — {len(ok)} report(s)**")
             m = st.columns(4)
-            m[0].metric("🔴 Fail", counts['critical'])
-            m[1].metric("🟠 Warning", counts['warning'])
-            m[2].metric("🔵 Note", counts['info'])
-            m[3].metric("🟢 Pass", counts['pass'])
+            m[0].metric("Reports", len(ok))
+            m[1].metric("🔴 Fail", tot['critical'])
+            m[2].metric("🟠 Warning", tot['warning'])
+            m[3].metric("Need attention", need)
+            st.dataframe([{
+                "Verdict": f"{_LAB_EMOJI[r['verdict']]} {_LAB_VERDICT[r['verdict']][2]}",
+                "Report": r['name'],
+                "Type": r['rtype'],
+                "🔴": r['counts']['critical'], "🟠": r['counts']['warning'],
+                "🔵": r['counts']['info'], "🟢": r['counts']['pass'],
+            } for r in ok], width="stretch", hide_index=True)
 
-            ftab, atab, dtab = st.tabs(
-                ["📋 Findings", "🖼 Annotated view", "🔬 Extracted data"])
-            with ftab:
-                _render_findings(findings)
-            with atab:
-                _render_annotated(f, rtype, parsed, ocr)
-            with dtab:
-                _render_parsed(rtype, parsed)
+            allrows = [{'Report': r['name'], 'Severity': _SEV_LABELS.get(s, s),
+                        'Category': c, 'Finding': msg}
+                       for r in ok for s, c, msg in r['findings']]
+            if pd is not None and allrows:
+                st.download_button(
+                    "⬇ All findings (.csv)",
+                    data=pd.DataFrame(allrows).to_csv(index=False).encode('utf-8'),
+                    file_name="lab_review_all_findings.csv", mime="text/csv",
+                    key="lab_batch_csv")
+
+        labels = [f"{_LAB_EMOJI[r['verdict']]}  {r['name']}" for r in ok]
+        idx = st.selectbox("View report", range(len(ok)),
+                           format_func=lambda i: labels[i], key="lab_pick")
+        _render_lab_detail(ok[idx], ocr)
+    else:
+        _render_lab_detail(ok[0], ocr)
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -618,189 +813,341 @@ def render_gallery():
 
 # ════════════════════════════════════════════════════════════════════════
 # TAB 4 — IIR Quality Review (Incoming Inspection Report consistency/completeness QA)
-def render_iir_tool():
-    import io
-    import iir_review
+# ════════════════════════════════════════════════════════════════════════
+_XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+_IIR_STYLE = {
+    iir_review.FAIL: ('#d62d38', '#fdecee', 'Fail'),
+    iir_review.WARN: ('#e07b16', '#fdf2e3', 'Warn'),
+    iir_review.INFO: ('#1a6ed6', '#e9f1fc', 'Info'),
+    iir_review.PASS: ('#1f9e50', '#e8f6ee', 'Pass'),
+}
+_IIR_ORDER = [iir_review.FAIL, iir_review.WARN, iir_review.INFO, iir_review.PASS]
+_IIR_CHOICE_LABEL = {iir_review.FAIL: "🔴 Fail", iir_review.WARN: "🟠 Warn",
+                     iir_review.INFO: "🔵 Info", iir_review.OFF: "⚪ Off"}
+
+
+def _iir_catalog_view():
+    """Data-driven view of every check, grouped by category (from CHECK_CATALOG)."""
     from itertools import groupby
+    st.caption("Every check the review runs. Tune each one's severity — or switch it "
+               "off — under **⚙️ Check severities**.")
+    for cat, items in groupby(iir_review.CHECK_CATALOG, key=lambda t: t[0]):
+        titles = [t[1] for t in items]
+        st.markdown(f"**{cat}**")
+        st.caption(" · ".join(titles))
 
-    XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    BADGE = {iir_review.FAIL: "🔴", iir_review.WARN: "🟠",
-             iir_review.INFO: "🔵", iir_review.PASS: "🟢"}
-    CHOICE_LABEL = {iir_review.FAIL: "🔴 Fail", iir_review.WARN: "🟠 Warn",
-                    iir_review.INFO: "🔵 Info", iir_review.OFF: "⚪ Off"}
 
-    def check_settings():
-        """Severity dropdown per check; returns {check_title: severity|OFF}."""
-        with st.expander("⚙️ Check settings — set the severity of each check"):
-            st.caption("Change any check's level, or turn it Off. The overview and "
-                       "verdicts below update immediately — no need to re-upload.")
-            if st.button("↺ Reset to defaults", key="iir_sev_reset"):
-                for _, title, _ in iir_review.CHECK_CATALOG:
-                    st.session_state.pop(f"iir_sev::{title}", None)
-            chosen = {}
-            for cat, items in groupby(iir_review.CHECK_CATALOG, key=lambda t: t[0]):
-                st.markdown(f"**{cat}**")
-                items = list(items)
-                cols = st.columns(2)
-                for j, (_, title, default) in enumerate(items):
-                    chosen[title] = cols[j % 2].selectbox(
-                        title, iir_review.SEVERITY_CHOICES,
-                        index=iir_review.SEVERITY_CHOICES.index(default),
-                        format_func=lambda s: CHOICE_LABEL[s],
-                        key=f"iir_sev::{title}",
-                    )
-        return chosen
+def _iir_check_settings():
+    """Severity dropdown per check; returns {check_title: severity|OFF}."""
+    from itertools import groupby
+    with st.expander("⚙️ Check severities — set each check's level or turn it off"):
+        st.caption("Changes apply instantly to the overview and verdicts below — no need "
+                   "to re-upload.")
+        if st.button("↺ Reset to defaults", key="iir_sev_reset"):
+            for _, title, _ in iir_review.CHECK_CATALOG:
+                st.session_state.pop(f"iir_sev::{title}", None)
+        chosen = {}
+        for cat, items in groupby(iir_review.CHECK_CATALOG, key=lambda t: t[0]):
+            st.markdown(f"**{cat}**")
+            items = list(items)
+            cols = st.columns(2)
+            for j, (_, title, default) in enumerate(items):
+                chosen[title] = cols[j % 2].selectbox(
+                    title, iir_review.SEVERITY_CHOICES,
+                    index=iir_review.SEVERITY_CHOICES.index(default),
+                    format_func=lambda s: _IIR_CHOICE_LABEL[s],
+                    key=f"iir_sev::{title}")
+    return chosen
 
-    st.markdown(
-        "Upload one or more **Incoming Inspection Reports** (Detailed Assessment "
-        "Customer Reports) as `.xlsx`. Each workbook is checked for internal "
-        "consistency and completeness, and a downloadable findings checklist is produced."
-    )
-    with st.expander("What does it check?"):
-        st.markdown(
-            "- **Identity / metadata** — doc number, customer, component, preparer, "
-            "reviewer, approver and PO# present and well-formed\n"
-            "- **Quantities** — Received = Scrap + Reconditionable; positions listed = "
-            "received; serial-number scope totals reconcile; the stated sum row matches "
-            "the scopes actually marked; Received-Parts table vs Serial-Number protocol agree\n"
-            "- **Integrity** — unique & contiguous positions, serial numbers present and "
-            "unique, valid repair-scope values, scrap mark ↔ scope 'S', every part scoped\n"
-            "- **Consistency** — Summary-of-Damages finding counts match the protocol "
-            "defect marks; executive-summary received count and scrap positions agree\n"
-            "- **Completeness** — incoming photos embedded for each caption; page numbering\n\n"
-            "Review **several reports at once** for a combined **Batch Summary** workbook "
-            "(one row per report + a pooled findings tab)."
-        )
 
-    st.divider()
+def _iir_filter_table(findings, key, with_report=False):
+    """Severity pills + category filter + text search over IIR finding dicts."""
+    if not findings:
+        st.caption("No findings.")
+        return
+    cats = sorted({f['category'] for f in findings})
+    counts = {s: sum(1 for f in findings if f['severity'] == s) for s in _IIR_ORDER}
+    sev_opts = [s for s in _IIR_ORDER if counts[s]]
+    default_sev = [s for s in (iir_review.FAIL, iir_review.WARN, iir_review.INFO)
+                   if counts[s]] or sev_opts
 
-    iir_files = st.file_uploader(
-        "IIR workbook(s) *(required)*",
-        type=["xlsx"],
-        accept_multiple_files=True,
-        key="iir_uploader",
-    )
+    c1, c2, c3 = st.columns([3, 2, 2])
+    with c1:
+        picked = st.pills(
+            "Severity", sev_opts, selection_mode="multi", default=default_sev,
+            format_func=lambda s: f"{iir_review.SEV_ICON[s]} {_IIR_STYLE[s][2]} ({counts[s]})",
+            label_visibility="collapsed", key=f"iirsev_{key}")
+    cat_pick = c2.multiselect("Category", cats, placeholder="All categories",
+                              label_visibility="collapsed", key=f"iircat_{key}")
+    query = c3.text_input("Search", placeholder="🔍 search detail…",
+                          label_visibility="collapsed", key=f"iirq_{key}")
 
-    if 'iir_data' not in st.session_state:
-        st.session_state.iir_data = []   # [{'src': name, 'data': parsed}, ...]
-
-    # Parse on demand; cached so changing the check settings re-checks instantly.
-    if st.button("▶ Run Review", type="primary", disabled=not iir_files):
-        parsed, errors = [], []
-        with st.spinner(f"Reading {len(iir_files)} report(s)..."):
-            with tempfile.TemporaryDirectory() as tmp:
-                for i, f in enumerate(iir_files):
-                    # Index-prefixed fixed name — never join the upload's raw name
-                    # (path-traversal safety); f.name is kept only as a label.
-                    path = os.path.join(tmp, f"iir_{i}.xlsx")
-                    with open(path, "wb") as fh:
-                        fh.write(f.getvalue())
-                    try:
-                        parsed.append({'src': f.name, 'data': iir_review.parse_iir(path)})
-                    except Exception as e:
-                        errors.append(f"{f.name}: {e}")
-        for err in errors:
-            st.error(f"Review failed — {err}")
-        st.session_state.iir_data = parsed
-
-    parsed = st.session_state.iir_data
-    if not parsed:
-        st.info("Upload IIR Excel file(s) and click ▶ Run Review." if iir_files
-                else "Upload one or more IIR Excel files above to run the review.")
+    picked = picked or sev_opts
+    q = (query or "").lower().strip()
+    shown = [f for f in findings
+             if f['severity'] in picked
+             and (not cat_pick or f['category'] in cat_pick)
+             and (not q or q in f"{f['check']} {f['detail']} {f['sheet']} "
+                                 f"{f.get('report', '')}".lower())]
+    if not shown:
+        st.caption("No findings match the filter.")
         return
 
-    overrides = check_settings()
+    rows = []
+    for f in shown:
+        row = {"Sev": iir_review.SEV_ICON[f['severity']], "Category": f['category'],
+               "Check": f['check'], "Sheet": f['sheet'], "Detail": f['detail']}
+        if with_report:
+            row = {"Report": f['report'], **row}
+        rows.append(row)
+    st.dataframe(rows, width="stretch", hide_index=True,
+                 column_config={
+                     "Sev": st.column_config.TextColumn(width="small"),
+                     "Detail": st.column_config.TextColumn(width="large")})
 
-    # Re-run the checks for every report with the current severity settings.
+
+def _iir_overview(results):
+    """Batch overview card: aggregate metrics + interactive table + batch download."""
+    with st.container(border=True):
+        tot = {k: sum(r['counts'][k] for r in results) for k in _IIR_ORDER}
+        need = sum(1 for r in results
+                   if r['template'] == 'unknown'
+                   or iir_review.verdict_of(r['counts'])[0] != iir_review.PASS)
+        st.markdown(f"**Batch overview — {len(results)} report(s)**")
+        m = st.columns(4)
+        m[0].metric("Reports", len(results))
+        m[1].metric("🔴 Fail", tot[iir_review.FAIL])
+        m[2].metric("🟠 Warn", tot[iir_review.WARN])
+        m[3].metric("Need attention", need)
+
+        overview = []
+        for r in results:
+            c = r['counts']
+            sev, label = iir_review.verdict_of(c)
+            rp = r['rp']
+            verdict = ("⚠️ Unknown layout" if r['template'] == 'unknown'
+                       else f"{iir_review.SEV_ICON[sev]} {label.split(' — ')[0]}")
+            overview.append({
+                "Verdict": verdict,
+                "Report": r['src'],
+                "Doc No": r['ident'].get('doc_no', ''),
+                "Component": r['ident'].get('component', ''),
+                "Recv": rp.get('received') if rp.get('found') else None,
+                "Scrap": rp.get('scrap') if rp.get('found') else None,
+                "Recond": rp.get('reconditionable') if rp.get('found') else None,
+                "🔴": c[iir_review.FAIL], "🟠": c[iir_review.WARN],
+                "🔵": c[iir_review.INFO], "🟢": c[iir_review.PASS],
+                "Top issue": iir_review.top_issue(r['findings']),
+            })
+        st.dataframe(overview, width="stretch", hide_index=True,
+                     column_config={"Top issue": st.column_config.TextColumn(width="large")})
+
+        if len(results) > 1:
+            records = [iir_review.record_of(r['data'], r['findings']) for r in results]
+            buf = io.BytesIO()
+            iir_review.build_batch_summary(records, buf)
+            st.download_button(
+                "⬇ Batch summary (.xlsx)", data=buf.getvalue(),
+                file_name="IIR_Batch_Summary.xlsx", mime=_XLSX_MIME,
+                key="iir_batch_dl", type="primary")
+
+
+def _iir_protocol_tab(data):
+    """The per-position serial-number protocol grid the checks are derived from."""
+    rows = data.get('sn_rows') or []
+    if not rows:
+        st.caption("No serial-number protocol rows were parsed for this report.")
+        return
+    st.caption(f"{len(rows)} position(s) — the per-position grid the checks are derived from.")
+    st.dataframe([{
+        "Pos": r.get('pos'), "Part No": r.get('pn', ''), "Serial": r.get('sn', ''),
+        "Scope": r.get('scope', ''), "Scrap": "✓" if r.get('scrap') else "",
+        "Defects": ", ".join(r.get('defects') or []),
+    } for r in rows], width="stretch", hide_index=True,
+        column_config={"Defects": st.column_config.TextColumn(width="large")})
+    sums = data.get('sn_sumrow') or {}
+    if sums:
+        st.caption("Protocol sum row — " + " · ".join(f"{k}: **{v}**" for k, v in sums.items()))
+
+
+def _iir_extracted_tab(data):
+    """Surface the rich parsed context that used to be Excel-only."""
+    shown = False
+    rp = data.get('received_parts') or {}
+    if rp.get('found'):
+        shown = True
+        st.markdown("**Received-parts table**")
+        st.caption(
+            f"Rows **{rp.get('rows', '—')}** · Required **{rp.get('required', '—')}** · "
+            f"Received **{rp.get('received', '—')}** · Scrap **{rp.get('scrap', '—')}** · "
+            f"Reconditionable **{rp.get('reconditionable', '—')}**")
+    ft = data.get('findings_tbl') or {}
+    if ft:
+        shown = True
+        st.markdown("**Summary of damages**")
+        st.dataframe([{"Finding": k, "Count": v} for k, v in ft.items()],
+                     width="stretch", hide_index=True)
+    op = data.get('operating') or {}
+    if op:
+        shown = True
+        st.markdown("**Operating data**")
+        st.caption(" · ".join(f"{k}: **{v}**" for k, v in op.items()))
+    sm = data.get('spares_matrix') or []
+    if sm:
+        shown = True
+        st.markdown("**Expected replacement components**")
+        st.dataframe([{
+            "Pos": r.get('pos'), "Scrap": "✓" if r.get('scrap') else "",
+            "Components": ", ".join(r.get('comps') or []),
+        } for r in sm], width="stretch", hide_index=True,
+            column_config={"Components": st.column_config.TextColumn(width="large")})
+    sl = data.get('spares_list') or []
+    if sl:
+        shown = True
+        st.markdown("**Spare parts list**")
+        st.dataframe([{"Part": r.get('part'), "Qty": r.get('qty')} for r in sl],
+                     width="stretch", hide_index=True)
+    photos = data.get('photos') or []
+    if photos:
+        shown = True
+        st.markdown("**Photo sheets**")
+        st.dataframe([{
+            "Sheet": p.get('sheet'), "Captions": len(p.get('captions') or []),
+            "Images": p.get('images'),
+        } for p in photos], width="stretch", hide_index=True)
+    footers = data.get('footers') or []
+    if footers:
+        shown = True
+        with st.expander(f"Page footers ({len(footers)})"):
+            frows = []
+            for fr in footers:
+                fr = list(fr) + [None, None, None]
+                frows.append({"Sheet": fr[0], "Page": fr[1], "Of": fr[2]})
+            st.dataframe(frows, width="stretch", hide_index=True)
+    if not shown:
+        st.caption("No additional extracted data available for this report.")
+
+
+def _iir_report_card(r):
+    """One report's detail card: identity, template, metrics, tabs, checklist."""
+    data, ident, c = r['data'], r['ident'], r['counts']
+    with st.container(border=True):
+        sev, _ = iir_review.verdict_of(c)
+        if r['template'] == 'unknown':
+            st.error(
+                f"**Unrecognized IIR layout** — “{r['src']}” didn't match a known template, "
+                "so the review couldn't be fully scored. Confirm it's a Detailed Assessment "
+                "Customer Report `.xlsx`.")
+        badge = "⚠️" if r['template'] == 'unknown' else iir_review.SEV_ICON[sev]
+        st.markdown(f"#### {badge} {r['src']}")
+        fam = "?" if r['template'] in ('unknown', '?') else r['template']
+        st.caption(
+            f"**{ident.get('doc_no', '?')}** · {ident.get('customer', '?')} · "
+            f"{ident.get('component', '?')}  —  prepared by "
+            f"{ident.get('preparer') or ident.get('author', '?')}, "
+            f"reviewed by {ident.get('reviewer', '?')}  ·  Template {fam}")
+
+        rp = r['rp']
+        m = st.columns(4)
+        m[0].metric("Received", rp.get('received') if rp.get('found') else "—")
+        m[1].metric("Scrap", rp.get('scrap') if rp.get('found') else "—")
+        m[2].metric("Reconditionable", rp.get('reconditionable') if rp.get('found') else "—")
+        m[3].metric("Positions", r['npos'])
+
+        st.markdown(_sevbar([(c[iir_review.FAIL], '#d62d38'), (c[iir_review.WARN], '#e07b16'),
+                             (c[iir_review.INFO], '#1a6ed6'), (c[iir_review.PASS], '#1f9e50')]),
+                    unsafe_allow_html=True)
+        m2 = st.columns(4)
+        m2[0].metric("🔴 Fail", c[iir_review.FAIL])
+        m2[1].metric("🟠 Warn", c[iir_review.WARN])
+        m2[2].metric("🔵 Info", c[iir_review.INFO])
+        m2[3].metric("🟢 Pass", c[iir_review.PASS])
+
+        ftab, ptab, xtab = st.tabs(["📋 Findings", "🔢 Protocol", "🗂 Extracted data"])
+        with ftab:
+            _iir_filter_table(r['findings'], key=f"rep_{r['src']}")
+        with ptab:
+            _iir_protocol_tab(data)
+        with xtab:
+            _iir_extracted_tab(data)
+
+        buf = io.BytesIO()
+        iir_review.build_checklist(data, r['findings'], buf)
+        st.download_button(
+            "⬇ Findings checklist (.xlsx)", data=buf.getvalue(),
+            file_name=f"IIR_Review_{Path(r['src']).stem}.xlsx",
+            mime=_XLSX_MIME, key=f"iir_dl_{r['src']}")
+
+
+def render_iir_tool():
+    st.caption(
+        "Automated consistency & completeness QA of **Incoming Inspection Reports** "
+        "(Detailed Assessment Customer Reports, `.xlsx`). Upload one or more workbooks for a "
+        "severity-tagged findings checklist and a batch overview."
+    )
+
+    top = st.columns([3, 1])
+    with top[0]:
+        iir_files = st.file_uploader(
+            "IIR workbook(s) (.xlsx)", type=["xlsx"], accept_multiple_files=True,
+            key="iir_uploader", label_visibility="collapsed")
+    with top[1]:
+        with st.popover("ℹ️ What it checks", use_container_width=True):
+            _iir_catalog_view()
+
+    if not iir_files:
+        st.info("Upload one or more IIR Excel files above to run the review.")
+        return
+
+    # Auto-run: parse every workbook on upload (cached on bytes) — no separate button.
+    parsed_items, perrs = [], []
+    with st.spinner(f"Reading {len(iir_files)} report(s)…"):
+        for f in iir_files:
+            try:
+                parsed_items.append({'src': f.name, 'data': _parse_iir(f.name, f.getvalue())})
+            except Exception as e:
+                perrs.append(f"{f.name}: {e}")
+    for e in perrs:
+        st.error(f"Could not read — {e}")
+    if not parsed_items:
+        return
+
+    overrides = _iir_check_settings()
+
+    # Re-run the checks for every report with the current severity settings (cheap).
     results = []
-    for item in parsed:
+    for item in parsed_items:
         data = item['data']
         findings = iir_review.run_checks(data, overrides)
         results.append({
             'src': item['src'], 'data': data, 'findings': findings,
             'counts': iir_review.count_severities(findings),
             'ident': data['ident'], 'rp': data['received_parts'],
-            'npos': len(data['sn_rows']),
+            'npos': len(data['sn_rows']), 'template': data.get('template', '?'),
         })
 
-    # ── Batch overview (one row per report) ──────────────────────────────────
-    st.divider()
-    tot = {k: sum(r['counts'][k] for r in results)
-           for k in (iir_review.FAIL, iir_review.WARN, iir_review.INFO, iir_review.PASS)}
-    st.subheader(f"Batch overview — {len(results)} report(s)")
-    overview = []
-    for r in results:
-        c = r['counts']
-        sev, label = iir_review.verdict_of(c)
-        rp = r['rp']
-        overview.append({
-            "Verdict": f"{BADGE[sev]} {label.split(' — ')[0]}",
-            "Report": r['src'],
-            "Doc No": r['ident'].get('doc_no', ''),
-            "Component": r['ident'].get('component', ''),
-            "Recv": rp.get('received') if rp.get('found') else None,
-            "Scrap": rp.get('scrap') if rp.get('found') else None,
-            "Recond": rp.get('reconditionable') if rp.get('found') else None,
-            "🔴": c[iir_review.FAIL], "🟠": c[iir_review.WARN],
-            "🔵": c[iir_review.INFO], "🟢": c[iir_review.PASS],
-        })
-    st.dataframe(overview, use_container_width=True, hide_index=True)
+    _iir_overview(results)
 
-    m = st.columns(4)
-    m[0].metric("🔴 Fail", tot[iir_review.FAIL])
-    m[1].metric("🟠 Warn", tot[iir_review.WARN])
-    m[2].metric("🔵 Info", tot[iir_review.INFO])
-    m[3].metric("🟢 Pass", tot[iir_review.PASS])
+    # ── Pooled findings across the whole batch (was Excel-only before) ──
+    pooled = [{**f, 'report': r['src']} for r in results for f in r['findings']]
+    if pooled:
+        with st.container(border=True):
+            st.markdown("**All findings across the batch**")
+            _iir_filter_table(pooled, key="pool", with_report=True)
 
+    # ── Per-report drill-down ──
+    st.markdown("### Report detail")
     if len(results) > 1:
-        records = [iir_review.record_of(r['data'], r['findings']) for r in results]
-        buf = io.BytesIO()
-        iir_review.build_batch_summary(records, buf)
-        st.download_button(
-            "⬇ Download batch summary (.xlsx)", data=buf.getvalue(),
-            file_name="IIR_Batch_Summary.xlsx", mime=XLSX_MIME,
-            key="iir_batch_dl", type="primary",
-        )
-
-    # ── Per-report detail (expanders) ────────────────────────────────────────
-    st.divider()
-    st.subheader("Report details")
-    for i, r in enumerate(results):
-        c = r['counts']
-        sev, _ = iir_review.verdict_of(c)
-        ident = r['ident']
-        header = (f"{BADGE[sev]} {r['src']}  —  {c[iir_review.FAIL]}F / "
-                  f"{c[iir_review.WARN]}W / {c[iir_review.INFO]}I / {c[iir_review.PASS]}P")
-        with st.expander(header, expanded=(sev != iir_review.PASS)):
-            st.caption(
-                f"**{ident.get('doc_no','?')}** · {ident.get('customer','?')} · "
-                f"{ident.get('component','?')}  —  prepared by "
-                f"{ident.get('preparer') or ident.get('author','?')}, "
-                f"reviewed by {ident.get('reviewer','?')}"
-            )
-            rp = r['rp']
-            if rp.get('found'):
-                st.caption(
-                    f"Received **{rp['received']}** · Scrap **{rp['scrap']}** · "
-                    f"Reconditionable **{rp['reconditionable']}** · "
-                    f"Positions in protocol **{r['npos']}**"
-                )
-            rows = [{
-                "Severity": f"{iir_review.SEV_ICON[f['severity']]} {f['severity']}",
-                "Category": f['category'],
-                "Check": f['check'],
-                "Sheet": f['sheet'],
-                "Detail": f['detail'],
-            } for f in r['findings']]
-            st.dataframe(rows, use_container_width=True, hide_index=True)
-            buf = io.BytesIO()
-            iir_review.build_checklist(r['data'], r['findings'], buf)
-            st.download_button(
-                label="⬇ Download findings checklist (.xlsx)",
-                data=buf.getvalue(),
-                file_name=f"IIR_Review_{Path(r['src']).stem}.xlsx",
-                mime=XLSX_MIME, key=f"iir_dl_{i}",
-            )
+        def _label(i):
+            r = results[i]
+            badge = ("⚠️" if r['template'] == 'unknown'
+                     else iir_review.SEV_ICON[iir_review.verdict_of(r['counts'])[0]])
+            return f"{badge}  {r['src']}"
+        idx = st.selectbox("View report", range(len(results)),
+                           format_func=_label, key="iir_pick")
+        _iir_report_card(results[idx])
+    else:
+        _iir_report_card(results[0])
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -819,7 +1166,7 @@ def main():
                        layout="wide", initial_sidebar_state="expanded")
     st.markdown(_CSS, unsafe_allow_html=True)
 
-    labels = [f"{ic}  {name}" for ic, name, _, _ in _TOOLS]
+    labels = [f"{ic}  {name}" for ic, name, _, _ in _TOOLS]
     with st.sidebar:
         st.markdown(_BRAND, unsafe_allow_html=True)
         choice = st.radio("nav", labels, label_visibility="collapsed")
