@@ -225,16 +225,22 @@ def _parse_family_b(wb, path, data):
     """Section-based IIR: identity from Cover/CONFIGURATION, serial registration
     from the SN sheet(s), photos from Incoming/Receiving Photos."""
     ident = dict(data.get('ident') or {})    # keep anything the common pass found
+    assessment = {}
     cover = _sheet_by(wb, 'Cover')
     if cover is not None:
         # Section-based covers put label and value in SEPARATE cells
         # ("Reviewed by:" | "Gokul Kumar"), so read the value to the right — the
         # combined-string parse in parse_iter() misses preparer/reviewer/approver/PO
         # here and would otherwise falsely flag them missing.
+        # 'Component' is a label-only cell ("Component:") — anchoring to end-of-cell
+        # stops it matching a merged banner ("Component: V84.2 ... Vanes") that
+        # precedes the real label/value pair and would mis-read the component.
+        # 'Verified by' is used in place of 'Reviewed by' on some covers.
         for key, pat in [('doc_no', r'AEG\s*Job\s*No'), ('customer', r'^\s*Client'),
-                         ('machine', r'Machine\s*Type'), ('component', r'^\s*Component'),
+                         ('machine', r'Machine\s*Type'), ('component', r'^\s*Component\s*:?\s*$'),
                          ('plant', r'^\s*Plant'),
-                         ('preparer', r'Prepared\s*by'), ('reviewer', r'Reviewed\s*by'),
+                         ('preparer', r'Prepared\s*by'),
+                         ('reviewer', r'Reviewed\s*by|Verified\s*by'),
                          ('approver', r'Approved\s*by'),
                          ('po', r'PO\s*/\s*FWA\s*No|PO\s*#|PO\s*No\b|FWA\s*No')]:
             v = _label_value(cover, _find_label(cover, pat))
@@ -243,6 +249,13 @@ def _parse_family_b(wb, path, data):
         t = _find_label(cover, r'inspection report')
         if t is not None:
             ident['title'] = _norm(t.value)
+        # "Overall Assessment: Medium: 0  Heavy: 27  Scrap: 21" scope tally (some
+        # covers carry counts, others just prose — leave empty when there are none).
+        oa = _find_label(cover, r'Overall\s*Assessment')
+        if oa is not None:
+            rowtext = ' '.join(_norm(c.value) for c in cover[oa.row] if c.value is not None)
+            for m in re.finditer(r'(?i)(medium|heavy|light|scrap)\s*:?\s*(\d+)', rowtext):
+                assessment[m.group(1).lower()] = int(m.group(2))
     cfg = _sheet_by(wb, 'CONFIG')  # matches CONFIG / CONFIGURATION / Configuration
     if cfg is not None:
         for key, pat in [('part_no', r'PART\s*NUMBER'), ('casting', r'CASTING\s*NUMBER'),
@@ -251,6 +264,7 @@ def _parse_family_b(wb, path, data):
             if v:
                 ident[key] = v
     data['ident'] = ident
+    data['b_assessment'] = assessment
 
     # serial-number registration: pair each "Serial Number" column with the
     # nearest "Item No." column to its left (handles the multi-block grid).
@@ -294,7 +308,8 @@ def _parse_family_b(wb, path, data):
         if 'incoming photo' in low or 'receiving photo' in low or low.strip().startswith('photos'):
             ws = wb[name]
             caps = [_norm(c.value) for c in _cells(ws)
-                    if isinstance(c.value, str) and re.match(r'(?i)(fig|photo|pic)\.?\s*\d+', c.value.strip())]
+                    if isinstance(c.value, str)
+                    and re.match(r'(?i)(fig(?:ure)?|photo|pic(?:ture)?)\.?\s*:?\s*\d+', c.value.strip())]
             photos.append({'sheet': name, 'captions': caps, 'images': anchors.get(name, 0)})
     data['photos'] = photos
 
@@ -581,11 +596,35 @@ def _checks_family_b(d):
                 out.append(_f("Item numbering contiguous", PASS, "SN",
                               f"Items 1–{max(items)} present with no gaps or duplicates", "Integrity"))
 
+    # Overall-Assessment scope tally reconciled to the set size. Family-B covers
+    # that carry "Medium/Heavy/Scrap" counts should sum to the stated Qty; prose
+    # covers (7660: "Refer to conclusion page") have no counts and are skipped —
+    # so this never false-fails, but validates the scrap/repair split when present.
+    assess = d.get('b_assessment') or {}
+    if assess:
+        denom = qty if qty is not None else (len(serials) if serials else None)
+        total = sum(assess.values())
+        detail = ", ".join(f"{k.title()} {v}" for k, v in assess.items())
+        if denom is None:
+            out.append(_f("Overall Assessment tally", INFO, "Cover",
+                          f"{detail} (no Qty to reconcile against)", "Quantities"))
+        elif total == denom:
+            out.append(_f("Overall Assessment tally", PASS, "Cover",
+                          f"{detail} = {total} = Qty {denom}", "Quantities"))
+        else:
+            out.append(_f("Overall Assessment tally", WARN, "Cover",
+                          f"{detail} sum to {total} ≠ Qty {denom} (off by {total - denom:+d})",
+                          "Quantities"))
+
     photos = d.get('photos', [])
     for ph in photos:
         if ph['captions'] and ph['images'] == 0:
             out.append(_f("Photos embedded", FAIL, ph['sheet'],
                           f"{len(ph['captions'])} caption(s) but no embedded images", "Completeness"))
+        elif ph['captions'] and ph['images'] < len(ph['captions']):
+            out.append(_f("Photo per caption", WARN, ph['sheet'],
+                          f"{len(ph['captions'])} caption(s) but only {ph['images']} embedded image(s)",
+                          "Completeness"))
     total_imgs = sum(p['images'] for p in photos)
     if photos and total_imgs:
         out.append(_f("Incoming photos present", PASS, "Incoming Photos",
@@ -656,6 +695,7 @@ def _parse_spares(wb, data):
                 if isinstance(c.value, str) and _norm(c.value)}
         c_part = next((v for k, v in cmap.items() if 'part' in k and 'number' not in k),
                       min(cmap.values()))
+        c_pn = next((v for k, v in cmap.items() if 'part' in k and 'number' in k), None)
         c_qty = next((v for k, v in cmap.items() if 'quantity' in k or k == 'qty'), None)
         for r in range(hr + 1, ws.max_row + 1):
             part = ws.cell(r, c_part).value
@@ -663,7 +703,13 @@ def _parse_spares(wb, data):
                 if slist:
                     break
                 continue
-            nums = re.findall(r'\d+', _norm(ws.cell(r, c_qty).value)) if c_qty else []
+            pn = _norm(ws.cell(r, c_pn).value) if c_pn else ''
+            qv = _norm(ws.cell(r, c_qty).value) if c_qty else ''
+            if not (pn or qv):        # footer/signature row (e.g. "IR :") — not a line item
+                if slist:
+                    break
+                continue
+            nums = re.findall(r'\d+', qv)
             slist.append({'part': part.strip(), 'qty': sum(int(x) for x in nums) if nums else None})
         break
     data['spares_list'] = slist
