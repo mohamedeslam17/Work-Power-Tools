@@ -310,22 +310,53 @@ _SEV_STYLE = {
 }
 
 
-def _render_findings(findings):
-    """Compact, colour-coded, scannable findings list (fails first)."""
+def _findings_html(items, sev):
+    """Compact colour-coded rows for one severity (items = [(category, msg), …])."""
     import html as _html
-    ordered = sorted(findings, key=lambda f: _SEV_ORDER.index(f[0]))
-    rows = []
-    for sev, cat, msg in ordered:
-        color, tint, label = _SEV_STYLE[sev]
-        rows.append(
-            f'<div style="display:flex;align-items:baseline;gap:.6rem;'
-            f'padding:.38rem .7rem;margin:.28rem 0;border-left:4px solid {color};'
-            f'background:{tint};border-radius:5px;">'
-            f'<span style="color:{color};font-weight:700;font-size:.72rem;'
-            f'letter-spacing:.03em;text-transform:uppercase;min-width:58px;">{label}</span>'
-            f'<span style="line-height:1.35;"><b>{_html.escape(cat)}</b> — '
-            f'{_html.escape(msg)}</span></div>')
-    st.markdown('<div>' + ''.join(rows) + '</div>', unsafe_allow_html=True)
+    color, tint, label = _SEV_STYLE[sev]
+    rows = [
+        f'<div style="display:flex;align-items:baseline;gap:.6rem;'
+        f'padding:.42rem .75rem;margin:.3rem 0;border-left:4px solid {color};'
+        f'background:{tint};border-radius:8px;">'
+        f'<span style="color:{color};font-weight:700;font-size:.7rem;letter-spacing:.03em;'
+        f'text-transform:uppercase;min-width:56px;">{label}</span>'
+        f'<span style="line-height:1.4;color:#28323f;"><b>{_html.escape(cat)}</b> — '
+        f'{_html.escape(msg)}</span></div>'
+        for cat, msg in items]
+    return '<div>' + ''.join(rows) + '</div>'
+
+
+def _render_findings(findings):
+    """Triage: fails + warnings up front; notes and passes tucked behind
+    disclosures so the things that need attention aren't buried."""
+    by = {s: [(c, m) for ss, c, m in findings if ss == s] for s in _SEV_ORDER}
+    if by['critical']:
+        st.markdown(_findings_html(by['critical'], 'critical'), unsafe_allow_html=True)
+    if by['warning']:
+        st.markdown(_findings_html(by['warning'], 'warning'), unsafe_allow_html=True)
+    if not by['critical'] and not by['warning']:
+        st.markdown(_findings_html([('Result', 'No fails or warnings.')], 'pass'),
+                    unsafe_allow_html=True)
+    if by['info']:
+        with st.expander(f"🔵  {len(by['info'])} note{'s' if len(by['info']) != 1 else ''}"):
+            st.markdown(_findings_html(by['info'], 'info'), unsafe_allow_html=True)
+    if by['pass']:
+        with st.expander(f"🟢  {len(by['pass'])} check{'s' if len(by['pass']) != 1 else ''} passed"):
+            st.markdown(_findings_html(by['pass'], 'pass'), unsafe_allow_html=True)
+
+
+def _key_facts(rtype, parsed):
+    """A compact 'Alloy · Job · Component · S/N' line for the report header."""
+    if rtype == 'metallurgical':
+        hdr, smp = parsed.get('header', {}) or {}, parsed.get('sample', {}) or {}
+        bits = [('Alloy', smp.get('material')), ('Job', hdr.get('job')),
+                ('Component', smp.get('description')), ('S/N', smp.get('serial'))]
+    elif rtype == 'coating':
+        bits = [('Report', parsed.get('report_no')), ('Component', parsed.get('component'))]
+    else:
+        return f"Detected report type: **{rtype}**"
+    shown = [f"{k}: **{v}**" for k, v in bits if v and str(v).strip()]
+    return f"*{rtype}*  ·  " + "  ·  ".join(shown) if shown else f"*{rtype}*"
 
 
 def _render_annotated(f, rtype, parsed, ocr):
@@ -484,14 +515,19 @@ def render_reviewer():
 
         st.write("")
         with st.container(border=True):
-            head = st.columns([7, 2])
-            head[0].markdown(f"#### {f.name}")
-            head[0].caption(f"Detected report type: **{rtype}**")
-            head[1].markdown(
-                f'<div style="text-align:right;padding-top:.4rem;">'
-                f'<span style="background:{vtint};color:{vcolor};font-weight:700;'
-                f'padding:.32rem .8rem;border-radius:999px;font-size:.85rem;'
-                f'border:1px solid {vcolor}33;">{vlabel}</span></div>',
+            st.markdown(f"#### {f.name}")
+            facts = _key_facts(rtype, parsed)
+            if facts:
+                st.caption(facts)
+
+            # One clear verdict banner (replaces the old pill + duplicate banner).
+            vicon = {'critical': '🔴', 'warning': '🟠', 'pass': '🟢'}[verdict]
+            st.markdown(
+                f'<div style="display:flex;align-items:center;gap:.55rem;padding:.65rem 1rem;'
+                f'border-radius:12px;background:{vtint};border:1px solid {vcolor}2e;'
+                f'margin:.1rem 0 .7rem;"><span style="font-size:1.1rem;">{vicon}</span>'
+                f'<span style="color:{vcolor};font-weight:700;">{vlabel}</span>'
+                f'<span style="color:#475569;"> — {vtext}</span></div>',
                 unsafe_allow_html=True)
 
             m = st.columns(4)
@@ -503,10 +539,6 @@ def render_reviewer():
             ftab, atab, dtab = st.tabs(
                 ["📋 Findings", "🖼 Annotated view", "🔬 Extracted data"])
             with ftab:
-                st.markdown(
-                    f'<div style="padding:.5rem .8rem;margin-bottom:.4rem;border-radius:6px;'
-                    f'background:{vtint};color:{vcolor};font-weight:600;">{vtext}</div>',
-                    unsafe_allow_html=True)
                 _render_findings(findings)
             with atab:
                 _render_annotated(f, rtype, parsed, ocr)
