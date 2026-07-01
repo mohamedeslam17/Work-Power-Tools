@@ -224,12 +224,19 @@ def _detect_template(wb):
 def _parse_family_b(wb, path, data):
     """Section-based IIR: identity from Cover/CONFIGURATION, serial registration
     from the SN sheet(s), photos from Incoming/Receiving Photos."""
-    ident = {}
+    ident = dict(data.get('ident') or {})    # keep anything the common pass found
     cover = _sheet_by(wb, 'Cover')
     if cover is not None:
+        # Section-based covers put label and value in SEPARATE cells
+        # ("Reviewed by:" | "Gokul Kumar"), so read the value to the right — the
+        # combined-string parse in parse_iter() misses preparer/reviewer/approver/PO
+        # here and would otherwise falsely flag them missing.
         for key, pat in [('doc_no', r'AEG\s*Job\s*No'), ('customer', r'^\s*Client'),
                          ('machine', r'Machine\s*Type'), ('component', r'^\s*Component'),
-                         ('plant', r'^\s*Plant')]:
+                         ('plant', r'^\s*Plant'),
+                         ('preparer', r'Prepared\s*by'), ('reviewer', r'Reviewed\s*by'),
+                         ('approver', r'Approved\s*by'),
+                         ('po', r'PO\s*/\s*FWA\s*No|PO\s*#|PO\s*No\b|FWA\s*No')]:
             v = _label_value(cover, _find_label(cover, pat))
             if v and not ident.get(key):
                 ident[key] = v
