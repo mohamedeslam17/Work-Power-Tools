@@ -806,11 +806,11 @@ def render_iir_tool():
 # ════════════════════════════════════════════════════════════════════════
 _TOOLS = [
     ("🧪", "Lab Report Review", "Automated QA of AEG metallurgical & coating reports",
-     "render_reviewer"),
+     render_reviewer),
     ("🔬", "SEM Converter", "Vendor SEM PDF → formatted Ansaldo Word report",
-     "render_converter"),
-    ("🖼️", "Photo Library", "Browse stored micrographs by alloy", "render_gallery"),
-    ("🛠️", "IIR Review", "Incoming-inspection report consistency QA", "render_iir_tool"),
+     render_converter),
+    ("🖼️", "Photo Library", "Browse stored micrographs by alloy", render_gallery),
+    ("🛠️", "IIR Review", "Incoming-inspection report consistency QA", render_iir_tool),
 ]
 
 
@@ -823,11 +823,11 @@ def main():
     with st.sidebar:
         st.markdown(_BRAND, unsafe_allow_html=True)
         choice = st.radio("nav", labels, label_visibility="collapsed")
-    icon, name, sub, fn_name = _TOOLS[labels.index(choice)]
+    icon, name, sub, fn = _TOOLS[labels.index(choice)]
 
     st.markdown(_page_header(icon, name, sub), unsafe_allow_html=True)
     try:
-        globals()[fn_name]()
+        fn()
     except Exception as e:
         st.error("This tool hit an error and couldn't finish.")
         st.caption(f"{type(e).__name__}: {e}")
