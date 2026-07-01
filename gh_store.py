@@ -104,6 +104,7 @@ def _read_index():
 
 def add_records(records):
     """Commit micrograph records (each with 'bytes') to the repo; return count added."""
+    import requests
     from photo_lib import _safe
     sha, index = _read_index()
     existing = {(r.get('job'), r.get('image'), r.get('source')) for r in index}
@@ -116,14 +117,23 @@ def add_records(records):
         rel = f"{_safe(r['alloy'])}/{name}"
         try:
             _put(f"{base()}/{rel}", r['bytes'], f"library: add {rel}")
-        except Exception:
-            continue
+        except requests.HTTPError as e:
+            code = getattr(e.response, 'status_code', None)
+            if code == 422:                 # already in the repo — record it in the index
+                pass
+            elif code in (401, 403):
+                raise RuntimeError('GitHub rejected the write (check the github_token '
+                                   'has Contents: read & write on the repo).') from e
+            else:                           # 5xx / rate-limit / network — surface, don't drop
+                raise
         rec = {k: v for k, v in r.items() if k != 'bytes'}
         rec['path'] = rel
         index.append(rec)
         existing.add(key)
         added += 1
     if added:
+        # Not wrapped: if this fails the images are committed but the index isn't,
+        # and re-running recovers (existing files 422 → skipped, index re-committed).
         _put(f"{base()}/{_INDEX_NAME}",
              json.dumps(index, indent=2, ensure_ascii=False).encode('utf-8'),
              f"library: index +{added}", sha=sha)

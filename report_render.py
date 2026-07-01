@@ -18,10 +18,16 @@ draws. It never raises into the caller — on any trouble it returns None / [].
 import io
 import os
 import shutil
+import signal
 import subprocess
 import tempfile
 import textwrap
+import threading
 import zipfile
+
+# Serialize LibreOffice conversions: concurrent headless soffice on a small host
+# collides on its profile and can OOM. One render at a time.
+_LO_LOCK = threading.Lock()
 
 try:
     from PIL import Image, ImageChops, ImageDraw, ImageFont
@@ -491,7 +497,7 @@ def _unique_fill(i, sev):
     return (r, g, b)
 
 
-def render_report_faithful(data, parsed, findings=None, filename=None, dpi=160, timeout=120):
+def render_report_faithful(data, parsed, findings=None, filename=None, dpi=130, timeout=90):
     """Return (png_bytes, status). status is 'ok' or a short reason on failure
     (so the caller can fall back to render_report_image). `findings` lets the
     legend also list warning/critical findings that aren't tied to a cell."""
@@ -593,8 +599,20 @@ def _xlsx_to_pdf(xlsx_path, outdir, timeout):
     cmd = [exe, '--headless', '--norestore', '--invisible', '--nologo',
            '-env:UserInstallation=' + profile,
            '--convert-to', 'pdf:calc_pdf_Export', '--outdir', outdir, xlsx_path]
-    subprocess.run(cmd, timeout=timeout, stdout=subprocess.PIPE,
-                   stderr=subprocess.PIPE, check=True)
+    with _LO_LOCK:
+        # start_new_session so a timeout can kill the whole soffice process group
+        # (soffice forks soffice.bin — killing just the launcher leaves a zombie).
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                start_new_session=True)
+        try:
+            proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except Exception:
+                proc.kill()
+            proc.communicate()
+            raise
     pdf = os.path.join(outdir, os.path.splitext(os.path.basename(xlsx_path))[0] + '.pdf')
     return pdf if os.path.exists(pdf) else None
 

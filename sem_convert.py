@@ -169,8 +169,14 @@ def caption_from_page(page,fig_num):
     if t and not re.match(r'Fig',t,re.I):t=f"Fig 1.{fig_num} shows "+t
     return t.strip()
 
+def _img_width(pdf, xref):
+    try:
+        return pdf.extract_image(xref).get('width', 0)
+    except Exception:
+        return 0
+
 def is_image_page(page,pdf):
-    if not any(pdf.extract_image(img[0]).get('width',0)>500 for img in page.get_images()):
+    if not any(_img_width(pdf, img[0]) > 500 for img in page.get_images()):
         return False
     d=page.get_text("dict")
     for b in d["blocks"]:
@@ -270,6 +276,24 @@ def parse(pdf_path):
 # ════════════════════════════════════════════════════════════
 # EXTRACT FIGURES
 # ════════════════════════════════════════════════════════════
+def _render_crop(page, rect, pw, ph):
+    """Rasterise a page crop robustly: clamp the rect to the page, fall back to a
+    full-page-minus-margins crop when the computed rect is degenerate (a
+    common off-layout case that otherwise crashes get_pixmap), and to the whole
+    page if rasterising still fails. Returns (jpeg_bytes, width, height)."""
+    x0, y0, x1, y1 = rect[0], rect[1], rect[2], rect[3]
+    x0, x1 = max(0.0, min(x0, x1)), min(pw, max(x0, x1))
+    y0, y1 = max(0.0, min(y0, y1)), min(ph, max(y0, y1))
+    if (x1 - x0) < 20 or (y1 - y0) < 20:
+        x0, y0, x1, y1 = 18.0, 60.0, pw - 18.0, ph - 60.0
+    try:
+        pix = page.get_pixmap(dpi=180, clip=fitz.Rect(x0, y0, x1, y1))
+        return pix.tobytes('jpeg'), pix.width, pix.height
+    except Exception:
+        pix = page.get_pixmap(dpi=150)
+        return pix.tobytes('jpeg'), pix.width, pix.height
+
+
 def extract_figures(pdf_path):
     doc=fitz.open(pdf_path);figs={}
     for page in doc:
@@ -306,8 +330,8 @@ def extract_figures(pdf_path):
                         if re.match(r'\s*Fig(?:ure)?\.?\s+1\.\d+\s+shows',lt) and bb[1]>400:
                             if bb[1]<cap_top:cap_top=bb[1]
                 crop_rect=fitz.Rect(18,hdr_bot+5,pw-18,cap_top-4)
-            pix=page.get_pixmap(dpi=180,clip=crop_rect)
-            figs[fn]={'bytes':pix.tobytes('jpeg'),'w':pix.width,'h':pix.height}
+            b,w,h=_render_crop(page,crop_rect,pw,ph)
+            figs[fn]={'bytes':b,'w':w,'h':h}
             continue
 
         # All other figures — prefer exact image-block bounding boxes; fall back to text-based crop
@@ -338,8 +362,8 @@ def extract_figures(pdf_path):
                         if bb[1]<cap_top:cap_top=bb[1]
             crop=fitz.Rect(18,hdr_bot+5,pw-18,cap_top-2)
 
-        pix=page.get_pixmap(dpi=180,clip=crop)
-        figs[fn]={'bytes':pix.tobytes('jpeg'),'w':pix.width,'h':pix.height}
+        b,w,h=_render_crop(page,crop,pw,ph)
+        figs[fn]={'bytes':b,'w':w,'h':h}
 
     doc.close()
     return figs
