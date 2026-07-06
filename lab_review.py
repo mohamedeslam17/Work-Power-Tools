@@ -1809,7 +1809,12 @@ def main():
     for path in sys.argv[1:]:
         with open(path, 'rb') as f:
             data = f.read()
-        rtype, parsed, findings = review_report(path, data)
+        try:
+            rtype, parsed, findings = review_report(path, data)
+        except Exception as e:
+            print('=' * 78)
+            print(f'{path}\n  ⚠️  not a readable .xlsx workbook ({type(e).__name__})')
+            continue
         counts = summarize(findings)
         print('=' * 78)
         print(f'{path}')
