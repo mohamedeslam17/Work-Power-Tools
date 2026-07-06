@@ -119,7 +119,11 @@ def _add_carbide(p, formula='M23C6', size=10):
 
 def _clean_caption(text):
     """Strip unwanted phrases and replace ASCII symbols with Unicode in caption text."""
-    text = re.sub(r'\s*No indications? of[^.]*\.', '', text, flags=re.I)
+    # Drop a whole 'No indication(s) of …' sentence — end at a period that closes
+    # the sentence (a capital or end follows), not at the first '.' inside an
+    # abbreviation/decimal like 'e.g.' or '0.5 µm'. The capital check must stay
+    # case-sensitive, so ignorecase is scoped to the phrase only.
+    text = re.sub(r'(?i:\s*No indications?\s+of).*?\.(?=\s+[A-Z]|\s*$)', '', text)
     text = re.sub(r'\bsecond[- ]?phase\s+', '', text, flags=re.I)
     text = re.sub(r'\bgamma[- ]prime\b', 'γ′', text, flags=re.I)
     text = re.sub(r'\bgamma\b', 'γ', text, flags=re.I)
@@ -143,6 +147,16 @@ def _R_cap(p, text, size=11, color=None, italic=False, bold=False):
             R(p, part, size=size, color=color, italic=italic, bold=bold)
 
 # ── PDF helpers ──────────────────────────────────────────────────────────
+def _open_pdf(path):
+    """Open a PDF, giving a clear error for a password-protected file instead of
+    a cryptic 'document closed or encrypted' failure deep in page iteration."""
+    doc = fitz.open(path)
+    if doc.needs_pass and not doc.authenticate(''):
+        doc.close()
+        raise ValueError('PDF is password-protected; remove the password and retry')
+    return doc
+
+
 def page_text(page):
     d=page.get_text("dict");spans=[]
     for b in d["blocks"]:
@@ -191,7 +205,7 @@ def is_image_page(page,pdf):
 # PARSE
 # ════════════════════════════════════════════════════════════
 def parse(pdf_path):
-    vendor=fitz.open(pdf_path)
+    vendor=_open_pdf(pdf_path)
     full='\n'.join(page_text(p) for p in vendor)
 
     job_m=re.search(r'Job No[:\s.]+([\d]+)',full,re.I)
@@ -203,8 +217,15 @@ def parse(pdf_path):
     dt_m=re.search(r'Date[:\s]+([A-Za-z]+ \d+[a-z]*,?\s*\d{4})',full,re.I)
     date=dt_m.group(1).strip() if dt_m else '05/05/2026'
 
-    sm=re.search(r'Job No[:\s.]+\d+\s+FR\s+(\d+)\s+(\d+)(?:nd|rd|st|th)\s+STG?\s+(BKT|BUCKET)',full,re.I)
-    stage=f"MS{sm.group(1)}001 Stage {sm.group(2)} Bucket" if sm else "MS7001 Stage 3 Bucket"
+    # Accept 'ST', 'STG', 'STAGE' and BUCKET/BLADE variants; when the frame/stage
+    # can't be read, use a neutral placeholder rather than stamping a specific
+    # (and possibly wrong) 'MS7001 Stage 3 Bucket' on the report.
+    sm=re.search(r'Job No[:\s.]+\d+\s+FR\s+(\d+)\s+(\d+)(?:nd|rd|st|th)?\s+ST(?:AGE|G)?\.?\s+(BKT|BUCKET|BLADE)',full,re.I)
+    if sm:
+        part='Blade' if 'BLAD' in sm.group(3).upper() else 'Bucket'
+        stage=f"MS{sm.group(1)}001 Stage {sm.group(2)} {part}"
+    else:
+        stage="Gas-Turbine Component (frame/stage not identified)"
 
     ht="Aged"
     ia="Heavy Repair"
@@ -213,24 +234,29 @@ def parse(pdf_path):
     for r_path in [base.replace('.pdf','_R.pdf'),
                    str(Path(pdf_path).parent/f"{Path(pdf_path).stem}_R.pdf")]:
         if os.path.exists(r_path):
-            rpdf=fitz.open(r_path)
+            rpdf=_open_pdf(r_path)
             rf='\n'.join(page_text(p) for p in rpdf); rpdf.close()
-            ht_m=re.search(r'Heat Treatment Condition[:\s]+([^\n••]+)',rf,re.I)
+            # page_text flattens each page to one line, so bound the capture at
+            # the next known label — otherwise it runs to the end of the page.
+            _stop=r'(?=\s+(?:Incoming Assessment|Heat Treatment|Serial Number|Job No|Material|CONCLUSION)\b|[\n••]|$)'
+            ht_m=re.search(r'Heat Treatment Condition[:\s]+(.+?)'+_stop,rf,re.I)
             if ht_m:ht=ht_m.group(1).strip()
-            ia_m=re.search(r'Incoming Assessment[:\s]+([^\n••]+)',rf,re.I)
+            ia_m=re.search(r'Incoming Assessment[:\s]+(.+?)'+_stop,rf,re.I)
             if ia_m:ia=ia_m.group(1).strip()
             break
 
     sizes=re.findall(r'measured to be ([\d.]+) microns',full,re.I)
     l1=sizes[0] if sizes else 'N/A'
     l2=sizes[1] if len(sizes)>1 else 'N/A'
+    # Keep every measured size so a third+ location isn't silently dropped from
+    # the summary table (see build()).
     no_anom=bool(re.search(r'No (evidence|indications) of.*(needle|sigma|eta)',full,re.I))
     rts=bool(re.search(r'suitable for return to service',full,re.I))
     conclusion=''
     for r_path in [base.replace('.pdf','_R.pdf'),
                    str(Path(pdf_path).parent/f"{Path(pdf_path).stem}_R.pdf")]:
         if os.path.exists(r_path):
-            rpdf2=fitz.open(r_path)
+            rpdf2=_open_pdf(r_path)
             rlast=rpdf2[-1].get_text("text")
             rpdf2.close()
             cm=re.search(r'CONCLUSION\s*\n+(.*?)(?:Location\s*\nMorphology|$)',rlast,re.DOTALL|re.I)
@@ -240,14 +266,20 @@ def parse(pdf_path):
         cm=re.search(r'(The metallurgical evaluation.+?NDT inspections\.)',full,re.DOTALL|re.I)
         if cm:conclusion=re.sub(r'\s+',' ',cm.group(1)).strip()
 
+    # Assign captions from pages carrying "Fig 1.N shows" (an authoritative
+    # caption) BEFORE pages that merely reference "Fig 1.N", so a cross-reference
+    # on another page can't claim a figure number ahead of its real caption page.
     captions={}
+    cap_pages=[]
     for page in vendor:
         if not is_image_page(page,vendor):continue
         pt=page_text(page)
         m=re.search(r'(?:Fig|Figure)\.?\s+1[.\s]*(\d+)\s+shows',pt,re.I)
+        has_shows=bool(m)
         if not m:m=re.search(r'(?:Fig|Figure)\.?\s+1[.\s]*(\d+)',pt,re.I)
         if not m:continue
-        fn=m.group(1)
+        cap_pages.append((page,m.group(1),has_shows))
+    for page,fn,has_shows in sorted(cap_pages,key=lambda t:0 if t[2] else 1):
         if fn in captions:continue
         captions[fn]=caption_from_page(page,fn)
 
@@ -265,12 +297,15 @@ def parse(pdf_path):
         m2=re.search(r'(Fig\s+1\.1\s+shows.+?(?:under SEM\.|SEM\.))',side,re.I|re.DOTALL)
         if m2:captions['1']=re.sub(r'\s+',' ',m2.group(1)).strip()
         break
-    if '1' not in captions or not captions.get('1','').startswith('Fig'):
+    # Case-insensitive: don't discard a legitimately-parsed 'FIGURE 1.1 …' caption
+    # (and replace it with boilerplate claiming a specific etchant) just because it
+    # isn't capitalised 'Fig'.
+    if '1' not in captions or not re.match(r'fig',captions.get('1',''),re.I):
         captions['1']=f"Fig 1.1 shows Image of the as-received sample (ID# {job}). The specimen was first mounted, metallographically prepared and etched with Glyceregia prior to examination under SEM."
 
     vendor.close()
     return dict(job=job,serial=serial,material=mat,date=date,stage=stage,
-                ht=ht,ia=ia,l1=l1,l2=l2,no_anom=no_anom,rts=rts,
+                ht=ht,ia=ia,l1=l1,l2=l2,sizes=sizes,no_anom=no_anom,rts=rts,
                 conclusion=conclusion,captions=captions)
 
 # ════════════════════════════════════════════════════════════
@@ -294,18 +329,54 @@ def _render_crop(page, rect, pw, ph):
         return pix.tobytes('jpeg'), pix.width, pix.height
 
 
+def _img_blocks(page, pw, ph, min_w=0.25, min_h=0.15):
+    """Image-block bounding boxes on a page, larger than a fraction of the page."""
+    out=[]
+    for b in page.get_text("dict")["blocks"]:
+        if b.get("type")==1:
+            bx0,by0,bx1,by1=b["bbox"]
+            if (bx1-bx0)>pw*min_w and (by1-by0)>ph*min_h:
+                out.append((bx0,by0,bx1,by1))
+    return out
+
+
 def extract_figures(pdf_path):
-    doc=fitz.open(pdf_path);figs={}
+    doc=_open_pdf(pdf_path);figs={}
+    # Collect candidate pages with EVERY figure number they reference; process
+    # pages carrying "Fig 1.N shows" (an authoritative caption) first so a mere
+    # cross-reference can't claim a figure number ahead of the real page.
+    cands=[]
     for page in doc:
         if not is_image_page(page,doc):continue
         pt=page_text(page)
-        m=re.search(r'(?:Fig|Figure)\.?\s+1[.\s]*(\d+)\s+shows',pt,re.I)
-        if not m:m=re.search(r'(?:Fig|Figure)\.?\s+1[.\s]*(\d+)',pt,re.I)
-        if not m:continue
-        fn=m.group(1)
-        if fn in figs:continue
+        shows=re.findall(r'(?:Fig|Figure)\.?\s+1[.\s]*(\d+)\s+shows',pt,re.I)
+        nums=shows or re.findall(r'(?:Fig|Figure)\.?\s+1[.\s]*(\d+)',pt,re.I)
+        seen=[]
+        for n in nums:
+            if n not in seen:seen.append(n)
+        if seen:cands.append((page,seen,bool(shows)))
+    cands.sort(key=lambda t:0 if t[2] else 1)
 
+    for page,nums,has_shows in cands:
+        nums=[n for n in nums if n not in figs]
+        if not nums:continue
         pw=page.rect.width;ph=page.rect.height
+
+        # A page with several micrographs (Fig 1.3 + 1.4 side by side): pair each
+        # image block with a figure number so the second figure isn't lost into a
+        # single merged crop.
+        if nums!=['1'] and len(nums)>=2:
+            blocks=_img_blocks(page,pw,ph)
+            if len(blocks)>=2:
+                blocks.sort(key=lambda b:(round(b[1]/10),b[0]))
+                for fn,blk in zip(sorted(nums,key=int),blocks):
+                    crop=fitz.Rect(max(0,blk[0]-4),max(0,blk[1]-4),
+                                   min(pw,blk[2]+4),min(ph,blk[3]+4))
+                    b,w,h=_render_crop(page,crop,pw,ph)
+                    figs[fn]={'bytes':b,'w':w,'h':h}
+                continue
+
+        fn=nums[0]
         # Only look for header/title text in the top 30% of the page to avoid
         # mistaking image-embedded labels for the page header.
         hdr_zone = ph * 0.30
@@ -370,16 +441,22 @@ def extract_figures(pdf_path):
 
 def _default_conclusion(info):
     """Generate a template conclusion filled with parsed report metadata."""
-    l1 = info.get('l1', 'N/A')
-    l2 = info.get('l2', 'N/A')
+    sizes = info.get('sizes') or [s for s in (info.get('l1'), info.get('l2'))
+                                  if s and s != 'N/A']
+    if len(sizes) >= 2:
+        size_sentence = (f"Average γ′ sizes ranged between {sizes[0]} µm and {sizes[-1]} µm, "
+                         f"consistent across the examined locations. ")
+    elif len(sizes) == 1:
+        size_sentence = f"The average primary γ′ size measured {sizes[0]} µm. "
+    else:
+        size_sentence = ""
     return (
         f"SEM microstructural analysis was conducted on a {info['stage']} "
         f"(S/N: {info['serial']}) manufactured from {info['material']} superalloy. "
-        f"The specimen, provided in the {info['ht']}, was examined at two representative "
+        f"The specimen, provided in the {info['ht']}, was examined at representative "
         f"locations under magnifications up to 10,000x.\n\n"
         f"The microstructure revealed cuboidal primary γ′ precipitates with fine secondary γ′ "
-        f"within the γ matrix. Average γ′ sizes ranged between {l1} µm and {l2} µm, consistent "
-        f"across the two examined locations. Stable MC carbides were observed within grains, "
+        f"within the γ matrix. {size_sentence}Stable MC carbides were observed within grains, "
         f"while M23C6 carbides were present along grain boundaries.\n\n"
         f"Based on these findings, the examined bucket (Job {info['job']}, S/N: {info['serial']}) "
         f"is considered suitable for reconditioning, subject to completion of standard NDT "
@@ -452,10 +529,23 @@ def add_two_col(doc, left_content_fn, right_bytes, right_cm=13.0, left_cm=13.5,
 def build(info, figs, out_path):
     caps = info['captions']
 
-    # Determine all SEM figure numbers (excluding cover figs 1 and 2),
-    # then group into pages of 3 for a fully dynamic layout.
+    # SEM figures (excluding cover figs 1 and 2), grouped by the location named
+    # in each figure's OWN caption, then paged in blocks of 3 — so a page never
+    # mixes locations under one banner.
     sem_fig_nums = sorted([k for k in figs.keys() if k not in ('1', '2')], key=int)
-    sem_chunks   = [sem_fig_nums[i:i+3] for i in range(0, len(sem_fig_nums), 3)]
+
+    def _fig_loc(fn):
+        cap = caps.get(fn, '').lower()
+        return 'Location 2' if 'location 2' in cap else 'Location 1'
+
+    from collections import OrderedDict
+    _loc_groups = OrderedDict()
+    for fn in sem_fig_nums:
+        _loc_groups.setdefault(_fig_loc(fn), []).append(fn)
+    sem_chunks = []   # list of (location_label, [fig_nums])
+    for loc, fns in _loc_groups.items():
+        for i in range(0, len(fns), 3):
+            sem_chunks.append((loc, fns[i:i+3]))
     total = 4 + len(sem_chunks) + 1   # cover + TOC + intro + micro + SEM pages + summary
 
     today = datetime.date.today().strftime('%d %B %Y')
@@ -566,7 +656,11 @@ def build(info, figs, out_path):
         add_two_col(doc,left_p3,f1['bytes'],right_cm=12.2,left_cm=14.5,
                     caption=caps.get('1','Fig 1.1'),img_pix=(f1['w'],f1['h']))
     else:
-        left_p3_para=doc.add_paragraph(); left_p3(left_p3_para)
+        # No fig 1.1 extracted (scanned / image-only / undetected as-received page):
+        # left_p3 needs a container that supports add_paragraph — a Paragraph does
+        # not, so render into a single borderless table cell instead of crashing.
+        _t=doc.add_table(rows=1,cols=1); _nobdr(_t.rows[0].cells[0])
+        left_p3(_t.rows[0].cells[0])
 
     _new_landscape_page(doc)
 
@@ -598,19 +692,14 @@ def build(info, figs, out_path):
         f2=figs['2']
         add_two_col(doc,left_p4,f2['bytes'],right_cm=13.0,left_cm=13.5,
                     caption=caps.get('2','Fig 1.2'),img_pix=(f2['w'],f2['h']))
-    _new_landscape_page(doc)
+    # Next section is a SEM image page (landscape) when there are figures, else the
+    # summary/conclusion page (portrait) — otherwise it would inherit landscape.
+    if sem_chunks:
+        _new_landscape_page(doc)
+    else:
+        _new_portrait_page(doc)
 
     # ══ SEM IMAGE PAGES: 3 figures per page, location label from captions ═══
-    def _loc_label(fn_list):
-        """Detect location from captions; fall back to 'Location 1'."""
-        for fn in fn_list:
-            cap = caps.get(fn, '').lower()
-            if 'location 2' in cap:
-                return 'Location 2'
-            elif 'location 1' in cap:
-                return 'Location 1'
-        return 'Location 1'
-
     def sem_page(nums, loc_lbl, page_num, next_portrait=False):
         add_page_hdr(doc, page_num, landscape=True)
         present=[(n,figs[n]) for n in nums if n in figs]
@@ -649,10 +738,10 @@ def build(info, figs, out_path):
         else:
             _new_landscape_page(doc)
 
-    for i, chunk in enumerate(sem_chunks):
+    for i, (loc_lbl, chunk) in enumerate(sem_chunks):
         page_num  = 5 + i
         is_last   = (i == len(sem_chunks) - 1)
-        sem_page(chunk, _loc_label(chunk), page_num, next_portrait=is_last)
+        sem_page(chunk, loc_lbl, page_num, next_portrait=is_last)
 
     # ══ SUMMARY + CONCLUSION ════════════════════════════════════════════════
     add_page_hdr(doc, total)
@@ -664,16 +753,22 @@ def build(info, figs, out_path):
     R(p,'To consolidate the observations from both examined locations, the measured sizes of primary γ′ precipitates are summarized in the table below:')
     SP(doc,4)
 
-    gt=doc.add_table(rows=3,cols=3);gt.alignment=WD_TABLE_ALIGNMENT.CENTER;gt.style='Table Grid'
+    # One row per measured location (not a hardcoded two), so a third+ location
+    # isn't dropped and a single-location report doesn't render a literal 'N/A'.
+    meas_sizes = info.get('sizes') or [s for s in (info.get('l1'), info.get('l2'))
+                                       if s and s != 'N/A']
+    if not meas_sizes:
+        meas_sizes = ['N/A']
+    gt=doc.add_table(rows=1+len(meas_sizes),cols=3);gt.alignment=WD_TABLE_ALIGNMENT.CENTER;gt.style='Table Grid'
     gw=[Cm(5.0),Cm(5.0),Cm(5.0)]
     for j,h in enumerate(['Location','Morphology','Average Size (μm)']):
         c=gt.rows[0].cells[j];c.width=gw[j];_bg(c,'1A1A2E');_bdr(c)
         cp=c.paragraphs[0];cp.alignment=WD_ALIGN_PARAGRAPH.CENTER
         R(cp,h,bold=True,size=10,color=WHITE)
-    for ri,row in enumerate([['Location 1','Cuboidal',info['l1']],['Location 2','Cuboidal',info['l2']]]):
-        for ci,val in enumerate(row):
+    for ri,size in enumerate(meas_sizes):
+        for ci,val in enumerate([f'Location {ri+1}','Cuboidal',size]):
             c=gt.rows[ri+1].cells[ci];c.width=gw[ci];_bdr(c)
-            if ri==1:_bg(c,'F8F8F8')
+            if ri%2==1:_bg(c,'F8F8F8')
             cp=c.paragraphs[0];cp.alignment=WD_ALIGN_PARAGRAPH.CENTER;R(cp,val,size=10)
     tp=doc.add_paragraph();tp.alignment=WD_ALIGN_PARAGRAPH.CENTER
     tp.paragraph_format.space_before=Pt(6);tp.paragraph_format.space_after=Pt(12)
@@ -683,7 +778,7 @@ def build(info, figs, out_path):
     R(h,'CONCLUSION',bold=True,size=11,color=NAVY)
     conclusion_text=info['conclusion'] if info['conclusion'] else _default_conclusion(info)
     for part in re.split(r'\n\s*\n',conclusion_text):
-        clean=re.sub(r'\s*No indications? of[^.]*\.','',part,flags=re.I)
+        clean=re.sub(r'(?i:\s*No indications?\s+of).*?\.(?=\s+[A-Z]|\s*$)','',part)
         clean=re.sub(r'\s+',' ',clean).strip()
         if clean:
             p=doc.add_paragraph();p.paragraph_format.space_after=Pt(8)
