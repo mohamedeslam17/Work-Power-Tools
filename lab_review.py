@@ -23,6 +23,7 @@ Public entry point:
 
 Usage (CLI):  python3 lab_review.py report.xlsx
 """
+import datetime
 import io
 import os
 import re
@@ -37,8 +38,16 @@ import openpyxl
 try:
     from PIL import Image, ImageFilter
     _PIL_AVAILABLE = True
+    # Guard against decompression-bomb images embedded in a malformed/malicious
+    # workbook: cap the pixel count PIL will decode so a crafted image can't OOM
+    # the shared Streamlit worker before we even look at its dimensions.
+    Image.MAX_IMAGE_PIXELS = 64_000_000
 except Exception:
     _PIL_AVAILABLE = False
+
+# Largest image we will analyse (edge map + OCR upscale amplify memory several×,
+# so oversized images are skipped rather than processed).
+_MAX_ANALYZE_PIXELS = 40_000_000
 
 try:
     import pytesseract
@@ -154,9 +163,17 @@ def _txt(v):
     return '' if v is None else str(v).strip()
 
 
+# Labels/headings live near the top of these sheets; cap unbounded scans so a
+# single stray cell at Excel's max row (which inflates ws.max_row to ~1,048,576)
+# can't turn every label lookup into a minutes-long, worker-freezing loop.
+_SCAN_ROWS_CAP = 2000
+
+
 def _find(ws, pattern, col=None, max_row=None):
     """Return (row, col) of the first cell whose text matches `pattern`."""
     rx = re.compile(pattern, re.I)
+    if max_row is None:
+        max_row = min(ws.max_row, _SCAN_ROWS_CAP)
     for row in ws.iter_rows(max_row=max_row):
         for cell in row:
             if col is not None and cell.column != col:
@@ -168,20 +185,29 @@ def _find(ws, pattern, col=None, max_row=None):
 
 
 def _value_right_loc(ws, row, col, max_scan=12):
-    """(value, (row, col)) of the first non-empty cell to the right, else (None, None)."""
+    """(value, (row, col)) of the first non-empty cell to the right, else (None, None).
+
+    If the first non-empty cell is itself another field's label (ends with ':'),
+    this field is treated as blank — otherwise an unfilled field would silently
+    swallow the next label as its value.
+    """
     for c in range(col + 1, col + 1 + max_scan):
         t = _txt(ws.cell(row=row, column=c).value)
         if t:
-            return t, (row, c)
+            return (None, None) if _looks_like_label(t) else (t, (row, c))
     return None, None
 
 
 def _value_below_loc(ws, row, col, max_scan=6):
-    """(value, (row, col)) of the first non-empty cell below, else (None, None)."""
+    """(value, (row, col)) of the first non-empty cell below, else (None, None).
+
+    Stops on a label-looking cell (see _value_right_loc) so a blank field can't
+    capture an unrelated label/section heading below it.
+    """
     for r in range(row + 1, row + 1 + max_scan):
         t = _txt(ws.cell(row=r, column=col).value)
         if t:
-            return t, (r, col)
+            return (None, None) if _looks_like_label(t) else (t, (r, col))
     return None, None
 
 
@@ -199,12 +225,23 @@ def _is_placeholder(v):
     return _txt(v).lower() in _PLACEHOLDERS
 
 
+# A cell whose text ends with a colon is another field's label, not this field's
+# value — used to stop a rightward/downward value scan from swallowing it.
+_LABELISH = re.compile(r'[A-Za-z].*:\s*$')
+
+
+def _looks_like_label(t):
+    return bool(_LABELISH.search(t or ''))
+
+
 def _num(v):
     """Parse a float from a cell that may carry units/symbols. Handles both the
     English '12.5' / '1,234.56' and the European '12,5' / '1.234,56' forms
     (common on Italian-lab reports); returns None when there's no number."""
-    if v is None:
-        return None
+    if v is None or isinstance(v, bool):
+        return None                         # bool is an int subclass — never a value
+    if isinstance(v, (datetime.date, datetime.datetime, datetime.time)):
+        return None                         # a date is never a measurement
     if isinstance(v, (int, float)):
         return float(v)
     m = re.search(r'-?\d[\d.,  ]*\d|-?\d', str(v))
@@ -221,6 +258,25 @@ def _num(v):
         return float(s)
     except ValueError:
         return None
+
+
+def _meas_num(v):
+    """Numeric value of a coating-measurement cell, but None for sentence-like
+    text (footer notes such as 'All 20 measurements taken at 100x') so a note
+    below the table isn't range-checked as a thickness."""
+    if isinstance(v, str):
+        if not re.match(r'^[<>]?\s*\d[\d.,\s]*(?:mm|µm|um)?$', v.strip(), re.I):
+            return None
+    return _num(v)
+
+
+def _looks_like_point_header(vals):
+    """True for a measurement-point index row like 1,2,3,…,N — consecutive small
+    integers starting at 0 or 1, i.e. a sub-header rather than thickness data."""
+    if len(vals) < 3 or any(not float(v).is_integer() for v in vals):
+        return False
+    seq = [int(v) for v in vals]
+    return seq[0] in (0, 1) and seq == list(range(seq[0], seq[0] + len(seq)))
 
 
 # ── Report-type detection ─────────────────────────────────────────────────
@@ -281,7 +337,9 @@ def _sample(ws):
     def below(substr):
         for h, c in headers.items():
             if substr in h:
-                val, vloc = _value_below_loc(ws, hrow, c)
+                # The sample row sits directly under its header; keep the scan
+                # tight so a blank cell can't reach into the next section.
+                val, vloc = _value_below_loc(ws, hrow, c, max_scan=2)
                 return val, {'label': (hrow, c), 'value': vloc}
         return None, None
 
@@ -302,12 +360,23 @@ def _hardness_unit(raw):
 
 def _hardness(ws):
     out, loc = {}, {}
+    # Anchor to the hardness band: a bare "Pre-/Post-Solution" can also appear in
+    # a picture caption ("Post-Solution HT, Kalling"), which would otherwise be
+    # read as a phantom hardness value from the neighbouring "Picture N:" cell.
+    hsec = _find(ws, r'^\s*Hardness')
+    pics = _find(ws, r'Picture\s*\d+\s*:')
     for key, pat in (('pre', r'Pre-?\s*Solution'), ('post', r'Post-?\s*Solution')):
         lbl = _find(ws, pat)
-        if lbl:
-            raw, vloc = _value_right_loc(ws, *lbl)
-            out[key] = {'raw': raw, 'value': _num(raw), 'unit': _hardness_unit(raw)}
-            loc[key] = {'label': lbl, 'value': vloc}
+        if not lbl:
+            continue
+        r = lbl[0]
+        if (hsec and r < hsec[0]) or (pics and r >= pics[0]):
+            continue                        # outside the hardness band → a caption
+        raw, vloc = _value_right_loc(ws, *lbl)
+        if raw and _PICNUM.search(str(raw)):
+            continue                        # 'Picture N:' to the right → not a reading
+        out[key] = {'raw': raw, 'value': _num(raw), 'unit': _hardness_unit(raw)}
+        loc[key] = {'label': lbl, 'value': vloc}
     return out, loc
 
 
@@ -326,37 +395,109 @@ def _coating(ws):
     return out, loc
 
 
-def _composition(ws, which):
-    """Extract {element: value} for which='Nominal' or 'Actual'.
+def _spec_from_text(raw):
+    """Parse a Nominal composition cell into a spec dict.
 
-    Handles the two layouts seen in practice: element headers in the
-    '(Nominal/Actual)' label row with values below, OR element headers in the
-    row above the label with values in the label row. Tolerates the 'Minimal'
-    typo for 'Nominal'.
+    A nominal cell is often not a single point value — it carries the spec
+    *range* ('15.7-16.3') or a one-sided *limit* ('< 0.5', 'max 0.5'). Returns
+    one of:
+        {'kind': 'range', 'lo', 'hi', 'value', 'raw'}
+        {'kind': 'max',   'hi',       'value', 'raw'}
+        {'kind': 'min',   'lo',       'value', 'raw'}
+        {'kind': 'point', 'value',              'raw'}
+    or None when there is no number. 'value' is a representative float (range
+    midpoint / the limit / the point) so callers that just want a number still
+    work.
+    """
+    t = str(raw if raw is not None else '').strip()
+    # Range 'a-b' / 'a – b' (must be two positive numbers, not a leading minus).
+    m = re.match(r'^\s*(\d[\d.,]*)\s*[-–—]\s*(\d[\d.,]*)\s*$', t)
+    if m:
+        lo, hi = _num(m.group(1)), _num(m.group(2))
+        if lo is not None and hi is not None:
+            if lo > hi:
+                lo, hi = hi, lo
+            return {'kind': 'range', 'lo': lo, 'hi': hi,
+                    'value': (lo + hi) / 2.0, 'raw': t}
+    if re.search(r'<|≤|\bmax(?:imum)?\b', t, re.I):
+        v = _num(t)
+        if v is not None:
+            return {'kind': 'max', 'hi': v, 'value': v, 'raw': t}
+    if re.search(r'>|≥|\bmin(?:imum)?\b', t, re.I):
+        v = _num(t)
+        if v is not None:
+            return {'kind': 'min', 'lo': v, 'value': v, 'raw': t}
+    v = _num(t)
+    if v is not None:
+        return {'kind': 'point', 'value': v, 'raw': t}
+    return None
+
+
+def _composition(ws, which):
+    """Extract composition for which='Nominal' or 'Actual'.
+
+    Returns (comp, loc, spec):
+      comp : {element: representative float}
+      loc  : {element: (row, col)} of the value cell
+      spec : {element: spec-dict}  (Nominal only; see _spec_from_text)
+
+    Handles element headers in the '(Nominal/Actual)' label row with values
+    below, element headers in the row above, and a single shared header row
+    sitting several rows above stacked (Nominal)/(Actual) value rows. When the
+    two labels share a row (side-by-side tables) each label reads only its own
+    sub-table so they can't cross-read. Tolerates the 'Minimal' typo.
     """
     pat = r'\(\s*(?:Nominal|Minimal)\s*\)' if which == 'Nominal' else r'\(\s*Actual\s*\)'
+    other = r'\(\s*Actual\s*\)' if which == 'Nominal' else r'\(\s*(?:Nominal|Minimal)\s*\)'
     lbl = _find(ws, pat)
-    comp, loc = {}, {}
+    comp, loc, spec = {}, {}, {}
     if not lbl:
-        return comp, loc
-    lrow = lbl[0]
+        return comp, loc, spec
+    lrow, lcol = lbl
+
+    # Bound the element scan to this label's own columns. Elements sit to the
+    # right of the label; if the OTHER label shares this row, stop before it.
+    cmin, cmax = lcol + 1, None
+    for c in ws[lrow]:
+        if c.column > lcol and re.search(other, _txt(c.value), re.I):
+            cmax = c.column - 1
+            break
 
     def elem_cells(r):
-        return [c for c in ws[r] if r >= 1 and _txt(c.value).capitalize() in ELEMENTS]
+        if r < 1:
+            return []
+        return [c for c in ws[r]
+                if c.column >= cmin and (cmax is None or c.column <= cmax)
+                and _txt(c.value).capitalize() in ELEMENTS]
 
-    if len(elem_cells(lrow)) >= 2:           # elements in label row, values below
+    if len(elem_cells(lrow)) >= 2:               # elements in label row, values below
         ehdr, vrow = lrow, lrow + 1
-    elif lrow > 1 and len(elem_cells(lrow - 1)) >= 2:   # elements above, values in label row
-        ehdr, vrow = lrow - 1, lrow
-    else:
-        return comp, loc
+    else:                                        # element header sits above the values
+        ehdr = None
+        for up in range(lrow - 1, max(0, lrow - 6), -1):
+            if len(elem_cells(up)) >= 2:
+                ehdr, vrow = up, lrow
+                break
+        if ehdr is None:
+            return comp, loc, spec
+
+    is_nominal = which == 'Nominal'
     for cell in elem_cells(ehdr):
-        val = _num(ws.cell(row=vrow, column=cell.column).value)
-        if val is not None:
-            el = _txt(cell.value).capitalize()
+        raw = ws.cell(row=vrow, column=cell.column).value
+        el = _txt(cell.value).capitalize()
+        if is_nominal:
+            sp = _spec_from_text(raw)
+            if sp is None:
+                continue
+            comp[el] = sp['value']
+            spec[el] = sp
+        else:
+            val = _num(raw)
+            if val is None:
+                continue
             comp[el] = val
-            loc[el] = (vrow, cell.column)
-    return comp, loc
+        loc[el] = (vrow, cell.column)
+    return comp, loc, spec
 
 
 def _comment(ws):
@@ -370,7 +511,7 @@ def _comment(ws):
 def _pictures(ws):
     rx = re.compile(r'Picture\s*\d+\s*:', re.I)
     pics, loc = [], []
-    for row in ws.iter_rows():
+    for row in ws.iter_rows(max_row=min(ws.max_row, _SCAN_ROWS_CAP)):
         for cell in row:
             if rx.search(_txt(cell.value)):
                 cap, vloc = _value_right_loc(ws, cell.row, cell.column)
@@ -396,8 +537,8 @@ def parse_metallurgical(wb, media=0):
     header, lh    = _header(ws)
     sample, ls    = _sample(ws)
     hardness, lhd = _hardness(ws)
-    nominal, ln   = _composition(ws, 'Nominal')
-    actual, la    = _composition(ws, 'Actual')
+    nominal, ln, nspec = _composition(ws, 'Nominal')
+    actual, la, _      = _composition(ws, 'Actual')
     coating, lc   = _coating(ws)
     comment, lcm  = _comment(ws)
     pictures, lp  = _pictures(ws)
@@ -406,7 +547,8 @@ def parse_metallurgical(wb, media=0):
         'header':    header,
         'sample':    sample,
         'hardness':  hardness,
-        'nominal':   nominal,
+        'nominal':      nominal,
+        'nominal_spec': nspec,
         'actual':    actual,
         'coating':   coating,
         'comment':   comment,
@@ -428,31 +570,70 @@ def parse_metallurgical(wb, media=0):
     }
 
 
-def _composition_deviations(nominal, actual):
-    """Elements whose Actual is out of tolerance vs Nominal.
+def _spec_ref(sp, nom, act):
+    """Reference value the Actual is judged against, or 'in_spec' when a range /
+    limit spec already contains it. `nom` is the representative point value used
+    when there is no interval/limit spec."""
+    kind = sp.get('kind') if sp else 'point'
+    if kind == 'range':
+        lo, hi = sp['lo'], sp['hi']
+        if lo <= act <= hi:
+            return 'in_spec'
+        return lo if act < lo else hi
+    if kind == 'max':
+        return 'in_spec' if act <= sp['hi'] else sp['hi']
+    if kind == 'min':
+        return 'in_spec' if act >= sp['lo'] else sp['lo']
+    return nom
 
-    Returns (deviations, systemic) where deviations is a list of
-    (element, nominal, actual, rel%) and `systemic` is True when so many
-    elements are off that the actual material likely isn't the stated alloy.
+
+def _composition_deviations(nominal, actual, spec=None):
+    """Elements whose Actual is out of tolerance vs the Nominal spec.
+
+    Returns (deviations, systemic) where each deviation is
+    (element, nominal_repr, actual, rel%|None, severity) — rel is None for a
+    spec value of 0 (graded on absolute deviation). `systemic` is True when so
+    many elements are off that the material likely isn't the stated alloy.
     """
     deviations = []
     if not nominal or not actual:
         return deviations, False
+    spec = spec or {}
     common = sorted(set(nominal) & set(actual))
     for el in common:
         nom, act = nominal[el], actual[el]
-        if nom == 0:
+        ref = _spec_ref(spec.get(el), nom, act)
+        if ref == 'in_spec':
             continue
-        dev = act - nom
-        rel = dev / abs(nom) * 100.0
-        if abs(rel) >= COMP_WARN_REL and abs(dev) >= COMP_WARN_ABS:
-            deviations.append((el, nom, act, rel))
+        dev = act - ref
+        if ref == 0:                        # spec value 0 → absolute-only test
+            if abs(dev) >= COMP_CRIT_ABS:
+                deviations.append((el, nom, act, None, 'critical'))
+            elif abs(dev) >= COMP_WARN_ABS:
+                deviations.append((el, nom, act, None, 'warning'))
+            continue
+        rel = dev / abs(ref) * 100.0
+        if abs(rel) >= COMP_CRIT_REL and abs(dev) >= COMP_CRIT_ABS:
+            deviations.append((el, nom, act, rel, 'critical'))
+        elif abs(rel) >= COMP_WARN_REL and abs(dev) >= COMP_WARN_ABS:
+            deviations.append((el, nom, act, rel, 'warning'))
     n_dev, n_common = len(deviations), len(common)
     systemic = n_dev >= 4 or (n_dev >= 3 and n_common and n_dev / n_common >= 0.5)
     return deviations, systemic
 
 
-def _review_composition(nominal, actual):
+def _fmt_deviation(el, nom, act, rel):
+    if rel is None:
+        return f'{el}: actual {act:g} vs nominal {nom:g} wt% (Δ{act - nom:+g}).'
+    return f'{el}: actual {act:g} vs nominal {nom:g} wt% ({rel:+.0f}%).'
+
+
+def _dev_sortkey(d):
+    """Order deviations worst-first; absolute-only (rel None) deviations sort top."""
+    return -(abs(d[3]) if d[3] is not None else float('inf'))
+
+
+def _review_composition(nominal, actual, spec=None):
     findings = []
     if not nominal or not actual:
         findings.append(('warning', 'Composition',
@@ -460,22 +641,24 @@ def _review_composition(nominal, actual):
         return findings
 
     common = sorted(set(nominal) & set(actual))
-    deviations, systemic = _composition_deviations(nominal, actual)
+    deviations, systemic = _composition_deviations(nominal, actual, spec)
     n_dev, n_common = len(deviations), len(common)
 
-    # A few elements off is normal service depletion / EDS scatter → warnings.
-    # Many elements off together signals the actual material doesn't match the
-    # stated alloy → one consolidated FAIL ("verify material/grade").
+    # A few elements off is normal service depletion / EDS scatter → per-element
+    # findings (a single gross deviation is graded critical on its own). Many
+    # elements off together signals the actual material doesn't match the stated
+    # alloy → one consolidated FAIL ("verify material/grade").
     if systemic:
-        worst = sorted(deviations, key=lambda d: -abs(d[3]))[:4]
-        detail = ", ".join(f"{el} {rel:+.0f}%" for el, _, _, rel in worst)
+        worst = sorted(deviations, key=_dev_sortkey)[:4]
+        detail = ", ".join(
+            (f"{el} {rel:+.0f}%" if rel is not None else f"{el} Δ{act - nom:+g}")
+            for el, nom, act, rel, _ in worst)
         findings.append(('critical', 'Composition',
                          f'{n_dev} of {n_common} elements out of tolerance ({detail} …) — actual '
                          f'composition does not match the stated alloy; verify material/grade.'))
     else:
-        for el, nom, act, rel in deviations:
-            findings.append(('warning', 'Composition',
-                             f'{el}: actual {act:g} vs nominal {nom:g} wt% ({rel:+.0f}%).'))
+        for el, nom, act, rel, sev in deviations:
+            findings.append((sev, 'Composition', _fmt_deviation(el, nom, act, rel)))
 
     only_nom = sorted(set(nominal) - set(actual))
     only_act = sorted(set(actual) - set(nominal))
@@ -523,8 +706,12 @@ def _review_comment(parsed):
     comment_types = _coating_types_in(comment)
 
     present = (coat.get('present') or '').strip().lower()
+    # "No coating" is only asserted when a coating cell was actually parsed —
+    # otherwise a layout the parser missed (all fields None) would be read as an
+    # explicit "no coating" and contradict a comment that mentions one.
+    any_coat_cell = any(coat.get(k) is not None for k in ('present', 'type', 'received', 'outgoing'))
     cell_has  = present == 'yes' or bool(cell_types)
-    cell_none = present == 'no' or (not cell_types and _is_placeholder(coat.get('type')))
+    cell_none = present == 'no' or (any_coat_cell and not cell_types and _is_placeholder(coat.get('type')))
 
     comment_has = bool(comment_types) or bool(re.search(
         r'received with[^.]{0,30}coating|coated with|coating (?:was |is )?(?:applied|present|intact)', cl))
@@ -573,8 +760,13 @@ def _review_comment(parsed):
                     r'beyond\s+repair|non[-\s]?conform|unacceptable', cl)
     pos = re.search(r'(?<!not )(?:\bsuitable for|\bacceptable|recommended for|'
                     r'reconditi|fit for service|return to service)', cl)
-    result_pos = bool(re.search(r'accept|suitable|conform|\bpass\b', rlow)) and 'see comment' not in rlow
-    result_neg = bool(re.search(r'reject|not\s+suitable|scrap|unacceptable', rlow))
+    # A negative Result cell ("Not acceptable", "Non conforming") must not also
+    # count as positive just because it contains "accept"/"conform" — grade it
+    # negative first and short-circuit.
+    result_neg = bool(re.search(r'reject|not\s+suitable|unsuitable|scrap|unacceptable|'
+                                r'not\s+accept|non[-\s]?conform', rlow))
+    result_pos = (not result_neg) and 'see comment' not in rlow and \
+        bool(re.search(r'accept|suitable|conform|\bpass\b', rlow))
     if result_pos and neg and not pos:
         findings.append(('warning', 'Comment',
                          f'Result cell says "{result}" but the comment indicates the part is NOT suitable.'))
@@ -609,9 +801,15 @@ def _review_hardness(hardness, material):
     is_hrc = (unit == 'HRC') or (unit is None and all(v <= 72 for v in vals))
     ustr = unit or ('HRC' if is_hrc else 'HV')
 
-    # Solution treatment should soften the material (post ≤ pre) — scale-agnostic.
-    # ±2 guard band so measurement scatter doesn't trip a false warning.
-    if pre is not None and post is not None and post > pre + 2:
+    # Solution treatment should soften the material (post ≤ pre). Only compare
+    # when pre and post share a scale, and scale the guard band to it (HRC scatter
+    # is a couple of points; HV/HBW scatter is far larger) so we don't compare a
+    # 355 HV reading against a 42 HRC one, or flag normal HV scatter.
+    pre_unit = hardness.get('pre', {}).get('unit')
+    post_unit = hardness.get('post', {}).get('unit')
+    mixed_units = pre_unit and post_unit and pre_unit != post_unit
+    band = 2 if is_hrc else 12
+    if pre is not None and post is not None and not mixed_units and post > pre + band:
         findings.append(('warning', 'Hardness',
                          f'Post-solution hardness ({post:g} {ustr}) exceeds pre-solution '
                          f'({pre:g} {ustr}) — solution treatment normally softens the material.'))
@@ -640,6 +838,11 @@ def _review_hardness(hardness, material):
                                  f'{label} {val:g} HRC is below the aged reference '
                                  f'{lo}–{hi} HRC — expected for the solution-treated '
                                  f'(pre-aging) condition.'))
+            elif val < lo:      # Pre-solution: as-received, so softness is a signal
+                findings.append(('info', 'Hardness',
+                                 f'{label} {val:g} HRC is below the aged reference '
+                                 f'{lo}–{hi} HRC — possible over-aged / service-degraded '
+                                 f'condition; verify.'))
     else:
         findings.append(('info', 'Hardness',
                          f'No reference hardness on file for "{material}".'))
@@ -815,12 +1018,17 @@ def _review_captions(parsed):
                              f'as-polished — confirm intended (a microstructure '
                              f'assessment is normally etched).'))
 
+    # \b so 'pic' inside words (microsco**pic**) doesn't match; warn only when a
+    # referenced number has no matching caption (not merely > the caption count,
+    # which false-fires on a numbering gap like Pictures 1, 2, 4).
     refs = [int(m.group(1)) for m in
-            re.finditer(r'pic(?:ture)?\.?\s*(?:no\.?\s*)?(\d+)', comment, re.I)]
-    if refs and max(refs) > len(pics):
-        findings.append(('warning', 'Captions',
-                         f'Comment refers to Picture {max(refs)} but only {len(pics)} '
-                         f'picture(s) are present.'))
+            re.finditer(r'\bpic(?:ture)?\.?\s*(?:no\.?\s*)?(\d+)', comment, re.I)]
+    if nums and refs:
+        missing_refs = sorted(set(refs) - set(nums))
+        if missing_refs:
+            findings.append(('warning', 'Captions',
+                             f'Comment refers to Picture {", ".join(map(str, missing_refs))} '
+                             f'but no such caption is present.'))
     return findings
 
 
@@ -828,7 +1036,8 @@ def review_metallurgical(parsed):
     findings = []
     findings += _review_completeness(parsed)
     findings += _review_hardness(parsed['hardness'], parsed['sample'].get('material'))
-    findings += _review_composition(parsed['nominal'], parsed['actual'])
+    findings += _review_composition(parsed['nominal'], parsed['actual'],
+                                    parsed.get('nominal_spec'))
     findings += _review_comment(parsed)
     findings += _review_captions(parsed)
     return findings
@@ -908,16 +1117,30 @@ def parse_coating(wb, media=0):
     meas_cols = [c for c in range(meas_loc[1], right_bound) if c not in (min_col, max_col)]
 
     cur_min = cur_max = None
+    blanks = 0
     for r in range(hrow + 1, aws.max_row + 1):
         m = _num(aws.cell(row=r, column=min_col).value)
         x = _num(aws.cell(row=r, column=max_col).value)
+        cells = [(c, _meas_num(aws.cell(row=r, column=c).value)) for c in meas_cols]
+        cells = [(c, v) for c, v in cells if v is not None]
+        # A run of fully-empty rows ends the table — stops the scan from running
+        # to ws.max_row (which a single stray cell can push to ~1M rows) and from
+        # gobbling footer notes below the table.
+        if not cells and m is None and x is None:
+            blanks += 1
+            if blanks >= 8:
+                break
+            continue
+        blanks = 0
         if m is not None:
             cur_min = m
         if x is not None:
             cur_max = x
-        cells = [(c, _num(aws.cell(row=r, column=c).value)) for c in meas_cols]
-        cells = [(c, v) for c, v in cells if v is not None]
         if not cells:
+            continue
+        # Skip measurement-point sub-header rows ('1 2 3 … 10'): they are indices,
+        # not thicknesses, and would otherwise inherit forward-filled limits.
+        if _looks_like_point_header([v for _, v in cells]):
             continue
         data['rows'].append({'row': r, 'values': [v for _, v in cells],
                              'cells': cells, 'min': cur_min, 'max': cur_max})
@@ -1006,10 +1229,13 @@ def _edge_density(im):
     w, h = im.size
     c = im.crop((int(w * 0.15), int(h * 0.15), int(w * 0.85), int(h * 0.80)))
     try:
-        px = list(c.filter(ImageFilter.FIND_EDGES).get_flattened_data())
+        # Count strong edges via the histogram rather than materialising every
+        # pixel in a Python list (which balloons memory on large images).
+        hist = c.filter(ImageFilter.FIND_EDGES).histogram()
     except Exception:
         return None
-    return sum(1 for p in px if p > 40) / len(px) if px else None
+    total = sum(hist[:256])
+    return (sum(hist[41:256]) / total) if total else None
 
 
 def _read_legend_im(im):
@@ -1051,7 +1277,12 @@ def _read_measurements_im(im):
         return []
     w, h = im.size
     body = im.crop((0, 0, w, int(h * 0.85)))        # exclude bottom legend + scale bar
-    big = body.resize((body.width * 3, body.height * 3))
+    # Upscale to help OCR, but cap the enlarged pixel count so a large image
+    # can't blow up to multiple GB here.
+    scale = 3
+    while scale > 1 and (body.width * body.height) * scale * scale > 30_000_000:
+        scale -= 1
+    big = body.resize((body.width * scale, body.height * scale)) if scale > 1 else body
     bright = big.point(lambda p: 255 if p > 200 else 0)
     txt = _safe_ocr(bright, '--psm 11')
     return sorted({int(v) for v in re.findall(r'(\d{1,3})\s*[µuμ]m', txt, re.I)})
@@ -1075,7 +1306,10 @@ def analyze_images(data, want_bytes=False, max_images=40):
     for n in names[:max_images]:
         raw = z.read(n)
         try:
-            im = Image.open(io.BytesIO(raw)).convert('L')
+            im = Image.open(io.BytesIO(raw))
+            if (im.width * im.height) > _MAX_ANALYZE_PIXELS:
+                continue                 # oversized image → skip (decompression-bomb guard)
+            im = im.convert('L')
         except Exception:
             continue
         w, h = im.size
@@ -1309,15 +1543,25 @@ def review_filename(filename, parsed, rtype):
     low = name.lower()
     matched = []
 
-    # Job number (filename vs content).
-    fjob = re.search(r'\b(\d{4})\b', name)
+    # Job number (filename vs content). Treat '_' as a separator (so
+    # '7712_MET.xlsx' is found), and when several 4-digit tokens appear prefer
+    # one equal to the content job and skip a leading year (2024) if a non-year
+    # candidate exists — otherwise the year gets mistaken for the job.
     cjob = _content_job(parsed, rtype)
+    cands = re.findall(r'(?<!\d)(\d{4})(?!\d)', name.replace('_', ' '))
+    fjob = None
+    if cands:
+        if cjob and cjob in cands:
+            fjob = cjob
+        else:
+            nonyear = [c for c in cands if not re.match(r'(?:19|20)\d\d$', c)]
+            fjob = (nonyear or cands)[0]
     if fjob and cjob:
-        if fjob.group(1) == cjob:
+        if fjob == cjob:
             matched.append('job')
         else:
             findings.append(('warning', 'Filename',
-                             f'Filename job number {fjob.group(1)} ≠ report job {cjob}.'))
+                             f'Filename job number {fjob} ≠ report job {cjob}.'))
 
     # Report type (filename keyword vs detected type).
     if 'coating' in low and rtype == 'metallurgical':
@@ -1425,35 +1669,49 @@ def collect_highlights(parsed):
     loc = parsed.get('loc') or {}
     out = []
 
-    def add(cell, severity, category, tag, note):
+    def add(cell, severity, category, tag, note, sheet=None):
         if cell:
-            out.append({'cell': tuple(cell), 'severity': severity,
-                        'category': category, 'tag': tag, 'note': note})
+            h = {'cell': tuple(cell), 'severity': severity,
+                 'category': category, 'tag': tag, 'note': note}
+            if sheet:
+                h['sheet'] = sheet
+            out.append(h)
 
     def anchor(entry):
         """Prefer the value cell; fall back to the label cell."""
         entry = entry or {}
         return entry.get('value') or entry.get('label')
 
-    # ── Composition — Actual cells out of tolerance vs Nominal ──
+    # ── Composition — Actual cells out of tolerance vs the Nominal spec ──
     deviations, systemic = _composition_deviations(
-        parsed.get('nominal') or {}, parsed.get('actual') or {})
+        parsed.get('nominal') or {}, parsed.get('actual') or {},
+        parsed.get('nominal_spec') or {})
     aloc = loc.get('actual') or {}
-    for el, nom, act, rel in deviations:
-        sev = 'critical' if systemic else 'warning'
-        add(aloc.get(el), sev, 'Composition', f'{el} {rel:+.0f}%',
-            f'{el}: actual {act:g} vs nominal {nom:g} wt% ({rel:+.0f}%).')
+    for el, nom, act, rel, sev in deviations:
+        sevf = 'critical' if systemic else sev
+        tag = f'{el} {rel:+.0f}%' if rel is not None else f'{el} Δ{act - nom:+g}'
+        add(aloc.get(el), sevf, 'Composition', tag, _fmt_deviation(el, nom, act, rel))
 
     # ── Hardness — post-solution should not exceed pre-solution ──
+    # Mirror _review_hardness exactly (same scale-aware band, skip on mixed
+    # units) so the annotated view never flags a case the findings list passes.
     hd = parsed.get('hardness') or {}
     pre = (hd.get('pre') or {}).get('value')
     post = (hd.get('post') or {}).get('value')
     hloc = loc.get('hardness') or {}
-    if pre is not None and post is not None and post > pre + 0.5:
-        note = (f'Post-solution hardness ({post:g} HRC) exceeds pre-solution '
-                f'({pre:g} HRC) — solution treatment normally softens the material.')
-        for key in ('pre', 'post'):
-            add(anchor(hloc.get(key)), 'warning', 'Hardness', 'post > pre', note)
+    pu = (hd.get('pre') or {}).get('unit')
+    qu = (hd.get('post') or {}).get('unit')
+    units = {u for u in (pu, qu) if u}
+    if pre is not None and post is not None and len(units) < 2:
+        unit = next(iter(units)) if units else None
+        is_hrc = (unit == 'HRC') or (unit is None and pre <= 72 and post <= 72)
+        band = 2 if is_hrc else 12
+        ustr = unit or ('HRC' if is_hrc else 'HV')
+        if post > pre + band:
+            note = (f'Post-solution hardness ({post:g} {ustr}) exceeds pre-solution '
+                    f'({pre:g} {ustr}) — solution treatment normally softens the material.')
+            for key in ('pre', 'post'):
+                add(anchor(hloc.get(key)), 'warning', 'Hardness', 'post > pre', note)
 
     # ── Completeness — blank header fields / material ──
     hdr = parsed.get('header') or {}
@@ -1478,7 +1736,14 @@ def collect_highlights(parsed):
     # so the box and the findings list don't double-report it.
     so = parsed.get('signoff') or {}
     so_loc = loc.get('signoff') or {}
-    so_fields = (('met_lab', 'Met. Lab'), ('mat_eng', 'Mat. Eng'), ('date', 'Date'))
+    # Coating reports sign off with Prepared-by/Approved-by (on the Cover sheet);
+    # metallurgical reports with Met. Lab / Mat. Eng. Use the right field set and
+    # carry each entry's own sheet so the annotator can place/skip it correctly.
+    is_coating = 'rows' in parsed and 'header' not in parsed
+    if is_coating:
+        so_fields = (('prepared', 'Prepared by'), ('approved', 'Approved by'), ('date', 'Date'))
+    else:
+        so_fields = (('met_lab', 'Met. Lab'), ('mat_eng', 'Mat. Eng'), ('date', 'Date'))
     so_missing = [label for key, label in so_fields if _is_placeholder(so.get(key))]
     if so_missing:
         so_note = f'Missing sign-off field(s): {", ".join(so_missing)}.'
@@ -1486,7 +1751,7 @@ def collect_highlights(parsed):
             if _is_placeholder(so.get(key)):
                 entry = so_loc.get(key) or {}
                 add(entry.get('label') or entry.get('value'), 'warning',
-                    'Sign-off', f'{label} missing', so_note)
+                    'Sign-off', f'{label} missing', so_note, sheet=entry.get('sheet'))
 
     # ── Captions — no etch status, or explicitly unetched ──
     pics = parsed.get('pictures') or []
