@@ -23,6 +23,11 @@ import io
 import os
 import sys
 import json
+import threading
+
+# The googleapiclient service wraps a single non-thread-safe httplib2 connection;
+# serialise Drive access so concurrent Streamlit sessions can't corrupt it.
+_LOCK = threading.Lock()
 
 _SCOPES = ['https://www.googleapis.com/auth/drive.file']
 _TOKEN_URI = 'https://oauth2.googleapis.com/token'
@@ -140,42 +145,72 @@ def _write_index(svc, root, index, fid=None):
 def add_records(records):
     """Upload micrograph records (each with 'bytes') to Drive; return count added."""
     from googleapiclient.http import MediaIoBaseUpload
-    svc = _service()
-    root = _root_id(svc)
-    idx_fid, index = _read_index(svc, root)
-    existing = {(r.get('job'), r.get('image'), r.get('source')) for r in index}
-    folders, added = {}, 0
-    for r in records:
-        key = (r.get('job'), r.get('image'), r.get('source'))
-        if key in existing:
-            continue
-        alloy = r['alloy']
-        if alloy not in folders:
-            folders[alloy] = _ensure_folder(svc, alloy, root)
-        name = f"{r.get('job', '')}_{os.path.splitext(r['image'])[0]}.jpg"
-        media = MediaIoBaseUpload(io.BytesIO(r['bytes']), mimetype='image/jpeg', resumable=False)
-        file = svc.files().create(body={'name': name, 'parents': [folders[alloy]]},
-                                  media_body=media, fields='id').execute()
-        rec = {k: v for k, v in r.items() if k != 'bytes'}
-        rec['drive_id'] = file['id']
-        rec['name'] = name
-        index.append(rec)
-        existing.add(key)
-        added += 1
-    if added:
-        _write_index(svc, root, index, idx_fid)
-    return added
+    from photo_lib import _stored_filename
+    with _LOCK:
+        svc = _service()
+        root = _root_id(svc)
+        idx_fid, index = _read_index(svc, root)
+        existing = {(r.get('job'), r.get('image'), r.get('source')) for r in index}
+        folders, added = {}, 0
+        for r in records:
+            key = (r.get('job'), r.get('image'), r.get('source'))
+            if key in existing:
+                continue
+            alloy = r['alloy']
+            if alloy not in folders:
+                folders[alloy] = _ensure_folder(svc, alloy, root)
+            name = _stored_filename(r)
+            # Resume semantics: reuse an existing file of the same name instead of
+            # creating a duplicate (Drive allows same-named files) after a partial
+            # batch / retry.
+            fid = _find_child(svc, name, folders[alloy])
+            if fid is None:
+                media = MediaIoBaseUpload(io.BytesIO(r['bytes']), mimetype='image/jpeg',
+                                          resumable=False)
+                fid = svc.files().create(body={'name': name, 'parents': [folders[alloy]]},
+                                         media_body=media, fields='id').execute()['id']
+            rec = {k: v for k, v in r.items() if k != 'bytes'}
+            rec['drive_id'] = fid
+            rec['name'] = name
+            index.append(rec)
+            existing.add(key)
+            added += 1
+        if added:
+            # Re-read and merge just before writing, so a concurrent session's
+            # additions aren't clobbered by this full-index overwrite.
+            fresh_fid, fresh_index = _read_index(svc, root)
+            if fresh_index:
+                seen = {(x.get('job'), x.get('image'), x.get('source')) for x in fresh_index}
+                for rec in index:
+                    k = (rec.get('job'), rec.get('image'), rec.get('source'))
+                    if k not in seen:
+                        fresh_index.append(rec)
+                        seen.add(k)
+                index, idx_fid = fresh_index, (fresh_fid or idx_fid)
+            _write_index(svc, root, index, idx_fid)
+        return added
 
 
 def load_index():
-    svc = _service()
-    return _read_index(svc, _root_id(svc))[1]
+    with _LOCK:
+        svc = _service()
+        return _read_index(svc, _root_id(svc))[1]
 
 
 def download(drive_id):
     if not drive_id:
         return None
-    return _service().files().get_media(fileId=drive_id).execute()
+    with _LOCK:
+        try:
+            return _service().files().get_media(fileId=drive_id).execute()
+        except Exception as e:
+            # A deleted/missing Drive file should render as 'missing' (like the
+            # other backends), not crash the whole gallery.
+            from googleapiclient.errors import HttpError
+            if isinstance(e, HttpError) and getattr(e, 'resp', None) is not None \
+                    and getattr(e.resp, 'status', None) in (403, 404, 410):
+                return None
+            raise
 
 
 # ── CLI helpers ───────────────────────────────────────────────────────────
@@ -200,8 +235,10 @@ def _auth():
     print(f'  drive_refresh_token = "{flow.credentials.refresh_token}"')
 
 
-def _migrate(library_dir='photo_library'):
+def _migrate(library_dir=None):
     import photo_lib
+    if library_dir is None:
+        library_dir = photo_lib.LIBRARY_DIR   # honour PHOTO_LIBRARY_DIR, not a hardcoded path
     recs = []
     for r in photo_lib._load_local_index(library_dir):
         p = os.path.join(library_dir, r.get('path', ''))
