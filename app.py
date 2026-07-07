@@ -6,6 +6,7 @@ import html as _html
 from pathlib import Path
 from openpyxl.utils import get_column_letter
 from sem_convert import parse, extract_figures, build
+import lab_review as _lr
 from lab_review import review_report, summarize
 try:
     from lab_review import HT_ORDER
@@ -28,8 +29,15 @@ except Exception:     # pandas ships with Streamlit; guard just in case
 
 @st.cache_data(show_spinner=False)
 def _lib_image(path, drive_id):
-    """Cached fetch of one library image (local file / GitHub / Drive)."""
-    return get_image_bytes({"path": path, "drive_id": drive_id})
+    """Cached fetch of one library image (local file / GitHub / Drive).
+
+    Raises on a miss instead of returning None, so a transient failure (e.g. a
+    just-committed GitHub blob 404ing for a moment) isn't cached as permanently
+    'missing' for every session until the process restarts."""
+    b = get_image_bytes({"path": path, "drive_id": drive_id})
+    if not b:
+        raise FileNotFoundError(path or drive_id or "image")
+    return b
 
 
 @st.cache_data(show_spinner=False)
@@ -291,8 +299,15 @@ def render_converter():
 
     st.divider()
 
-    if 'results' not in st.session_state:
+    st.session_state.setdefault('results', [])
+    st.session_state.setdefault('conv_errors', [])
+    # Drop stale results/errors when the uploaded set changes (including a revised
+    # PDF with the same name) so a download button never serves the previous batch.
+    sig = tuple((f.name, f.size) for f in (vendor_files or []))
+    if st.session_state.get('conv_sig') != sig:
+        st.session_state.conv_sig = sig
         st.session_state.results = []
+        st.session_state.conv_errors = []
 
     btn_col1, btn_col2 = st.columns(2)
 
@@ -336,13 +351,15 @@ def render_converter():
                     except Exception as e:
                         errors.append(f"{vendor_file.name}: {e}")
 
-        if errors:
-            for err in errors:
-                st.error(f"Conversion failed — {err}")
-
         st.session_state.results = results
+        st.session_state.conv_errors = errors
         if results:
             st.success(f"Generated {len(results)} report(s).")
+
+    # Per-file failures persist across reruns (a download-button click reruns the
+    # script), so a partial-batch failure isn't hidden the moment you interact.
+    for err in st.session_state.conv_errors:
+        st.error(f"Conversion failed — {err}")
 
     # ── Download buttons appear in btn_col2 side-by-side with Generate ──
     results = st.session_state.results
@@ -497,12 +514,17 @@ def _render_annotated(r, ocr):
             file_name=f"{Path(f.name).stem}_annotated.png",
             mime="image/png", key=f"gridpng_{f.name}")
     elif rtype in ('metallurgical', 'coating'):
-        st.caption("Annotated view unavailable (image libraries not installed).")
+        if not getattr(report_render, '_PIL', True):
+            st.caption("Annotated view unavailable (image libraries not installed).")
+        else:
+            st.caption("Annotated view couldn't be generated for this report.")
 
     # The pixel-faithful render runs LibreOffice (seconds, more on a big report),
     # so build it only when asked — the quick view above is already on screen.
     if report_render.libreoffice_available():
-        fkey = f"faithful_{f.name}"
+        # Key the sticky flag on the file CONTENT, not just its name, so a revised
+        # same-named upload doesn't auto-trigger the slow render of the new file.
+        fkey = f"faithful_{f.name}_{len(data)}"
         if st.button("🖼 Render pixel-faithful view — exact workbook look (slower)",
                      key=f"fbtn_{f.name}"):
             st.session_state[fkey] = True
@@ -547,22 +569,32 @@ def _render_parsed(rtype, parsed):
         c1.write(f"**Coating:** {coat_str}")
 
         nom, act = parsed.get('nominal', {}), parsed.get('actual', {})
+        spec = parsed.get('nominal_spec') or {}
         if nom or act:
             st.markdown("**Composition — Nominal vs Actual (wt%)**")
             rows = []
             for el in sorted(set(nom) | set(act)):
                 n, a = nom.get(el), act.get(el)
-                if n not in (None, 0) and a is not None:
-                    dev_pct = (a - n) / abs(n) * 100
-                    dev = f"{dev_pct:+.0f}%"
-                    flag = ("🔴" if abs(dev_pct) >= COMP_CRIT_REL
-                            else "🟠" if abs(dev_pct) >= COMP_WARN_REL else "")
+                sp = spec.get(el)
+                # Show the real spec (range / limit) and grade the same way the
+                # findings do — by containment / nearest bound — so a spec range
+                # like '15.7-16.3' doesn't read as a deviation from its midpoint.
+                nom_disp = (sp.get('raw') if sp else (f"{n:g}" if n is not None else "—"))
+                if n is not None and a is not None:
+                    ref = _lr._spec_ref(sp, n, a)
+                    if ref == 'in_spec' or ref == 0:
+                        dev, flag = ("in spec" if ref == 'in_spec' else "—"), ""
+                    else:
+                        dev_pct = (a - ref) / abs(ref) * 100
+                        dev = f"{dev_pct:+.0f}%"
+                        flag = ("🔴" if abs(dev_pct) >= COMP_CRIT_REL
+                                else "🟠" if abs(dev_pct) >= COMP_WARN_REL else "")
                 else:
                     dev, flag = "—", ""
                 rows.append({
                     "": flag,
                     "Element": el,
-                    "Nominal": f"{n:g}" if n is not None else "—",
+                    "Nominal": nom_disp,
                     "Actual":  f"{a:g}" if a is not None else "—",
                     "Δ":       dev,
                 })
@@ -616,12 +648,16 @@ def _render_lab_detail(r, ocr):
             b1, b2 = st.columns(2)
             if r['rtype'] in ('metallurgical', 'coating'):
                 if b1.button("📁 Add to library", key=f"add_{r['name']}", width="stretch"):
-                    added = add_to_library(r['name'], r['f'].getvalue(), r['parsed'], r['rtype'])
-                    if added:
-                        _gallery_counts.clear()
-                        _gallery_photos.clear()
-                    st.toast(f"Added {added} micrograph(s) to the library." if added
-                             else "No new micrographs (already in library).")
+                    try:
+                        added = add_to_library(r['name'], r['f'].getvalue(), r['parsed'], r['rtype'])
+                        if added:
+                            _gallery_counts.clear()
+                            _gallery_photos.clear()
+                        st.toast(f"Added {added} micrograph(s) to the library." if added
+                                 else "No new micrographs (already in library).")
+                    except Exception as e:
+                        # A backend write failure must not abort the report card.
+                        st.error(f"Couldn't add to the library ({type(e).__name__}: {e}).")
             b2.download_button(
                 "⬇ Findings (.csv)", data=_lab_findings_csv(r['findings']),
                 file_name=f"{Path(r['name']).stem}_findings.csv", mime="text/csv",
@@ -759,6 +795,7 @@ def render_gallery():
         if st.button("↻ Retry", key="gallery_retry"):
             _gallery_counts.clear()
             _gallery_photos.clear()
+            _lib_image.clear()               # also drop any cached image misses
             st.rerun()
         return
     total = sum(counts.values())
@@ -795,7 +832,10 @@ def render_gallery():
         cols = st.columns(3)
         for i, r in enumerate(groups[g]):
             c = cols[i % 3]
-            img = _lib_image(r.get("path"), r.get("drive_id"))
+            try:                              # a flaky backend/image can't take down the gallery
+                img = _lib_image(r.get("path"), r.get("drive_id"))
+            except Exception:
+                img = None
             contrast = "etched" if r.get("etched") else "low-contrast"
             cap = f"Job {r.get('job') or '—'} · {r.get('mag') or '?'} · {contrast}"
             if img:
@@ -852,11 +892,16 @@ def _iir_check_settings():
             items = list(items)
             cols = st.columns(2)
             for j, (_, title, default) in enumerate(items):
-                chosen[title] = cols[j % 2].selectbox(
+                sel = cols[j % 2].selectbox(
                     title, iir_review.SEVERITY_CHOICES,
                     index=iir_review.SEVERITY_CHOICES.index(default),
                     format_func=lambda s: _IIR_CHOICE_LABEL[s],
                     key=f"iir_sev::{title}")
+                # Only pass a genuine change — sending every default would flatten
+                # a check's context-specific severity (e.g. the softened WARN a
+                # final-repair report gets for fewer serialised positions).
+                if sel != default:
+                    chosen[title] = sel
     return chosen
 
 
@@ -1165,6 +1210,13 @@ def main():
     st.set_page_config(page_title="AEG Materials Tools", page_icon="🔬",
                        layout="wide", initial_sidebar_state="expanded")
     st.markdown(_CSS, unsafe_allow_html=True)
+
+    # Single-script radio navigation garbage-collects the widget state of tools
+    # not rendered this run. Re-assert the IIR severity settings (done before the
+    # widgets are re-created) so switching tools and back doesn't silently reset
+    # them to defaults and re-score the batch — contradicting the settings panel.
+    for k in [k for k in st.session_state if k.startswith('iir_sev::')]:
+        st.session_state[k] = st.session_state[k]
 
     labels = [f"{ic}  {name}" for ic, name, _, _ in _TOOLS]
     with st.sidebar:
