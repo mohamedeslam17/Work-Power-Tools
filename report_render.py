@@ -30,10 +30,13 @@ import zipfile
 _LO_LOCK = threading.Lock()
 
 try:
-    from PIL import Image, ImageChops, ImageDraw, ImageFont
+    from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
     _PIL = True
+    Image.MAX_IMAGE_PIXELS = 64_000_000     # decompression-bomb guard
 except Exception:                       # pragma: no cover - exercised by guard
     _PIL = False
+
+_MAX_MICRO_PIXELS = 40_000_000
 
 try:
     import fitz                          # PyMuPDF — rasterises the LibreOffice PDF
@@ -119,7 +122,8 @@ def _render(data, parsed, findings, filename, max_rows, max_cols, scale):
     sheet_name = loc.get('sheet')
     ws = wb[sheet_name] if sheet_name in wb.sheetnames else wb.active
 
-    highlights = [h for h in collect_highlights(parsed) if h.get('cell')]
+    highlights = [h for h in collect_highlights(parsed)
+                  if h.get('cell') and (not h.get('sheet') or h['sheet'] == ws.title)]
 
     # Merged ranges → covered cells + anchor span lookup.
     spans = {}            # (r, c) of every covered cell → (r0, c0, r1, c1)
@@ -155,6 +159,15 @@ def _render(data, parsed, findings, filename, max_rows, max_cols, scale):
     c1 = min(cmax, cmin + max_cols - 1)
     rows = list(range(rmin, r1 + 1))
     cols = list(range(cmin, c1 + 1))
+
+    # Highlights outside the rendered window would be clamped into a giant
+    # whole-grid box — instead drop them from the boxes and surface them in the
+    # 'Also flagged' legend so nothing is silently lost or mislocated.
+    def _in_window(cell):
+        return rmin <= cell[0] <= r1 and cmin <= cell[1] <= c1
+    offscreen_notes = [(h['severity'], h['category'], h['note'])
+                       for h in highlights if not _in_window(h['cell'])]
+    highlights = [h for h in highlights if _in_window(h['cell'])]
 
     # Measure column widths from their content.
     probe = Image.new('RGB', (8, 8))
@@ -222,10 +235,16 @@ def _render(data, parsed, findings, filename, max_rows, max_cols, scale):
     # Warning/critical findings not represented by a box (filename, photo
     # legends, caption numbering, …) — listed so nothing is silently missing.
     boxed_notes = {h['note'] for h in highlights}
+    boxed_cats = {h['category'] for h in highlights}
     extra_lines = []
-    for sev, cat, msg in (findings or []):
-        if sev in ('critical', 'warning') and msg not in boxed_notes:
-            extra_lines.append((sev, textwrap.wrap(f"{cat} — {msg}", wrap_chars) or ['']))
+    seen_extra = set()
+    for sev, cat, msg in list(findings or []) + offscreen_notes:
+        if sev not in ('critical', 'warning') or msg in boxed_notes or msg in seen_extra:
+            continue
+        if cat == 'Composition' and cat in boxed_cats:   # already shown as per-element boxes
+            continue
+        seen_extra.add(msg)
+        extra_lines.append((sev, textwrap.wrap(f"{cat} — {msg}", wrap_chars) or ['']))
 
     def _block_h(lines):
         return 28 + sum(22 + 18 * (len(w) - 1) + 8 for *_, w in lines)
@@ -381,7 +400,10 @@ def annotate_micrographs(data, parsed, max_images=12):
         if name not in media:
             continue
         try:
-            im = Image.open(io.BytesIO(z.read(media[name]))).convert('RGB')
+            im = Image.open(io.BytesIO(z.read(media[name])))
+            if im.width * im.height > _MAX_MICRO_PIXELS:
+                continue                 # oversized image → skip (decompression-bomb guard)
+            im = im.convert('RGB')
         except Exception:
             continue
         out.append((name, _annotate_one(im, entry), _micro_caption(entry)))
@@ -488,12 +510,34 @@ def _find_soffice():
     return None
 
 
+# Each severity gets a distinct RED channel so a critical and a warning fill can
+# never land within the ±tol match window of each other (the old scheme let e.g.
+# critical #3 and warning #24 collide, misplacing both badges).
+_SEV_RCHAN = {'critical': 255, 'warning': 249, 'info': 243, 'pass': 237}
+
+
+def _has_drawing_shapes(data):
+    """True when the workbook has drawing *shapes* (text boxes / stamps) — which
+    openpyxl silently drops on load/save — as opposed to plain pictures (kept)."""
+    try:
+        z = zipfile.ZipFile(io.BytesIO(data))
+        for n in z.namelist():
+            if n.startswith('xl/drawings/') and n.endswith('.xml'):
+                if b'<xdr:sp' in z.read(n) or b'<xdr:sp>' in z.read(n):
+                    return True
+    except Exception:
+        pass
+    return False
+
+
 def _unique_fill(i, sev):
-    """A severity-tinted fill that is unique per finding index (so it can be
-    found back in the raster by exact colour). Steps of 6 keep masks (±2) apart."""
-    r, g, b = _TINT.get(sev, _TINT['warning'])
-    b = max(140, b - (i % 8) * 6)
-    g = max(140, g - (i // 8) * 6)
+    """A severity-tinted fill unique per finding index (found back in the raster
+    by exact colour). Red identifies the severity; green/blue index within it in
+    steps of 6 so masks (±2) never overlap."""
+    r = _SEV_RCHAN.get(sev, 249)
+    _, g0, b0 = _TINT.get(sev, _TINT['warning'])
+    b = max(150, b0 - (i % 8) * 6)
+    g = max(150, g0 - (i // 8) * 6)
     return (r, g, b)
 
 
@@ -517,12 +561,33 @@ def render_report_faithful(data, parsed, findings=None, filename=None, dpi=130, 
 
 def _faithful(data, parsed, findings, filename, dpi, timeout):
     loc = parsed.get('loc') or {}
-    highlights = sorted((h for h in collect_highlights(parsed) if h.get('cell')),
-                        key=lambda h: (h['cell'][0], h['cell'][1]))
-
     wb = openpyxl.load_workbook(io.BytesIO(data))      # keep styles + images
     sheet = loc.get('sheet')
     ws = wb[sheet] if sheet and sheet in wb.sheetnames else wb.active
+
+    # Only highlights that belong on THIS sheet (a coating sign-off box lives on
+    # the Cover sheet, not the assessment sheet we render).
+    highlights = sorted(
+        (h for h in collect_highlights(parsed)
+         if h.get('cell') and (not h.get('sheet') or h['sheet'] == ws.title)),
+        key=lambda h: (h['cell'][0], h['cell'][1]))
+
+    # LibreOffice prints every sheet; hide the others so the composed image is
+    # this one sheet and the colour search can't badge a look-alike fill on
+    # another page.
+    for s in wb.worksheets:
+        if s is not ws:
+            s.sheet_state = 'hidden'
+    wb.active = wb.worksheets.index(ws)
+
+    # A conditional-format fill (common on QA templates) would paint over our
+    # sentinel and hide the badge for exactly the out-of-tolerance cells; drop CF
+    # rules on the rendered sheet so the sentinel shows through.
+    try:
+        from openpyxl.formatting.formatting import ConditionalFormattingList
+        ws.conditional_formatting = ConditionalFormattingList()
+    except Exception:
+        pass
 
     span = {}
     for rng in ws.merged_cells.ranges:
@@ -561,19 +626,40 @@ def _faithful(data, parsed, findings, filename, dpi, timeout):
             cell = ws.cell(row=rr, column=cc)
             cell.fill = fill
             cell.border = border
+            # Unhide a flagged cell's row/column so its badge isn't silently lost.
+            if ws.row_dimensions[rr].hidden:
+                ws.row_dimensions[rr].hidden = False
+            col_letter = get_column_letter(cc)
+            if ws.column_dimensions[col_letter].hidden:
+                ws.column_dimensions[col_letter].hidden = False
         keys.append({'num': i + 1, 'severity': sev, 'notes': g['notes'],
                      'rgb': rgb, 'ref': f'{get_column_letter(c)}{r}'})
 
     # Warning/critical findings not represented by a box (filename, photo
     # legends, caption numbering, …) — listed so nothing is silently missing.
+    # A systemic-composition summary is already represented by its per-element
+    # boxes, so don't also list it loose (avoids a contradictory duplicate).
     boxed_notes = {h['note'] for h in highlights}
+    boxed_cats = {h['category'] for h in highlights}
     extras = [(sev, cat, msg) for (sev, cat, msg) in (findings or [])
-              if sev in ('critical', 'warning') and msg not in boxed_notes]
+              if sev in ('critical', 'warning') and msg not in boxed_notes
+              and not (cat == 'Composition' and cat in boxed_cats)]
 
-    # Bound output to the used range and fit to one page wide.
+    # Openpyxl's load/save keeps images but drops drawing shapes (text boxes,
+    # stamps). If the workbook has any, note that the faithful view may be missing
+    # them rather than pretending it's complete.
+    if _has_drawing_shapes(data):
+        extras.append(('warning', 'Render',
+                       'The original workbook contains drawing shapes (e.g. text '
+                       'boxes / stamps) that this faithful view may not reproduce.'))
+
+    # Fit to one page wide. Only bound the print area to the used cell range when
+    # the sheet has no images — ws.dimensions covers only populated cells, so a
+    # micrograph anchored beyond the last text cell would otherwise be cropped out.
     try:
         from openpyxl.worksheet.properties import PageSetupProperties
-        ws.print_area = ws.dimensions
+        if not getattr(ws, '_images', None):
+            ws.print_area = ws.dimensions
         ws.page_setup.orientation = 'landscape'
         ws.page_setup.fitToWidth = 1
         ws.page_setup.fitToHeight = 0
@@ -632,13 +718,20 @@ def _raster_pdf(pdf, dpi):
     return pages
 
 
-def _color_bbox(img, rgb, tol=2):
-    """Bounding box of pixels matching rgb within tol on every channel, or None."""
+def _color_bbox(img, rgb, tol=2, min_px=40):
+    """Bounding box of the sentinel fill, or None. Erodes the match mask so a
+    stray pixel of real content (a photo/logo within tol of a tint) can't stretch
+    the box or claim the wrong page, and requires a solid blob of >= min_px."""
     bands = []
     for ch, v in zip(img.split()[:3], rgb):
         lo, hi = v - tol, v + tol
         bands.append(ch.point(lambda p: 255 if lo <= p <= hi else 0))
     mask = ImageChops.multiply(ImageChops.multiply(bands[0], bands[1]), bands[2])
+    eroded = mask.filter(ImageFilter.MinFilter(3))     # drop isolated pixels
+    if eroded.getbbox() is not None:
+        mask = eroded
+    if mask.histogram()[-1] < min_px:                  # too few matching pixels → noise
+        return None
     return mask.getbbox()
 
 
@@ -679,7 +772,8 @@ def _compose_faithful(pages, keys, extras, filename, dpi):
     key_entries = []
     for k in keys:
         notes = list(k['notes'])
-        notes[0] = f"[{k['ref']}]  {notes[0]}"
+        ref = k['ref'] if k['num'] in located else f"{k['ref']} · not visible on the sheet"
+        notes[0] = f"[{ref}]  {notes[0]}"
         key_entries.append({'badge': str(k['num']), 'severity': k['severity'],
                             'lines': wrap_notes(notes)})
     extra_entries = [{'badge': None, 'severity': sev, 'lines': wrap_notes([f'{cat} — {msg}'])}
