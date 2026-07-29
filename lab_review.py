@@ -664,7 +664,7 @@ def _review_hardness(hardness, material):
     return findings
 
 
-def _review_completeness(parsed):
+def _review_completeness(parsed, data=None):
     findings = []
     hdr = parsed['header']
     for key, label in (('customer', 'Customer'), ('job', 'AEG Job No'),
@@ -691,7 +691,21 @@ def _review_completeness(parsed):
         findings.append(('info', 'Micrographs',
                          f'{len(uncaptioned)} of {len(pics)} pictures have no caption.'))
     if parsed.get('media', 0) == 0:
-        findings.append(('warning', 'Micrographs', 'No embedded images found in the workbook.'))
+        if pics:
+            findings.append(('critical', 'Micrographs',
+                             f'{len(pics)} micrograph(s) are captioned ({", ".join(p.rstrip(":") for p, _ in pics)}) '
+                             f'but the workbook has no embedded images at all.'))
+        else:
+            findings.append(('warning', 'Micrographs', 'No embedded images found in the workbook.'))
+    elif pics and data is not None:
+        # A caption with no matching photo is a real gap in the deliverable —
+        # not just an OCR/legend miss, so this needs to outrank those.
+        n_anchored = len(_anchor_order(data))
+        if n_anchored < len(pics):
+            findings.append(('critical', 'Micrographs',
+                             f'{len(pics)} micrograph(s) are captioned ({", ".join(p.rstrip(":") for p, _ in pics)}) '
+                             f'but only {n_anchored} image(s) are actually embedded in the workbook — '
+                             f'{len(pics) - n_anchored} caption(s) have no photo.'))
 
     so = parsed['signoff']
     missing = [lbl for key, lbl in (('met_lab', 'Met. Lab'), ('mat_eng', 'Mat. Eng'),
@@ -838,9 +852,9 @@ def _review_captions(parsed):
     return findings
 
 
-def review_metallurgical(parsed):
+def review_metallurgical(parsed, data=None):
     findings = []
-    findings += _review_completeness(parsed)
+    findings += _review_completeness(parsed, data)
     findings += _review_hardness(parsed['hardness'], parsed['sample'].get('material'))
     findings += _review_composition(parsed['nominal'], parsed['actual'])
     findings += _review_comment(parsed)
@@ -1410,7 +1424,7 @@ def review_report(filename, data, ocr=True):
         findings = review_coating(parsed)
     elif rtype == 'metallurgical':
         parsed = parse_metallurgical(wb, media)
-        findings = review_metallurgical(parsed)
+        findings = review_metallurgical(parsed, data)
     else:
         parsed = {}
         findings = [('warning', 'Format',
