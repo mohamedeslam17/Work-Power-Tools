@@ -229,7 +229,17 @@ def _sevbar(segments):
         f'<div style="width:{c / total * 100:.4f}%;background:{col};"></div>'
         for c, col in segments if c)
     return ('<div style="display:flex;height:6px;width:100%;border-radius:4px;'
-            f'overflow:hidden;background:#f0f0f1;margin:.2rem 0 .6rem;">{cells}</div>')
+            f'overflow:hidden;background:#f0f0f1;margin:.2rem 0 .3rem;">{cells}</div>')
+
+
+def _severity_strip(counts, order, style):
+    """One compact severity readout: proportional bar + inline count legend.
+    Replaces a bar *and* a row of same-number metric tiles with a single line."""
+    bar = _sevbar([(counts[s], style[s][0]) for s in order])
+    bits = [f'<span style="color:{style[s][0]};font-weight:600;">{counts[s]} {style[s][2]}</span>'
+            for s in order if counts[s]]
+    legend = ' &nbsp;·&nbsp; '.join(bits) or '<span style="color:#a1a1aa;">No findings</span>'
+    return bar + f'<div style="font-size:.82rem;margin:0 0 .6rem;">{legend}</div>'
 
 
 def _finding_rows_html(rows):
@@ -299,9 +309,7 @@ def render_converter():
     if 'results' not in st.session_state:
         st.session_state.results = []
 
-    btn_col1, btn_col2 = st.columns(2)
-
-    if btn_col1.button("▶ Generate Reports", type="primary", disabled=not vendor_files):
+    if st.button("▶ Generate Reports", type="primary", disabled=not vendor_files):
         results = []
         errors  = []
 
@@ -347,31 +355,24 @@ def render_converter():
 
         st.session_state.results = results
         if results:
-            st.success(f"Generated {len(results)} report(s).")
+            st.toast(f"Generated {len(results)} report(s).")
 
-    # ── Download buttons appear in btn_col2 side-by-side with Generate ──
+    # ── One compact card per generated report: name + facts + download ──
     results = st.session_state.results
     if results:
-        for i, r in enumerate(results):
-            btn_col2.download_button(
-                label=f"⬇ {Path(r['name']).stem[-28:]}",
-                data=r['bytes'],
-                file_name=r['name'],
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                use_container_width=True,
-                key=f"dl_{i}",
-            )
-
         st.divider()
-        for r in results:
-            st.success(f"**{r['name']}** — {r['fig_count']} figures extracted")
-            m1, m2 = st.columns(2)
-            m1.metric("Job Number", f"JC. {r['info']['job']}")
-            m2.metric("Stage", r['info']['stage'])
-            m1.metric("γ′ Size — Location 1", f"{r['info']['l1']} µm")
-            m2.metric("γ′ Size — Location 2", f"{r['info']['l2']} µm")
-            m1.metric("Heat Treatment", r['info']['ht'])
-            m2.metric("Material", r['info']['material'])
+        for i, r in enumerate(results):
+            with st.container(border=True):
+                c1, c2 = st.columns([4, 1])
+                c1.markdown(f"**{r['name']}**  ·  {r['fig_count']} figures extracted")
+                c1.caption(
+                    f"Job JC.{r['info']['job']} · Stage {r['info']['stage']} · "
+                    f"γ′ {r['info']['l1']}/{r['info']['l2']} µm · "
+                    f"{r['info']['ht']} · {r['info']['material']}")
+                c2.download_button(
+                    "⬇ Download", data=r['bytes'], file_name=r['name'],
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    width="stretch", key=f"dl_{i}")
 
     if not vendor_files:
         st.info("Upload one or more vendor PDFs above to get started.")
@@ -623,15 +624,7 @@ def _render_lab_detail(r, ocr):
             st.warning("This workbook didn't match a metallurgical or coating layout, so only "
                        "a limited review ran. Check it's an AEG lab report `.xlsx`.")
 
-        c = r['counts']
-        st.markdown(_sevbar([(c['critical'], '#e5484d'), (c['warning'], '#b45309'),
-                             (c['info'], '#0284c7'), (c['pass'], '#12805c')]),
-                    unsafe_allow_html=True)
-        m = st.columns(4)
-        m[0].metric("🔴 Fail", c['critical'])
-        m[1].metric("🟠 Warning", c['warning'])
-        m[2].metric("🔵 Note", c['info'])
-        m[3].metric("🟢 Pass", c['pass'])
+        st.markdown(_severity_strip(r['counts'], _SEV_ORDER, _SEV_STYLE), unsafe_allow_html=True)
 
         ftab, atab, dtab = st.tabs(["📋 Findings", "🖼 Annotated view", "🔬 Extracted data"])
         with ftab:
@@ -643,12 +636,6 @@ def _render_lab_detail(r, ocr):
 
 
 def render_reviewer():
-    st.caption(
-        "Automated QA of AEG lab reports (`.xlsx`) — **metallurgical** or **coating**. "
-        "Each report is checked against its own stated spec (nominal composition / design "
-        "limits), plus hardness, completeness and sign-off."
-    )
-
     up, opt = st.columns([3, 1])
     with up:
         files = st.file_uploader(
@@ -695,25 +682,23 @@ def render_reviewer():
     if not ok:
         return
 
-    # ── Batch overview (only worth showing for more than one report) ──
+    # ── Batch overview: worst-first, click a row to open it below ──
+    # (only worth showing — and sorting — for more than one report)
     if len(ok) > 1:
+        rank = {'critical': 0, 'warning': 1, 'pass': 2}
+        ok.sort(key=lambda r: rank[r['verdict']])
+        need = sum(1 for r in ok if r['verdict'] != 'pass')
         with st.container(border=True):
-            tot = {k: sum(r['counts'][k] for r in ok)
-                   for k in ('critical', 'warning', 'info', 'pass')}
-            need = sum(1 for r in ok if r['verdict'] != 'pass')
-            st.markdown(f"**Batch overview — {len(ok)} report(s)**")
-            m = st.columns(4)
-            m[0].metric("Reports", len(ok))
-            m[1].metric("🔴 Fail", tot['critical'])
-            m[2].metric("🟠 Warning", tot['warning'])
-            m[3].metric("Need attention", need)
-            st.dataframe([{
+            st.caption(f"**{len(ok)} reports** — {need} need attention  ·  "
+                       f"👆 click a row to open it below")
+            event = st.dataframe([{
                 "Verdict": f"{_LAB_EMOJI[r['verdict']]} {_LAB_VERDICT[r['verdict']][2]}",
                 "Report": r['name'],
                 "Type": r['rtype'],
                 "🔴": r['counts']['critical'], "🟠": r['counts']['warning'],
                 "🔵": r['counts']['info'], "🟢": r['counts']['pass'],
-            } for r in ok], width="stretch", hide_index=True)
+            } for r in ok], width="stretch", hide_index=True,
+                on_select="rerun", selection_mode="single-row", key="lab_overview_tbl")
 
             allrows = [{'Report': r['name'], 'Severity': _SEV_LABELS.get(s, s),
                         'Category': c, 'Finding': msg}
@@ -725,10 +710,8 @@ def render_reviewer():
                     file_name="lab_review_all_findings.csv", mime="text/csv",
                     key="lab_batch_csv")
 
-        labels = [f"{_LAB_EMOJI[r['verdict']]}  {r['name']}" for r in ok]
-        idx = st.selectbox("View report", range(len(ok)),
-                           format_func=lambda i: labels[i], key="lab_pick")
-        _render_lab_detail(ok[idx], ocr)
+        rows_sel = event.selection.rows if event and event.selection.rows else [0]
+        _render_lab_detail(ok[rows_sel[0]], ocr)
     else:
         _render_lab_detail(ok[0], ocr)
 
@@ -737,11 +720,8 @@ def render_reviewer():
 # TAB 3 — Photo Library (per-alloy micrograph gallery)
 # ════════════════════════════════════════════════════════════════════════
 def render_gallery():
-    st.markdown(
-        "Browse stored micrographs **by alloy**, with the data of the report they "
-        "came from. Add micrographs from the **Lab Report Review** tab."
-    )
-    st.caption(f"Storage backend: **{backend_name()}**")
+    st.caption(f"Add micrographs from the **Lab Report Review** tab  ·  "
+               f"storage backend: **{backend_name()}**")
     try:
         counts = _gallery_counts()
     except Exception as e:
@@ -899,18 +879,22 @@ def _iir_filter_table(findings, key, with_report=False):
 
 
 def _iir_overview(results):
-    """Batch overview card: aggregate metrics + interactive table + batch download."""
+    """Batch overview card: click-to-select table + batch download.
+    Sorts worst-first and returns the row index to open below."""
+    rank = {iir_review.FAIL: 0, iir_review.WARN: 1, iir_review.INFO: 2, iir_review.PASS: 3}
+
+    def _key(r):
+        if r['template'] == 'unknown':
+            return -1
+        return rank[iir_review.verdict_of(r['counts'])[0]]
+    results.sort(key=_key)
+
     with st.container(border=True):
-        tot = {k: sum(r['counts'][k] for r in results) for k in _IIR_ORDER}
         need = sum(1 for r in results
                    if r['template'] == 'unknown'
                    or iir_review.verdict_of(r['counts'])[0] != iir_review.PASS)
-        st.markdown(f"**Batch overview — {len(results)} report(s)**")
-        m = st.columns(4)
-        m[0].metric("Reports", len(results))
-        m[1].metric("🔴 Fail", tot[iir_review.FAIL])
-        m[2].metric("🟠 Warn", tot[iir_review.WARN])
-        m[3].metric("Need attention", need)
+        st.caption(f"**{len(results)} reports** — {need} need attention  ·  "
+                   f"👆 click a row to open it below")
 
         overview = []
         for r in results:
@@ -931,8 +915,9 @@ def _iir_overview(results):
                 "🔵": c[iir_review.INFO], "🟢": c[iir_review.PASS],
                 "Top issue": iir_review.top_issue(r['findings']),
             })
-        st.dataframe(overview, width="stretch", hide_index=True,
-                     column_config={"Top issue": st.column_config.TextColumn(width="large")})
+        event = st.dataframe(overview, width="stretch", hide_index=True,
+                             column_config={"Top issue": st.column_config.TextColumn(width="large")},
+                             on_select="rerun", selection_mode="single-row", key="iir_overview_tbl")
 
         if len(results) > 1:
             records = [iir_review.record_of(r['data'], r['findings']) for r in results]
@@ -942,6 +927,9 @@ def _iir_overview(results):
                 "⬇ Batch summary (.xlsx)", data=buf.getvalue(),
                 file_name="IIR_Batch_Summary.xlsx", mime=_XLSX_MIME,
                 key="iir_batch_dl", type="primary")
+
+    rows_sel = event.selection.rows if event and event.selection.rows else [0]
+    return rows_sel[0]
 
 
 def _iir_protocol_tab(data):
@@ -1046,14 +1034,7 @@ def _iir_report_card(r):
         m[2].metric("Reconditionable", rp.get('reconditionable') if rp.get('found') else "—")
         m[3].metric("Positions", r['npos'])
 
-        st.markdown(_sevbar([(c[iir_review.FAIL], '#e5484d'), (c[iir_review.WARN], '#b45309'),
-                             (c[iir_review.INFO], '#0284c7'), (c[iir_review.PASS], '#12805c')]),
-                    unsafe_allow_html=True)
-        m2 = st.columns(4)
-        m2[0].metric("🔴 Fail", c[iir_review.FAIL])
-        m2[1].metric("🟠 Warn", c[iir_review.WARN])
-        m2[2].metric("🔵 Info", c[iir_review.INFO])
-        m2[3].metric("🟢 Pass", c[iir_review.PASS])
+        st.markdown(_severity_strip(c, _IIR_ORDER, _IIR_STYLE), unsafe_allow_html=True)
 
         ftab, ptab, xtab = st.tabs(["📋 Findings", "🔢 Protocol", "🗂 Extracted data"])
         with ftab:
@@ -1072,12 +1053,6 @@ def _iir_report_card(r):
 
 
 def render_iir_tool():
-    st.caption(
-        "Automated consistency & completeness QA of **Incoming Inspection Reports** "
-        "(Detailed Assessment Customer Reports, `.xlsx`). Upload one or more workbooks for a "
-        "severity-tagged findings checklist and a batch overview."
-    )
-
     top = st.columns([3, 1])
     with top[0]:
         iir_files = st.file_uploader(
@@ -1118,28 +1093,18 @@ def render_iir_tool():
             'npos': len(data['sn_rows']), 'template': data.get('template', '?'),
         })
 
-    _iir_overview(results)
-
-    # ── Pooled findings across the whole batch (was Excel-only before) ──
-    pooled = [{**f, 'report': r['src']} for r in results for f in r['findings']]
-    if pooled:
-        with st.container(border=True):
-            st.markdown("**All findings across the batch**")
-            _iir_filter_table(pooled, key="pool", with_report=True)
-
-    # ── Per-report drill-down ──
-    st.markdown("### Report detail")
+    # ── Batch overview: worst-first, click a row to open it below ──
+    # (only worth showing — and pooling findings — for more than one report)
     if len(results) > 1:
-        def _label(i):
-            r = results[i]
-            badge = ("⚠️" if r['template'] == 'unknown'
-                     else iir_review.SEV_ICON[iir_review.verdict_of(r['counts'])[0]])
-            return f"{badge}  {r['src']}"
-        idx = st.selectbox("View report", range(len(results)),
-                           format_func=_label, key="iir_pick")
-        _iir_report_card(results[idx])
+        idx = _iir_overview(results)
+        pooled = [{**f, 'report': r['src']} for r in results for f in r['findings']]
+        if pooled:
+            with st.expander(f"All findings across the batch ({len(pooled)})"):
+                _iir_filter_table(pooled, key="pool", with_report=True)
     else:
-        _iir_report_card(results[0])
+        idx = 0
+
+    _iir_report_card(results[idx])
 
 
 # ════════════════════════════════════════════════════════════════════════
