@@ -428,12 +428,23 @@ def parse_metallurgical(wb, media=0):
     }
 
 
+def _deviation_severity(rel, dev):
+    """Severity of one element's deviation, independent of how many other
+    elements are also off — a single element gutted by 88% is critical on
+    its own, not just when enough *other* elements are also out of spec."""
+    if abs(rel) >= COMP_CRIT_REL and abs(dev) >= COMP_CRIT_ABS:
+        return 'critical'
+    return 'warning'
+
+
 def _composition_deviations(nominal, actual):
     """Elements whose Actual is out of tolerance vs Nominal.
 
     Returns (deviations, systemic) where deviations is a list of
-    (element, nominal, actual, rel%) and `systemic` is True when so many
-    elements are off that the actual material likely isn't the stated alloy.
+    (element, nominal, actual, rel%, severity) and `systemic` is True when so
+    many elements are off that the actual material likely isn't the stated
+    alloy (a separate, count-based signal from any single element's own
+    severity — either can independently make the overall verdict critical).
     """
     deviations = []
     if not nominal or not actual:
@@ -446,7 +457,7 @@ def _composition_deviations(nominal, actual):
         dev = act - nom
         rel = dev / abs(nom) * 100.0
         if abs(rel) >= COMP_WARN_REL and abs(dev) >= COMP_WARN_ABS:
-            deviations.append((el, nom, act, rel))
+            deviations.append((el, nom, act, rel, _deviation_severity(rel, dev)))
     n_dev, n_common = len(deviations), len(common)
     systemic = n_dev >= 4 or (n_dev >= 3 and n_common and n_dev / n_common >= 0.5)
     return deviations, systemic
@@ -463,19 +474,22 @@ def _review_composition(nominal, actual):
     deviations, systemic = _composition_deviations(nominal, actual)
     n_dev, n_common = len(deviations), len(common)
 
-    # A few elements off is normal service depletion / EDS scatter → warnings.
-    # Many elements off together signals the actual material doesn't match the
-    # stated alloy → one consolidated FAIL ("verify material/grade").
+    # A few elements off is normal service depletion / EDS scatter → warnings,
+    # unless a single element is itself far enough outside tolerance to be
+    # critical regardless of how many others are affected. Many elements off
+    # together signals the actual material doesn't match the stated alloy →
+    # one consolidated FAIL ("verify material/grade").
     if systemic:
         worst = sorted(deviations, key=lambda d: -abs(d[3]))[:4]
-        detail = ", ".join(f"{el} {rel:+.0f}%" for el, _, _, rel in worst)
+        detail = ", ".join(f"{el} {rel:+.0f}%" for el, _, _, rel, _ in worst)
         findings.append(('critical', 'Composition',
                          f'{n_dev} of {n_common} elements out of tolerance ({detail} …) — actual '
                          f'composition does not match the stated alloy; verify material/grade.'))
     else:
-        for el, nom, act, rel in deviations:
-            findings.append(('warning', 'Composition',
-                             f'{el}: actual {act:g} vs nominal {nom:g} wt% ({rel:+.0f}%).'))
+        for el, nom, act, rel, sev in deviations:
+            extra = ' — far outside tolerance, verify material/grade' if sev == 'critical' else ''
+            findings.append((sev, 'Composition',
+                             f'{el}: actual {act:g} vs nominal {nom:g} wt% ({rel:+.0f}%){extra}.'))
 
     only_nom = sorted(set(nominal) - set(actual))
     only_act = sorted(set(actual) - set(nominal))
@@ -978,7 +992,10 @@ _MAG_PATS = [
     re.compile(r'E\s*[_ €F]?\s*(\d{2,4})\s*[xX%]'),   # E_500x
     re.compile(r'(?<![\d.])(\d{2,4})\s*[xX%]'),       # 500x
 ]
-_JOB_PAT   = re.compile(r'\b(\d{4})\b')
+# Digit-bounded, not \b-bounded: "7420_E_500x-4" has no \w/\W boundary after
+# the job number (underscore is a word char too), so \b(\d{4})\b never matches
+# the documented convention above.
+_JOB_PAT   = re.compile(r'(?<!\d)(\d{4})(?!\d)')
 _SCALE_PAT = re.compile(r'(\d{1,3})\s*[µuμyptwb]+m', re.I)
 _CAP_MAG   = re.compile(r'(\d{2,4})\s*[xX]\b')
 
@@ -1229,6 +1246,16 @@ def _review_legends(legends, ocr_used, caption_mags, report_job=None):
                      f'Read legends from {len(legends)} micrograph(s); '
                      f'magnifications: {", ".join(img_mags) if img_mags else "n/a"}.'))
 
+    # Two visibly different micrographs sharing one burned-in ID means at
+    # least one was captured/labelled wrong — the AEG "-n" suffix exists to
+    # keep these unique, so a repeat is never expected.
+    ids = [l['id'] for l in legends if l.get('id')]
+    dupes = sorted({i for i in ids if ids.count(i) > 1})
+    if dupes:
+        findings.append(('warning', 'Photo legends',
+                         f'Multiple micrographs share the identical burned-in ID '
+                         f'{", ".join(dupes)} — verify they aren\'t the same image mislabeled.'))
+
     # Cross-check magnifications burned into the images against the captions.
     if img_mags and caption_mags:
         missing = [m for m in img_mags if m not in caption_mags]
@@ -1309,8 +1336,10 @@ def review_filename(filename, parsed, rtype):
     low = name.lower()
     matched = []
 
-    # Job number (filename vs content).
-    fjob = re.search(r'\b(\d{4})\b', name)
+    # Job number (filename vs content). Digit-bounded, not \b-bounded — an
+    # underscore right after the digits (e.g. "7504_AEN_Saudi...") is a word
+    # char too, so \b(\d{4})\b would never match this very common convention.
+    fjob = re.search(r'(?<!\d)(\d{4})(?!\d)', name)
     cjob = _content_job(parsed, rtype)
     if fjob and cjob:
         if fjob.group(1) == cjob:
@@ -1439,8 +1468,8 @@ def collect_highlights(parsed):
     deviations, systemic = _composition_deviations(
         parsed.get('nominal') or {}, parsed.get('actual') or {})
     aloc = loc.get('actual') or {}
-    for el, nom, act, rel in deviations:
-        sev = 'critical' if systemic else 'warning'
+    for el, nom, act, rel, sev in deviations:
+        sev = 'critical' if systemic else sev
         add(aloc.get(el), sev, 'Composition', f'{el} {rel:+.0f}%',
             f'{el}: actual {act:g} vs nominal {nom:g} wt% ({rel:+.0f}%).')
 
