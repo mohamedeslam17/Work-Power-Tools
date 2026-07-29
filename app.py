@@ -50,8 +50,7 @@ def _micrographs(name, data, ocr):
 
 @st.cache_data(show_spinner=False)
 def _faithful_image(name, data, ocr):
-    """The slow pixel-faithful LibreOffice render — built only on demand, so a
-    big report never blocks the review. Returns (png_or_None, status)."""
+    """The pixel-faithful LibreOffice render. Returns (png_or_None, status)."""
     _, parsed, findings = _review(name, data, ocr)
     try:
         return report_render.render_report_faithful(data, parsed, findings=findings, filename=name)
@@ -480,30 +479,25 @@ def _flagged_cells(parsed):
 
 def _render_annotated(r, ocr):
     """Annotated view: pixel-faithful LibreOffice render (exact workbook look),
-    built on demand, plus annotated micrographs."""
+    always built, plus annotated micrographs."""
     f, rtype, parsed = r['f'], r['rtype'], r['parsed']
     data = f.getvalue()
 
     if report_render.libreoffice_available():
-        fkey = f"faithful_{f.name}"
-        if st.button("🖼 Render annotated view — exact workbook look",
-                     key=f"fbtn_{f.name}"):
-            st.session_state[fkey] = True
-        if st.session_state.get(fkey):
-            with st.status("Rendering the exact workbook with LibreOffice…", expanded=False) as status:
-                png, stat = _faithful_image(f.name, data, ocr)
-                status.update(
-                    label=("Pixel-faithful render ready" if png
-                           else f"Pixel-faithful render unavailable — {stat}"),
-                    state=("complete" if png else "error"))
-            if png:
-                st.image(png, width="stretch",
-                         caption="Pixel-faithful render — original fonts, layout and embedded micrographs, "
-                                 "with flagged cells boxed and numbered to the legend.")
-                st.download_button(
-                    "⬇ Annotated view (.png)", data=png,
-                    file_name=f"{Path(f.name).stem}_annotated.png",
-                    mime="image/png", key=f"fpng_{f.name}")
+        with st.status("Rendering the exact workbook with LibreOffice…", expanded=False) as status:
+            png, stat = _faithful_image(f.name, data, ocr)
+            status.update(
+                label=("Pixel-faithful render ready" if png
+                       else f"Pixel-faithful render unavailable — {stat}"),
+                state=("complete" if png else "error"))
+        if png:
+            st.image(png, width="stretch",
+                     caption="Pixel-faithful render — original fonts, layout and embedded micrographs, "
+                             "with flagged cells boxed and numbered to the legend.")
+            st.download_button(
+                "⬇ Annotated view (.png)", data=png,
+                file_name=f"{Path(f.name).stem}_annotated.png",
+                mime="image/png", key=f"fpng_{f.name}")
     elif rtype in ('metallurgical', 'coating'):
         st.caption("Annotated view unavailable — LibreOffice isn't installed in this environment.")
 

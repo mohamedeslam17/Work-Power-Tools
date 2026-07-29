@@ -35,8 +35,8 @@ annotated (legend / scale-bar regions boxed, low contrast and any burned-in thic
 flagged). Implemented in [`report_render.py`](report_render.py); cell anchoring comes
 from `lab_review.collect_highlights`.
 
-The render is built on demand (a button in the Annotated view tab) since LibreOffice
-takes a few seconds per report. It needs LibreOffice — `packages.txt` installs
+The render happens automatically for every reviewed report (LibreOffice takes a
+few seconds per report). It needs LibreOffice — `packages.txt` installs
 `libreoffice-calc`, and the PDF is rasterised with the existing **PyMuPDF** dependency;
 if LibreOffice isn't available, the annotated view is unavailable. The cell highlights
 are placed by filling each flagged cell with a uniquely-detectable colour in the
