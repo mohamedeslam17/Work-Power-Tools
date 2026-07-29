@@ -12,3 +12,7 @@ runOnSave = false
 
 [browser]
 gatherUsageStats = false
+
+[client]
+# Hide the deploy button / dev menu natively instead of via custom CSS.
+toolbarMode = "minimal"
