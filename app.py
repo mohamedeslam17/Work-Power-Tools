@@ -99,95 +99,106 @@ def _gallery_photos(alloy):
     return photos_for(alloy)
 
 
-# Complete UI redesign: Inter type, a light sidebar-nav dashboard shell, a
-# branded page header, and designed cards / inputs / metrics / controls.
+# Supabase-inspired UI: Inter + a monospace accent for data, a flat light
+# dashboard shell (zinc neutrals, green brand accent), border-driven cards
+# instead of heavy shadows, and tight, technical radii throughout.
 _CSS = """
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
   html, body, .stApp, button, input, textarea, select,
   [class*="css"] { font-family:'Inter',-apple-system,system-ui,Segoe UI,sans-serif !important; }
-  .stApp { background:#eef2f8; }
+  code, .stCodeBlock, [data-testid="stMetricValue"] { font-family:'JetBrains Mono',ui-monospace,Menlo,Consolas,monospace !important; }
+  .stApp { background:#fafafa; }
   .block-container { max-width:1140px; padding-top:1.3rem; padding-bottom:4rem; }
-  h1,h2,h3,h4 { letter-spacing:-.018em; color:#0f172a; font-weight:700; }
-  p,li,label,.stMarkdown { color:#334155; }
+  h1,h2,h3,h4 { letter-spacing:-.01em; color:#18181b; font-weight:600; }
+  p,li,label,.stMarkdown { color:#3f3f46; }
   #MainMenu, footer, [data-testid="stDecoration"] { display:none; }
   [data-testid="stHeader"] { background:transparent; height:0; }
 
   /* Sidebar */
-  [data-testid="stSidebar"] { background:#ffffff; border-right:1px solid #e6eaf2; }
+  [data-testid="stSidebar"] { background:#fafafa; border-right:1px solid #e4e4e7; }
   [data-testid="stSidebar"] > div { padding-top:.6rem; }
   [data-testid="stSidebar"] [role="radiogroup"] { gap:.18rem; }
   [data-testid="stSidebar"] [role="radiogroup"] label {
-    display:flex; align-items:center; width:100%; padding:.62rem .85rem; margin:0;
-    border-radius:11px; cursor:pointer; font-weight:600; font-size:.95rem;
-    color:#475569; transition:all .12s; }
-  [data-testid="stSidebar"] [role="radiogroup"] label:hover { background:#f1f5f9; }
+    display:flex; align-items:center; width:100%; padding:.6rem .85rem; margin:0;
+    border-radius:8px; cursor:pointer; font-weight:500; font-size:.92rem;
+    color:#52525b; transition:all .12s; }
+  [data-testid="stSidebar"] [role="radiogroup"] label:hover { background:#f0f0f1; }
   [data-testid="stSidebar"] [role="radiogroup"] label > div:first-child { display:none; }
   [data-testid="stSidebar"] [role="radiogroup"] label:has(input:checked) {
-    background:#eaf1ff; color:#1d4ed8; box-shadow:inset 3px 0 0 #2563eb; }
+    background:#e6f9f1; color:#12805c; font-weight:600; box-shadow:inset 2px 0 0 #3ecf8e; }
 
   /* Branded page header */
-  .pagehead { display:flex; align-items:center; gap:.9rem; margin:.1rem 0 1.2rem; }
-  .pagehead .ic { width:48px; height:48px; flex:none; border-radius:14px;
-    display:flex; align-items:center; justify-content:center; font-size:1.5rem;
-    background:linear-gradient(135deg,#2563eb,#4f46e5); color:#fff;
-    box-shadow:0 8px 18px rgba(37,99,235,.28); }
-  .pagehead h2 { margin:0; font-size:1.55rem; }
-  .pagehead .sub { color:#64748b; font-size:.92rem; margin-top:.12rem; }
+  .pagehead { display:flex; align-items:center; gap:.85rem; margin:.1rem 0 1.2rem; }
+  .pagehead .ic { width:44px; height:44px; flex:none; border-radius:10px;
+    display:flex; align-items:center; justify-content:center; font-size:1.4rem;
+    background:#3ecf8e; color:#0c2117; }
+  .pagehead h2 { margin:0; font-size:1.5rem; }
+  .pagehead .sub { color:#71717a; font-size:.9rem; margin-top:.1rem; }
 
   /* Cards */
   [data-testid="stVerticalBlockBorderWrapper"] {
-    background:#fff; border:1px solid #e8ecf4 !important; border-radius:18px;
-    box-shadow:0 1px 2px rgba(15,23,42,.04), 0 12px 32px rgba(15,23,42,.06); }
+    background:#fff; border:1px solid #e4e4e7 !important; border-radius:10px;
+    box-shadow:0 1px 2px rgba(0,0,0,.03); }
 
   /* Inputs */
   .stTextInput input, .stTextArea textarea,
   div[data-baseweb="select"] > div, div[data-baseweb="input"] > div {
-    background:#fff !important; border:1px solid #dbe2ec !important; border-radius:11px !important; }
+    background:#fff !important; border:1px solid #e4e4e7 !important; border-radius:8px !important; }
   .stTextInput input:focus, .stTextArea textarea:focus {
-    border-color:#2563eb !important; box-shadow:0 0 0 3px rgba(37,99,235,.13) !important; }
+    border-color:#3ecf8e !important; box-shadow:0 0 0 3px rgba(62,207,142,.18) !important; }
 
   /* Buttons */
   .stButton button, .stDownloadButton button {
-    border-radius:11px; font-weight:600; border:1px solid #dbe2ec; padding:.45rem 1rem; transition:all .12s; }
+    border-radius:8px; font-weight:500; border:1px solid #e4e4e7; padding:.45rem 1rem; transition:all .12s; }
   .stButton button:hover, .stDownloadButton button:hover {
-    border-color:#2563eb; color:#2563eb; box-shadow:0 3px 10px rgba(37,99,235,.13); }
+    border-color:#3ecf8e; color:#12805c; box-shadow:none; }
   .stButton button[kind="primary"], .stDownloadButton button[kind="primary"] {
-    background:#2563eb; border-color:#2563eb; color:#fff; }
-  .stButton button[kind="primary"]:hover { background:#1d4ed8; color:#fff; }
+    background:#3ecf8e; border-color:#3ecf8e; color:#0c2117; font-weight:600; }
+  .stButton button[kind="primary"]:hover { background:#34b27f; border-color:#34b27f; color:#0c2117; }
 
   /* Metrics */
   [data-testid="stMetric"] {
-    background:#f8fafc; border:1px solid #eef2f8; border-radius:14px; padding:.55rem .9rem; }
-  [data-testid="stMetricValue"] { font-size:1.6rem; font-weight:800; }
+    background:#fafafa; border:1px solid #e4e4e7; border-radius:8px; padding:.55rem .9rem; }
+  [data-testid="stMetricValue"] { font-size:1.5rem; font-weight:600; }
   [data-testid="stMetricLabel"] p { font-size:.78rem; opacity:.85; }
 
   /* Sub-tabs */
-  .stTabs [data-baseweb="tab-list"] { gap:.15rem; border-bottom:1px solid #e8ecf4; }
-  .stTabs [data-baseweb="tab"] { padding:.45rem 1.05rem; font-weight:600; color:#64748b; }
-  .stTabs [aria-selected="true"] { color:#2563eb; }
+  .stTabs [data-baseweb="tab-list"] { gap:.15rem; border-bottom:1px solid #e4e4e7; }
+  .stTabs [data-baseweb="tab"] { padding:.45rem 1.05rem; font-weight:500; color:#71717a; }
+  .stTabs [aria-selected="true"] { color:#12805c; font-weight:600; }
 
   /* Uploader / expander / divider */
-  [data-testid="stFileUploaderDropzone"] { background:#f8fafe; border:1.5px dashed #c6d2e6; border-radius:14px; }
-  [data-testid="stExpander"] details { border:1px solid #e8ecf4 !important; border-radius:13px; background:#fff; }
-  hr { border-color:#e8ecf4; margin:.7rem 0; }
+  [data-testid="stFileUploaderDropzone"] { background:#fafafa; border:1.5px dashed #d4d4d8; border-radius:8px; }
+  [data-testid="stExpander"] details { border:1px solid #e4e4e7 !important; border-radius:8px; background:#fff; }
+  hr { border-color:#e4e4e7; margin:.7rem 0; }
 
   /* Filter pills / segmented control */
   [data-testid="stPills"] button, [data-testid="stButtonGroup"] button {
-    border-radius:999px !important; font-weight:600 !important; }
+    border-radius:8px !important; font-weight:500 !important; }
   /* Dataframes read as part of the card */
-  [data-testid="stDataFrame"] { border-radius:12px; }
-  [data-testid="stPopover"] button { border-radius:11px; font-weight:600; }
+  [data-testid="stDataFrame"] { border-radius:8px; }
+  [data-testid="stPopover"] button { border-radius:8px; font-weight:500; }
+
+  /* Alert boxes (st.info / success / warning / error) */
+  [data-testid="stAlertContainer"] { background:transparent !important; padding:0 !important; border-radius:8px; }
+  [data-testid="stAlertContentInfo"], [data-testid="stAlertContentSuccess"],
+  [data-testid="stAlertContentWarning"], [data-testid="stAlertContentError"] {
+    padding:.75rem 1rem; border-radius:8px; }
+  [data-testid="stAlertContentInfo"] { background:#e7f3fb; border:1px solid #0284c729; color:#0c4a6e; }
+  [data-testid="stAlertContentSuccess"] { background:#e6f9f1; border:1px solid #12805c29; color:#0c4a35; }
+  [data-testid="stAlertContentWarning"] { background:#fef6e7; border:1px solid #b4530929; color:#5c3a08; }
+  [data-testid="stAlertContentError"] { background:#fdecec; border:1px solid #e5484d29; color:#7a1f22; }
 </style>
 """
 
 _BRAND = (
     '<div style="display:flex;align-items:center;gap:.6rem;padding:.4rem .35rem 1rem;">'
-    '<div style="width:40px;height:40px;border-radius:12px;'
-    'background:linear-gradient(135deg,#2563eb,#4f46e5);display:flex;align-items:center;'
-    'justify-content:center;font-size:1.35rem;box-shadow:0 8px 18px rgba(37,99,235,.3);">🔬</div>'
-    '<div><div style="font-weight:800;font-size:1.05rem;color:#0f172a;line-height:1.1;">AEG Tools</div>'
-    '<div style="font-size:.74rem;color:#94a3b8;">Materials Engineering</div></div></div>'
+    '<div style="width:38px;height:38px;border-radius:9px;'
+    'background:#3ecf8e;display:flex;align-items:center;'
+    'justify-content:center;font-size:1.3rem;">🔬</div>'
+    '<div><div style="font-weight:600;font-size:1.02rem;color:#18181b;line-height:1.1;">AEG Tools</div>'
+    '<div style="font-size:.74rem;color:#a1a1aa;">Materials Engineering</div></div></div>'
 )
 
 
@@ -198,17 +209,17 @@ def _page_header(icon, title, sub):
 
 # ── Shared UI helpers (used by both revamped tools) ──────────────────────
 def _chip(label, color, tint, icon=""):
-    """A small rounded status pill (returns HTML)."""
+    """A small status badge — flat tint fill, thin border, tight radius (returns HTML)."""
     ic = f'{icon} ' if icon else ''
     return (f'<span style="display:inline-flex;align-items:center;gap:.3rem;'
-            f'padding:.18rem .62rem;border-radius:999px;background:{tint};color:{color};'
-            f'font-weight:700;font-size:.78rem;border:1px solid {color}33;">{ic}{label}</span>')
+            f'padding:.16rem .55rem;border-radius:6px;background:{tint};color:{color};'
+            f'font-weight:600;font-size:.76rem;border:1px solid {color}2e;">{ic}{label}</span>')
 
 
 def _chips(items):
     """items: list of (label, color, tint, icon) → one inline chip row."""
     inner = ' '.join(_chip(l, c, t, i) for l, c, t, i in items)
-    return f'<div style="display:flex;gap:.45rem;flex-wrap:wrap;margin:.15rem 0 .5rem;">{inner}</div>'
+    return f'<div style="display:flex;gap:.4rem;flex-wrap:wrap;margin:.15rem 0 .5rem;">{inner}</div>'
 
 
 def _sevbar(segments):
@@ -217,8 +228,8 @@ def _sevbar(segments):
     cells = ''.join(
         f'<div style="width:{c / total * 100:.4f}%;background:{col};"></div>'
         for c, col in segments if c)
-    return ('<div style="display:flex;height:8px;width:100%;border-radius:999px;'
-            f'overflow:hidden;background:#eef2f8;margin:.2rem 0 .6rem;">{cells}</div>')
+    return ('<div style="display:flex;height:6px;width:100%;border-radius:4px;'
+            f'overflow:hidden;background:#f0f0f1;margin:.2rem 0 .6rem;">{cells}</div>')
 
 
 def _finding_rows_html(rows):
@@ -227,11 +238,11 @@ def _finding_rows_html(rows):
     for color, tint, label, cat, msg in rows:
         out.append(
             f'<div style="display:flex;align-items:baseline;gap:.6rem;'
-            f'padding:.45rem .8rem;margin:.32rem 0;border-left:4px solid {color};'
-            f'background:{tint};border-radius:8px;">'
-            f'<span style="color:{color};font-weight:700;font-size:.68rem;'
-            f'letter-spacing:.04em;text-transform:uppercase;min-width:54px;">{_html.escape(label)}</span>'
-            f'<span style="line-height:1.45;color:#28323f;">'
+            f'padding:.45rem .8rem;margin:.32rem 0;border-left:3px solid {color};'
+            f'background:{tint};border-radius:6px;">'
+            f'<span style="color:{color};font-weight:600;font-family:\'JetBrains Mono\',monospace;'
+            f'font-size:.66rem;letter-spacing:.04em;text-transform:uppercase;min-width:54px;">{_html.escape(label)}</span>'
+            f'<span style="line-height:1.45;color:#27272a;">'
             f'<b>{_html.escape(str(cat))}</b> — {_html.escape(str(msg))}</span></div>')
     return '<div>' + ''.join(out) + '</div>'
 
@@ -372,17 +383,17 @@ def render_converter():
 # severity → (accent colour, light tint, label)
 _SEV_ORDER = ['critical', 'warning', 'info', 'pass']
 _SEV_STYLE = {
-    'critical': ('#d62d38', '#fdecee', 'Fail'),
-    'warning':  ('#e07b16', '#fdf2e3', 'Warning'),
-    'info':     ('#1a6ed6', '#e9f1fc', 'Note'),
-    'pass':     ('#1f9e50', '#e8f6ee', 'Pass'),
+    'critical': ('#e5484d', '#fdecec', 'Fail'),
+    'warning':  ('#b45309', '#fef6e7', 'Warning'),
+    'info':     ('#0284c7', '#e7f3fb', 'Note'),
+    'pass':     ('#12805c', '#e6f9f1', 'Pass'),
 }
 _SEV_LABELS = {'critical': 'Fail', 'warning': 'Warning', 'info': 'Note', 'pass': 'Pass'}
 _LAB_EMOJI = {'critical': '🔴', 'warning': '🟠', 'info': '🔵', 'pass': '🟢'}
 _LAB_VERDICT = {
-    'critical': ('#d62d38', '#fdecee', 'Needs attention'),
-    'warning':  ('#e07b16', '#fdf2e3', 'Review recommended'),
-    'pass':     ('#1f9e50', '#e8f6ee', 'Looks good'),
+    'critical': ('#e5484d', '#fdecec', 'Needs attention'),
+    'warning':  ('#b45309', '#fef6e7', 'Review recommended'),
+    'pass':     ('#12805c', '#e6f9f1', 'Looks good'),
 }
 
 
@@ -405,7 +416,7 @@ def _lab_rows(findings):
     rank = {s: i for i, s in enumerate(_SEV_ORDER)}
     out = []
     for sev, cat, msg in sorted(findings, key=lambda t: rank.get(t[0], 9)):
-        color, tint, label = _SEV_STYLE.get(sev, ('#64748b', '#f1f5f9', sev))
+        color, tint, label = _SEV_STYLE.get(sev, ('#71717a', '#f4f4f5', sev))
         out.append((color, tint, label, cat, msg))
     return out
 
@@ -589,7 +600,7 @@ def _render_lab_detail(r, ocr):
             type_lbl = r['rtype'].capitalize() if r['rtype'] != 'unknown' else 'Unknown type'
             st.markdown(
                 _chips([(vlabel, color, tint, _LAB_EMOJI[r['verdict']]),
-                        (type_lbl, '#475569', '#eef2f6', '')]),
+                        (type_lbl, '#52525b', '#f4f4f5', '')]),
                 unsafe_allow_html=True)
             if r['facts']:
                 st.caption(r['facts'])
@@ -613,8 +624,8 @@ def _render_lab_detail(r, ocr):
                        "a limited review ran. Check it's an AEG lab report `.xlsx`.")
 
         c = r['counts']
-        st.markdown(_sevbar([(c['critical'], '#d62d38'), (c['warning'], '#e07b16'),
-                             (c['info'], '#1a6ed6'), (c['pass'], '#1f9e50')]),
+        st.markdown(_sevbar([(c['critical'], '#e5484d'), (c['warning'], '#b45309'),
+                             (c['info'], '#0284c7'), (c['pass'], '#12805c')]),
                     unsafe_allow_html=True)
         m = st.columns(4)
         m[0].metric("🔴 Fail", c['critical'])
@@ -652,7 +663,7 @@ def render_reviewer():
 
     ocr_ok = _ocr_available()
     lo_ok = report_render.libreoffice_available()
-    _ok, _off = ('#1f9e50', '#e8f6ee', '✓'), ('#94a3b8', '#f1f5f9', '○')
+    _ok, _off = ('#12805c', '#e6f9f1', '✓'), ('#a1a1aa', '#f4f4f5', '○')
     st.markdown(_chips([
         ("OCR ready" if ocr_ok else "OCR unavailable", *(_ok if ocr_ok else _off)),
         ("Pixel-faithful ready" if lo_ok else "Pixel-faithful unavailable", *(_ok if lo_ok else _off)),
@@ -797,10 +808,10 @@ def render_gallery():
 # ════════════════════════════════════════════════════════════════════════
 _XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 _IIR_STYLE = {
-    iir_review.FAIL: ('#d62d38', '#fdecee', 'Fail'),
-    iir_review.WARN: ('#e07b16', '#fdf2e3', 'Warn'),
-    iir_review.INFO: ('#1a6ed6', '#e9f1fc', 'Info'),
-    iir_review.PASS: ('#1f9e50', '#e8f6ee', 'Pass'),
+    iir_review.FAIL: ('#e5484d', '#fdecec', 'Fail'),
+    iir_review.WARN: ('#b45309', '#fef6e7', 'Warn'),
+    iir_review.INFO: ('#0284c7', '#e7f3fb', 'Info'),
+    iir_review.PASS: ('#12805c', '#e6f9f1', 'Pass'),
 }
 _IIR_ORDER = [iir_review.FAIL, iir_review.WARN, iir_review.INFO, iir_review.PASS]
 _IIR_CHOICE_LABEL = {iir_review.FAIL: "🔴 Fail", iir_review.WARN: "🟠 Warn",
@@ -1035,8 +1046,8 @@ def _iir_report_card(r):
         m[2].metric("Reconditionable", rp.get('reconditionable') if rp.get('found') else "—")
         m[3].metric("Positions", r['npos'])
 
-        st.markdown(_sevbar([(c[iir_review.FAIL], '#d62d38'), (c[iir_review.WARN], '#e07b16'),
-                             (c[iir_review.INFO], '#1a6ed6'), (c[iir_review.PASS], '#1f9e50')]),
+        st.markdown(_sevbar([(c[iir_review.FAIL], '#e5484d'), (c[iir_review.WARN], '#b45309'),
+                             (c[iir_review.INFO], '#0284c7'), (c[iir_review.PASS], '#12805c')]),
                     unsafe_allow_html=True)
         m2 = st.columns(4)
         m2[0].metric("🔴 Fail", c[iir_review.FAIL])

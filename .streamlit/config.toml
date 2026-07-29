@@ -1,10 +1,10 @@
 [theme]
-# Brand palette — a confident blue accent (replaces Streamlit's default red),
-# a light app background with white cards/inputs, and calm slate text.
-primaryColor = "#2563eb"
-backgroundColor = "#f5f8fd"
+# Supabase-inspired palette — the signature green accent, a light neutral
+# (zinc) background with white cards/inputs, and near-black text.
+primaryColor = "#3ecf8e"
+backgroundColor = "#fafafa"
 secondaryBackgroundColor = "#ffffff"
-textColor = "#1f2a37"
+textColor = "#18181b"
 font = "sans serif"
 
 [server]
