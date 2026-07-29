@@ -39,18 +39,13 @@ def _review(name, data, ocr):
 
 
 @st.cache_data(show_spinner=False)
-def _grid_and_micros(name, data, ocr):
-    """The instant annotated view: the drawn-grid image + annotated micrographs."""
-    rtype, parsed, findings = _review(name, data, ocr)
+def _micrographs(name, data, ocr):
+    """Annotated micrographs: legend / scale-bar regions boxed."""
+    _, parsed, _ = _review(name, data, ocr)
     try:
-        grid = report_render.render_report_image(data, parsed, findings, rtype, filename=name)
+        return report_render.annotate_micrographs(data, parsed)
     except Exception:
-        grid = None
-    try:
-        micros = report_render.annotate_micrographs(data, parsed)
-    except Exception:
-        micros = []
-    return grid, micros
+        return []
 
 
 @st.cache_data(show_spinner=False)
@@ -484,26 +479,14 @@ def _flagged_cells(parsed):
 
 
 def _render_annotated(r, ocr):
-    """Annotated view: instant drawn-grid render + annotated micrographs, with the
-    heavy pixel-faithful LibreOffice render available on demand."""
+    """Annotated view: pixel-faithful LibreOffice render (exact workbook look),
+    built on demand, plus annotated micrographs."""
     f, rtype, parsed = r['f'], r['rtype'], r['parsed']
     data = f.getvalue()
-    grid, micrographs = _grid_and_micros(f.name, data, ocr)
-    if grid:
-        st.image(grid, width="stretch",
-                 caption="Quick annotated view — flagged cells boxed and numbered to the legend.")
-        st.download_button(
-            "⬇ Annotated view (.png)", data=grid,
-            file_name=f"{Path(f.name).stem}_annotated.png",
-            mime="image/png", key=f"gridpng_{f.name}")
-    elif rtype in ('metallurgical', 'coating'):
-        st.caption("Annotated view unavailable (image libraries not installed).")
 
-    # The pixel-faithful render runs LibreOffice (seconds, more on a big report),
-    # so build it only when asked — the quick view above is already on screen.
     if report_render.libreoffice_available():
         fkey = f"faithful_{f.name}"
-        if st.button("🖼 Render pixel-faithful view — exact workbook look (slower)",
+        if st.button("🖼 Render annotated view — exact workbook look",
                      key=f"fbtn_{f.name}"):
             st.session_state[fkey] = True
         if st.session_state.get(fkey):
@@ -515,12 +498,16 @@ def _render_annotated(r, ocr):
                     state=("complete" if png else "error"))
             if png:
                 st.image(png, width="stretch",
-                         caption="Pixel-faithful render — original fonts, layout and embedded micrographs.")
+                         caption="Pixel-faithful render — original fonts, layout and embedded micrographs, "
+                                 "with flagged cells boxed and numbered to the legend.")
                 st.download_button(
-                    "⬇ Pixel-faithful (.png)", data=png,
-                    file_name=f"{Path(f.name).stem}_faithful.png",
+                    "⬇ Annotated view (.png)", data=png,
+                    file_name=f"{Path(f.name).stem}_annotated.png",
                     mime="image/png", key=f"fpng_{f.name}")
+    elif rtype in ('metallurgical', 'coating'):
+        st.caption("Annotated view unavailable — LibreOffice isn't installed in this environment.")
 
+    micrographs = _micrographs(f.name, data, ocr)
     if micrographs:
         st.markdown("**Annotated micrographs** — legend / scale-bar regions boxed; "
                     "contrast and any burned-in thickness flagged.")
@@ -674,7 +661,7 @@ def render_reviewer():
     _ok, _off = ('#1f9e50', '#e8f6ee', '✓'), ('#94a3b8', '#f1f5f9', '○')
     st.markdown(_chips([
         ("OCR ready" if ocr_ok else "OCR unavailable", *(_ok if ocr_ok else _off)),
-        ("Pixel-faithful ready" if lo_ok else "Grid view only", *(_ok if lo_ok else _off)),
+        ("Pixel-faithful ready" if lo_ok else "Pixel-faithful unavailable", *(_ok if lo_ok else _off)),
     ]), unsafe_allow_html=True)
 
     if not files:
