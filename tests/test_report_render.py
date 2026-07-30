@@ -1,9 +1,20 @@
+import io
 import unittest
 from unittest.mock import patch
 
+import fitz
+import openpyxl
 from PIL import Image, ImageDraw
+from openpyxl.worksheet.pagebreak import Break
 
-from report_render import _annotate_faithful_pages, build_issue_index
+from report_render import (
+    _annotate_faithful_pages,
+    _compose_download_pages,
+    _download_issue_cards,
+    _faithful_view,
+    _pages_to_pdf,
+    build_issue_index,
+)
 
 
 class ReportRenderTests(unittest.TestCase):
@@ -103,6 +114,98 @@ class ReportRenderTests(unittest.TestCase):
         self.assertEqual(issues[0]["pages"], [1])
         self.assertGreater(len(entries[0]["png"]), 1000)
         self.assertEqual(annotated[0].size, page.size)
+
+    def test_faithful_render_preserves_workbook_pagination(self):
+        workbook = openpyxl.Workbook()
+        sheet = workbook.active
+        sheet.title = "MET"
+        sheet["A1"] = "Report"
+        sheet["C20"] = "Last printed cell"
+        sheet.print_area = "A1:C20"
+        sheet.page_setup.orientation = "portrait"
+        sheet.page_setup.scale = 76
+        sheet.page_margins.left = 0.42
+        sheet.row_breaks.append(Break(id=10))
+        source = io.BytesIO()
+        workbook.save(source)
+
+        captured = {}
+
+        def inspect_saved_workbook(path, _outdir, _timeout):
+            annotated = openpyxl.load_workbook(path)
+            saved = annotated["MET"]
+            captured.update({
+                "print_area": str(saved.print_area),
+                "orientation": saved.page_setup.orientation,
+                "scale": saved.page_setup.scale,
+                "left_margin": saved.page_margins.left,
+                "row_breaks": [item.id for item in saved.row_breaks.brk],
+            })
+            return "fake.pdf"
+
+        with (
+            patch("report_render.collect_highlights", return_value=[]),
+            patch("report_render._xlsx_to_pdf", side_effect=inspect_saved_workbook),
+            patch(
+                "report_render._raster_pdf",
+                return_value=[Image.new("RGB", (300, 400), "white")],
+            ),
+            patch("report_render._compose_faithful_view", return_value={"ok": True}),
+        ):
+            result = _faithful_view(
+                source.getvalue(),
+                {"loc": {"sheet": "MET"}},
+                findings=[],
+                filename="report.xlsx",
+                dpi=150,
+                timeout=30,
+            )
+
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(captured["print_area"], "'MET'!$A$1:$C$20")
+        self.assertEqual(captured["orientation"], "portrait")
+        self.assertEqual(captured["scale"], 76)
+        self.assertEqual(captured["left_margin"], 0.42)
+        self.assertEqual(captured["row_breaks"], [10])
+
+    def test_download_pdf_embeds_all_issue_comments_beside_report(self):
+        report = Image.new("RGB", (600, 800), "white")
+        entry = {"number": 1, "issue_nums": [1]}
+        note = " ".join(
+            f"comment{index}" for index in range(180)
+        )
+        issues = [{
+            "num": 1,
+            "severity": "critical",
+            "category": "Disposition",
+            "note": note,
+            "refs": ["M9", "B21"],
+            "pages": [1],
+        }]
+
+        cards, _pad, _height = _download_issue_cards(
+            issues, panel_width=500, panel_height=800, dpi=150)
+        embedded_words = " ".join(
+            line for card in cards for line in card["note_lines"]
+        ).split()
+        self.assertEqual(embedded_words, note.split())
+
+        download_pages = _compose_download_pages(
+            [report],
+            [entry],
+            issues,
+            extras=[],
+            filename="report.xlsx",
+            dpi=150,
+        )
+        self.assertEqual(len(download_pages), 1)
+        self.assertGreater(download_pages[0].width, report.width + 500)
+        self.assertEqual(download_pages[0].height, report.height)
+
+        pdf = _pages_to_pdf(download_pages, dpi=150)
+        document = fitz.open(stream=pdf, filetype="pdf")
+        self.assertEqual(document.page_count, 1)
+        document.close()
 
 
 if __name__ == "__main__":
