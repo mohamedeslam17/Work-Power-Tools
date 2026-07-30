@@ -23,7 +23,7 @@ Two report families are recognised automatically:
 
 | Family            | Checks performed |
 |-------------------|------------------|
-| **Metallurgical** | Filename ↔ content (job / type / component / customer); Actual-vs-Nominal composition (element-by-element, ±10% → warning, ±25% → fail); hardness (pre/post-solution sanity + built-in alloy reference); completeness; sign-off; coating cell ↔ comment (presence & type); caption integrity (duplicate/gap numbers, etch status required, comment over-references); comment ↔ material/Result verdict; micrograph legends, etch contrast and burned-in thickness. |
+| **Metallurgical** | Filename ↔ content (job / type / component / customer); workbook formula/error integrity; Actual-vs-Nominal composition (element-by-element, duplicate/misaligned headers, `<LOD` major elements, chemistry-total sanity); hardness (pre/post-solution sanity + built-in alloy reference); sample ↔ serial traceability; explicit report disposition; sign-off; coating cell ↔ comment (presence & type); caption ↔ embedded-image completeness; caption integrity (duplicate/gap numbers, etch status required, comment over-references); comment ↔ material/Result verdict; micrograph job identity, legends, etch contrast and burned-in thickness. |
 | **Coating**       | Filename ↔ content; coating-thickness measurements vs design MIN/MAX limits; sign-off; reference-micrograph presence. |
 
 Findings are graded **🔴 Fail / 🟠 Warning / 🔵 Note / 🟢 Pass** and shown on screen.
@@ -96,9 +96,10 @@ that **post-solution** readings are expected to run *below* it (the solution-
 treated state precedes re-aging), so those are informational, not failures.
 Values are advisory — verify against the controlling spec.
 
-**Micrograph analysis (OCR).** Off by default so the findings list renders
-instantly; switch on *Also read micrograph legends & etch contrast* and the
-reviewer reads each embedded micrograph's burned-in legend (`<job>_E_<mag>x-<n>`
+**Micrograph analysis (OCR).** Enabled by default when Tesseract is available,
+because mixed-job evidence is release-critical; it can still be switched off for
+a faster text-only pass. The reviewer reads each embedded micrograph's burned-in
+legend (`<job>_E_<mag>x-<n>`
 + scale bar) and cross-checks the magnification and job number against the
 captions; gauges etched-vs-low-contrast via edge density (advisory — faint
 post-HT etching reads as low-contrast); and reads burned-in thickness labels
@@ -158,6 +159,12 @@ The Lab Report Reviewer can also be run from the command line:
 
 ```bash
 python3 lab_review.py "path/to/report.xlsx" [more.xlsx ...]
+```
+
+Run the deterministic reviewer regression suite with:
+
+```bash
+python3 -m unittest discover -s tests -v
 ```
 
 ## Notes
