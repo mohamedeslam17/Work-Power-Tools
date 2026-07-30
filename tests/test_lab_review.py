@@ -8,9 +8,12 @@ from lab_review import (
     _review_comment,
     _review_completeness,
     _review_composition,
+    _review_captions,
     _review_evidence_claims,
     _review_legends,
     _review_traceability,
+    collect_highlights,
+    review_filename,
 )
 
 
@@ -114,7 +117,7 @@ class LabReviewRegressionTests(unittest.TestCase):
             for message in messages(findings, "warning")
         ))
 
-    def test_sample_and_serial_count_mismatch_is_detected(self):
+    def test_sample_and_serial_count_mismatch_is_intentionally_skipped(self):
         parsed = {
             "sample": {
                 "sample_no": "MS 7221C    MS 7217C\nMS 7375C\nMS 7441C",
@@ -125,9 +128,9 @@ class LabReviewRegressionTests(unittest.TestCase):
 
         findings = _review_traceability(parsed)
 
-        self.assertTrue(any(
-            "4 sample number(s) but 3 serial/part number(s)" in message
-            for message in messages(findings, "warning")
+        self.assertFalse(any(
+            "sample-to-part mapping" in message
+            for message in messages(findings)
         ))
 
     def test_spaced_serial_prefix_is_one_identifier(self):
@@ -174,6 +177,150 @@ class LabReviewRegressionTests(unittest.TestCase):
         self.assertTrue(any(
             "Mixed micrograph job numbers" in message
             for message in messages(findings, "warning")
+        ))
+
+    def test_unsupported_600x_caption_is_release_blocking(self):
+        parsed = {
+            "pictures": [
+                ("Picture 1:", "Middle Wall Micrograph\nOrtho. Acid Etched 600x"),
+            ],
+            "comment": "",
+        }
+
+        findings = _review_captions(parsed)
+
+        self.assertTrue(any(
+            "Unsupported magnification 600x" in message
+            and "25x, 50x, 100x, 200x, 500x, 1000x" in message
+            for message in messages(findings, "critical")
+        ))
+
+    def test_approved_caption_magnifications_are_accepted(self):
+        parsed = {
+            "pictures": [
+                (f"Picture {index}:", f"Ortho. Acid Etched {mag}x")
+                for index, mag in enumerate((25, 50, 100, 200, 500, 1000), 1)
+            ],
+            "comment": "",
+        }
+
+        findings = _review_captions(parsed)
+
+        self.assertFalse(any(
+            category == "Magnification"
+            for _severity, category, _message in findings
+        ))
+
+    def test_title_identity_accepts_machine_aliases(self):
+        cases = [
+            (
+                "7420 AEN Saudi FS.7 3rd Stage Bucket Metallurgical Report.xlsx",
+                "7420", "MS7001", "3rd Stage Bucket",
+            ),
+            (
+                "7504 AEN Saudi 7FA 3rd Stage Bucket Metallurgical Report.xlsx",
+                "7504", "MS7001FA", "3rd Stage Bucket",
+            ),
+            (
+                "7646 AEN Saudi V84.2 2nd Stage Vane Metallurgical Report.xlsx",
+                "7646", "V84.2", "2nd Stage Vane",
+            ),
+        ]
+        for filename, job, machine, description in cases:
+            with self.subTest(filename=filename):
+                parsed = {
+                    "header": {
+                        "job": job,
+                        "machine": machine,
+                        "customer": "AEN Saudi",
+                    },
+                    "sample": {"description": description},
+                }
+
+                findings = review_filename(filename, parsed, "metallurgical")
+
+                self.assertFalse(any(
+                    severity in ("critical", "warning")
+                    for severity, category, _message in findings
+                    if category == "Title identity"
+                ))
+                self.assertTrue(any(
+                    "machine/set" in message
+                    for message in messages(findings, "pass")
+                ))
+
+    def test_title_identity_rejects_stage_component_and_machine_mismatches(self):
+        parsed = {
+            "header": {
+                "job": "7646",
+                "machine": "MS7001FA",
+                "customer": "AEN Saudi",
+            },
+            "sample": {"description": "3rd Stage Bucket"},
+        }
+
+        findings = review_filename(
+            "7646 AEN Saudi V84.2 2nd Stage Vane Metallurgical Report.xlsx",
+            parsed,
+            "metallurgical",
+        )
+        critical = messages(findings, "critical")
+
+        self.assertTrue(any("title says Stage 2" in message for message in critical))
+        self.assertTrue(any(
+            'title component "vane"' in message
+            for message in critical
+        ))
+        self.assertTrue(any("title machine/set" in message for message in critical))
+
+    def test_new_identity_and_magnification_failures_are_marked_on_report(self):
+        title_note = (
+            'Report title says Stage 1, but the internal component description '
+            'says Stage 2 ("2nd Stage Vane").'
+        )
+        parsed = {
+            "title_findings": [("critical", "Title identity", title_note)],
+            "header": {"job": "7646", "machine": "V84.2", "customer": "AEN"},
+            "sample": {
+                "description": "2nd Stage Vane",
+                "material": "Rene80",
+                "result": "Acceptable",
+            },
+            "pictures": [
+                ("Picture 1:", "Middle Wall Micrograph\nOrtho. Acid Etched 600x"),
+            ],
+            "comment": "A sufficiently long metallurgical discussion for this report.",
+            "micrograph_count": 1,
+            "signoff": {"met_lab": "Lab", "mat_eng": "Engineer", "date": "2026-07-30"},
+            "loc": {
+                "sheet": "MET",
+                "header": {
+                    "job": {"value": (4, 4)},
+                    "machine": {"value": (3, 12)},
+                    "customer": {"value": (3, 4)},
+                },
+                "sample": {
+                    "description": {"value": (9, 4)},
+                    "material": {"value": (9, 10)},
+                    "result": {"value": (9, 12)},
+                },
+                "pictures": [{"value": (20, 4)}],
+                "signoff": {},
+            },
+        }
+
+        highlights = collect_highlights(parsed)
+
+        self.assertTrue(any(
+            item["category"] == "Title identity"
+            and item["cell"] == (9, 4)
+            for item in highlights
+        ))
+        self.assertTrue(any(
+            item["category"] == "Magnification"
+            and item["cell"] == (20, 4)
+            and "600x" in item["note"]
+            for item in highlights
         ))
 
 

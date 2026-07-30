@@ -23,7 +23,7 @@ Two report families are recognised automatically:
 
 | Family            | Checks performed |
 |-------------------|------------------|
-| **Metallurgical** | Filename ↔ content (job / type / component / customer); workbook formula/error integrity; Actual-vs-Nominal composition (element-by-element, duplicate/misaligned headers, `<LOD` major elements, chemistry-total sanity); hardness (pre/post-solution sanity + built-in alloy reference); sample ↔ serial traceability; explicit report disposition; sign-off; coating cell ↔ comment (presence & type); caption ↔ embedded-image completeness; caption integrity (duplicate/gap numbers, etch status required, comment over-references); comment ↔ material/Result verdict; micrograph job identity, legends, etch contrast and burned-in thickness. |
+| **Metallurgical** | Report title ↔ content identity (job / type / stage / component / machine-set / customer); workbook formula/error integrity; Actual-vs-Nominal composition (element-by-element, duplicate/misaligned headers, `<LOD` major elements, chemistry-total sanity); hardness (pre/post-solution sanity + built-in alloy reference); duplicate sample/serial identifiers; explicit report disposition; sign-off; coating cell ↔ comment (presence & type); caption ↔ embedded-image completeness; caption integrity (duplicate/gap numbers, etch status required, approved magnifications only, comment over-references); comment ↔ material/Result verdict; micrograph job identity, legends, etch contrast and burned-in thickness. |
 | **Coating**       | Filename ↔ content; coating-thickness measurements vs design MIN/MAX limits; sign-off; reference-micrograph presence. |
 
 Findings are graded **🔴 Fail / 🟠 Warning / 🔵 Note / 🟢 Pass**.
@@ -106,6 +106,11 @@ post-HT etching reads as low-contrast); and reads burned-in thickness labels
 (e.g. `42 µm`) to surface alongside the comment's thickness values. Best-effort;
 needs the **Tesseract** engine (`packages.txt` installs `tesseract-ocr`; the app
 degrades gracefully without it).
+
+Written caption magnifications are checked even without OCR. The approved report
+set is **25x, 50x, 100x, 200x, 500x and 1000x**; values such as **600x** are
+release-blocking. OCR-only unsupported readings are warnings because small
+burned-in text can be misread.
 
 **Etch handling.** A caption that explicitly states *unetched / as-polished* is
 surfaced on its own (legitimate for thickness / crack work, but worth confirming
