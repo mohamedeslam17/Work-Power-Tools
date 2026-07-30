@@ -886,10 +886,6 @@ def _review_traceability(parsed):
     sample_ids = _identifier_tokens(sample.get('sample_no'), 'sample')
     serial_ids = _identifier_tokens(sample.get('serial'), 'serial')
 
-    if sample_ids and serial_ids and len(sample_ids) != len(serial_ids):
-        findings.append(('warning', 'Traceability',
-                         f'{len(sample_ids)} sample number(s) but {len(serial_ids)} serial/part '
-                         f'number(s) — the sample-to-part mapping is incomplete.'))
     for label, values in (('sample number', sample_ids), ('serial/part number', serial_ids)):
         duplicates = sorted(value for value, count in Counter(values).items() if count > 1)
         if duplicates:
@@ -1052,6 +1048,13 @@ def _review_captions(parsed):
         findings.append(('warning', 'Captions',
                          f'Comment refers to Picture {max(refs)} but only {len(pics)} '
                          f'picture(s) are present.'))
+
+    for value, entry in sorted(_invalid_caption_magnifications(pics).items()):
+        findings.append((
+            'critical',
+            'Magnification',
+            _invalid_magnification_message(value, entry['labels']),
+        ))
     return findings
 
 
@@ -1220,6 +1223,39 @@ _MAG_PATS = [
 _JOB_PAT   = re.compile(r'(?<!\d)(\d{4})(?!\d)')
 _SCALE_PAT = re.compile(r'(\d{1,3})\s*[µuμyptwb]+m', re.I)
 _CAP_MAG   = re.compile(r'(\d{2,4})\s*[xX]\b')
+
+# Magnifications available in the AEG metallography-report workflow. Treat
+# other written values (for example 600x) as report-data errors instead of
+# accepting every plausible microscope number.
+APPROVED_MAGNIFICATIONS = (25, 50, 100, 200, 500, 1000)
+
+
+def _invalid_caption_magnifications(pictures):
+    """Unsupported written magnifications grouped by value.
+
+    Returns {magnification: {'labels': [...], 'indexes': [...]}} so the finding
+    and the annotated report can share exactly the same wording and anchors.
+    """
+    invalid = {}
+    for index, (label, caption) in enumerate(pictures or []):
+        for match in _CAP_MAG.finditer(caption or ''):
+            value = int(match.group(1))
+            if value in APPROVED_MAGNIFICATIONS:
+                continue
+            entry = invalid.setdefault(value, {'labels': [], 'indexes': []})
+            shown = (label or f'Picture {index + 1}').rstrip(':')
+            if shown not in entry['labels']:
+                entry['labels'].append(shown)
+            if index not in entry['indexes']:
+                entry['indexes'].append(index)
+    return invalid
+
+
+def _invalid_magnification_message(value, labels):
+    where = ', '.join(labels)
+    approved = ', '.join(f'{mag}x' for mag in APPROVED_MAGNIFICATIONS)
+    return (f'Unsupported magnification {value}x in {where}. '
+            f'Approved report magnifications are {approved}.')
 
 
 def _safe_ocr(im, cfg='--psm 7'):
@@ -1468,6 +1504,20 @@ def _review_legends(legends, ocr_used, caption_mags, report_job=None):
                      f'Read legends from {len(legends)} micrograph(s); '
                      f'magnifications: {", ".join(img_mags) if img_mags else "n/a"}.'))
 
+    unsupported_ocr = [
+        mag for mag in img_mags
+        if int(mag[:-1]) not in APPROVED_MAGNIFICATIONS and mag not in caption_mags
+    ]
+    if unsupported_ocr:
+        approved = ', '.join(f'{mag}x' for mag in APPROVED_MAGNIFICATIONS)
+        findings.append((
+            'warning',
+            'Photo legends',
+            f'OCR read unsupported magnification(s) {", ".join(unsupported_ocr)} '
+            f'from image legends; approved values are {approved}. Verify the '
+            f'burned-in labels because OCR can misread small text.',
+        ))
+
     # Two visibly different micrographs sharing one burned-in ID means at
     # least one was captured/labelled wrong — the AEG "-n" suffix exists to
     # keep these unique, so a repeat is never expected.
@@ -1522,7 +1572,7 @@ def _review_legends(legends, ocr_used, caption_mags, report_job=None):
 
 
 # ════════════════════════════════════════════════════════════════════════
-# FILENAME vs CONTENT  (catch a mis-named workbook)
+# REPORT TITLE / FILENAME vs CONTENT  (catch a misidentified workbook)
 # ════════════════════════════════════════════════════════════════════════
 # Component synonyms (GE terminology): bucket≡blade (rotating), vane≡nozzle
 # (stationary). Order matters — multi-word parts first.
@@ -1538,14 +1588,53 @@ _PART_SYNONYMS = [
 ]
 
 
+def _component_identity(text):
+    """Return (stage_number, canonical_part) from free report-title text."""
+    raw = text or ''
+    lowered = raw.lower()
+    part = next((name for pat, name in _PART_SYNONYMS if re.search(pat, lowered)), None)
+    stage_match = (
+        re.search(r'\b(\d{1,2})\s*(?:st|nd|rd|th)?\s*(?:stage|stg)\b', lowered)
+        or re.search(r'\b(?:stage|stg)\s*(\d{1,2})\b', lowered)
+    )
+    stage = int(stage_match.group(1)) if stage_match else None
+    return stage, part
+
+
 def _canon_component(text):
     """Canonical 'stage + part' from free text, e.g. '2nd Stage Bucket' → '2 bucket'."""
-    t = (text or '').lower()
-    part = next((name for pat, name in _PART_SYNONYMS if re.search(pat, t)), None)
+    stage, part = _component_identity(text)
     if part is None:
         return None
-    m = re.search(r'(\d)\s*(?:st|nd|rd|th)?\s*stage', t)
-    return (f'{m.group(1)} ' if m else '') + part
+    return (f'{stage} ' if stage is not None else '') + part
+
+
+def _canon_machine(text):
+    """Canonical machine/set designation from a filename or report header.
+
+    The aliases below reflect the forms used by the supplied reports:
+    FS.7 ≡ MS7001 and 7FA ≡ MS7001FA. V-series names remain explicit.
+    """
+    raw = (text or '').upper()
+
+    v_model = re.search(r'(?<![A-Z0-9])V\s*(\d{2})\s*[.\-]?\s*(\d)(?!\d)', raw)
+    if v_model:
+        return f'V{v_model.group(1)}.{v_model.group(2)}'
+
+    ms_model = re.search(r'(?<![A-Z0-9])MS\s*([679])\s*001\s*([A-Z]{1,3})?', raw)
+    if ms_model:
+        frame, suffix = ms_model.group(1), ms_model.group(2) or ''
+        return f'{frame}{suffix}' if suffix else f'MS{frame}001'
+
+    fs_model = re.search(r'(?<![A-Z0-9])FS\s*[.\-]?\s*([679])(?!\d)', raw)
+    if fs_model:
+        return f'MS{fs_model.group(1)}001'
+
+    short_f = re.search(r'(?<![A-Z0-9])([679])\s*F\s*([A-Z]?)(?![A-Z0-9])', raw)
+    if short_f:
+        return f'{short_f.group(1)}F{short_f.group(2)}'
+
+    return None
 
 
 def _content_job(parsed, rtype):
@@ -1558,15 +1647,16 @@ def _content_job(parsed, rtype):
 
 
 def review_filename(filename, parsed, rtype):
-    """Check that the workbook's name agrees with its contents."""
+    """Check that the report title/filename agrees with its contents."""
     findings = []
     name = re.sub(r'\.xlsx?$', '', os.path.basename(filename or ''), flags=re.I)
     if not name:
         return findings
     low = name.lower()
     matched = []
+    category = 'Title identity'
 
-    # Job number (filename vs content). Digit-bounded, not \b-bounded — an
+    # Job number (title vs content). Digit-bounded, not \b-bounded — an
     # underscore right after the digits (e.g. "7504_AEN_Saudi...") is a word
     # char too, so \b(\d{4})\b would never match this very common convention.
     fjob = re.search(r'(?<!\d)(\d{4})(?!\d)', name)
@@ -1575,42 +1665,108 @@ def review_filename(filename, parsed, rtype):
         if fjob.group(1) == cjob:
             matched.append('job')
         else:
-            findings.append(('warning', 'Filename',
-                             f'Filename job number {fjob.group(1)} ≠ report job {cjob}.'))
+            findings.append(('critical', category,
+                             f'Report title job number {fjob.group(1)} does not match '
+                             f'the internal AEG job number {cjob}.'))
+    elif cjob and not fjob:
+        findings.append(('warning', category,
+                         f'Report title does not state the internal AEG job number {cjob}.'))
+    elif fjob and not cjob:
+        findings.append(('warning', category,
+                         f'Report title states job {fjob.group(1)}, but no internal '
+                         f'AEG job number was found.'))
 
-    # Report type (filename keyword vs detected type).
+    # Report type.
     if 'coating' in low and rtype == 'metallurgical':
-        findings.append(('warning', 'Filename',
-                         'Filename says "Coating" but the content is a metallurgical report.'))
+        findings.append(('critical', category,
+                         'Report title says "Coating" but the content is metallurgical.'))
     elif re.search(r'metallurg', low) and rtype == 'coating':
-        findings.append(('warning', 'Filename',
-                         'Filename says "Metallurgical" but the content is a coating report.'))
+        findings.append(('critical', category,
+                         'Report title says "Metallurgical" but the content is a coating report.'))
     elif ('coating' in low and rtype == 'coating') or \
          (re.search(r'metallurg', low) and rtype == 'metallurgical'):
         matched.append('type')
 
-    # Component / part.
-    fcomp = _canon_component(name)
-    ccomp = (_canon_component(parsed.get('sample', {}).get('description'))
-             if rtype == 'metallurgical' else parsed.get('component'))
-    if fcomp and ccomp:
-        if fcomp == ccomp:
+    content_description = (
+        parsed.get('sample', {}).get('description')
+        if rtype == 'metallurgical'
+        else parsed.get('component')
+    ) or ''
+    fstage, fpart = _component_identity(name)
+    cstage, cpart = _component_identity(content_description)
+
+    # Stage and component are checked independently so a title cannot pass by
+    # getting one of the two right.
+    if fstage is not None and cstage is not None:
+        if fstage == cstage:
+            matched.append('stage')
+        else:
+            findings.append(('critical', category,
+                             f'Report title says Stage {fstage}, but the internal '
+                             f'component description says Stage {cstage} '
+                             f'("{content_description}").'))
+    elif cstage is not None and fstage is None:
+        findings.append(('warning', category,
+                         f'Report title does not state Stage {cstage} from the internal '
+                         f'component description "{content_description}".'))
+    elif fstage is not None and cstage is None:
+        findings.append(('warning', category,
+                         f'Report title says Stage {fstage}, but the internal component '
+                         f'description does not state a stage.'))
+
+    if fpart and cpart:
+        if fpart == cpart:
             matched.append('component')
         else:
-            findings.append(('warning', 'Filename',
-                             f'Filename component "{fcomp}" ≠ report description "{ccomp}".'))
+            findings.append(('critical', category,
+                             f'Report title component "{fpart}" does not match the '
+                             f'internal component "{cpart}" ("{content_description}").'))
+    elif cpart and not fpart:
+        findings.append(('warning', category,
+                         f'Report title does not state the internal component "{cpart}".'))
+    elif fpart and not cpart:
+        findings.append(('warning', category,
+                         f'Report title states component "{fpart}", but no internal '
+                         f'component name was found.'))
+
+    # Machine/set designation: cover both the explicit V-series wording and GE
+    # aliases used in these files (FS.7/MS7001 and 7FA/MS7001FA).
+    content_machine = (
+        parsed.get('header', {}).get('machine') if rtype == 'metallurgical' else None
+    ) or ''
+    fmachine = _canon_machine(name)
+    cmachine = _canon_machine(content_machine)
+    if rtype == 'metallurgical':
+        if fmachine and cmachine:
+            if fmachine == cmachine:
+                matched.append('machine/set')
+            else:
+                findings.append(('critical', category,
+                                 f'Report title machine/set "{fmachine}" does not match '
+                                 f'the internal Machine Type "{content_machine}" '
+                                 f'("{cmachine}").'))
+        elif cmachine and not fmachine:
+            findings.append(('warning', category,
+                             f'Report title does not state the internal machine/set '
+                             f'"{content_machine}".'))
+        elif fmachine and not cmachine:
+            findings.append(('warning', category,
+                             f'Report title states machine/set "{fmachine}", but the '
+                             f'internal Machine Type is blank or unrecognised.'))
 
     # Customer (advisory, lenient — pass on any shared word ≥3 chars).
     ccust = parsed.get('header', {}).get('customer') if rtype == 'metallurgical' else None
     if ccust:
         ctoks = set(re.findall(r'[a-z]{3,}', ccust.lower()))
         if ctoks and not (ctoks & set(re.findall(r'[a-z]{3,}', low))):
-            findings.append(('info', 'Filename',
-                             f'Filename customer doesn’t obviously match the report customer "{ccust}".'))
+            findings.append(('info', category,
+                             f'Report title customer does not obviously match the '
+                             f'internal customer "{ccust}".'))
 
-    if matched and not any(c == 'Filename' and s == 'warning' for s, c, _ in findings):
-        findings.append(('pass', 'Filename',
-                         f'Filename agrees with the report ({", ".join(matched)}).'))
+    if matched and not any(
+            c == category and s in ('critical', 'warning') for s, c, _ in findings):
+        findings.append(('pass', category,
+                         f'Report title agrees with the content ({", ".join(matched)}).'))
     return findings
 
 
@@ -1658,7 +1814,9 @@ def review_report(filename, data, ocr=True):
                      'Unrecognised layout — not classified as a metallurgical or coating report.')]
         findings += _review_workbook_integrity(parsed)
 
-    findings += review_filename(filename, parsed, rtype)
+    title_findings = review_filename(filename, parsed, rtype)
+    parsed['title_findings'] = title_findings
+    findings += title_findings
 
     images = []
     if ocr:
@@ -1718,6 +1876,24 @@ def collect_highlights(parsed):
             f'{issue.get("sheet")}!{issue.get("cell")} uses external-workbook '
             f'formula {issue.get("formula")}.')
 
+    # ── Report title identity — point at the conflicting internal field ──
+    title_header_loc = loc.get('header') or {}
+    title_sample_loc = loc.get('sample') or {}
+    for severity, category, note in parsed.get('title_findings') or []:
+        if severity == 'pass':
+            continue
+        lowered = note.lower()
+        cell, tag = None, 'title mismatch'
+        if 'job number' in lowered or 'states job' in lowered:
+            cell, tag = anchor(title_header_loc.get('job')), 'job mismatch'
+        elif 'machine/set' in lowered or 'machine type' in lowered:
+            cell, tag = anchor(title_header_loc.get('machine')), 'machine mismatch'
+        elif 'stage' in lowered or 'component' in lowered:
+            cell, tag = anchor(title_sample_loc.get('description')), 'component mismatch'
+        elif 'customer' in lowered:
+            cell, tag = anchor(title_header_loc.get('customer')), 'customer?'
+        add(cell, severity, category, tag, note)
+
     # ── Composition — Actual cells out of tolerance vs Nominal ──
     deviations, systemic = _composition_deviations(
         parsed.get('nominal') or {}, parsed.get('actual') or {})
@@ -1764,16 +1940,6 @@ def collect_highlights(parsed):
     if _is_placeholder(smp.get('material')):
         add(anchor((loc.get('sample') or {}).get('material')), 'warning',
             'Completeness', 'Material blank', 'Sample material/alloy not stated.')
-
-    # ── Traceability — sample-number / serial-number scope mismatch ──
-    sample_ids = _identifier_tokens(smp.get('sample_no'), 'sample')
-    serial_ids = _identifier_tokens(smp.get('serial'), 'serial')
-    if sample_ids and serial_ids and len(sample_ids) != len(serial_ids):
-        note = (f'{len(sample_ids)} sample number(s) but {len(serial_ids)} serial/part '
-                f'number(s) — the sample-to-part mapping is incomplete.')
-        sloc = loc.get('sample') or {}
-        for key in ('sample_no', 'serial'):
-            add(anchor(sloc.get(key)), 'warning', 'Traceability', 'count mismatch', note)
 
     # ── Disposition — "See comment" must lead to an actual verdict ──
     result = smp.get('result') or ''
@@ -1833,6 +1999,12 @@ def collect_highlights(parsed):
             add(anchor(entry), 'info', 'Captions', 'Unetched',
                 f'{(label or "?").rstrip(":")} caption states unetched / as-polished — '
                 f'confirm intended (a microstructure assessment is normally etched).')
+
+    for value, invalid in sorted(_invalid_caption_magnifications(pics).items()):
+        note = _invalid_magnification_message(value, invalid['labels'])
+        for index in invalid['indexes']:
+            entry = ploc[index] if 0 <= index < len(ploc) else {}
+            add(anchor(entry), 'critical', 'Magnification', f'{value}x invalid', note)
 
     # ── Photo etch — per-picture caption↔contrast mismatch (anchor to caption) ──
     for v in parsed.get('photo_etch') or []:
