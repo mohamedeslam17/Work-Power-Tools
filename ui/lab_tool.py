@@ -96,9 +96,10 @@ def render():
 
     ocr_ok = _ocr_available()
     ocr = st.toggle(
-        "Also read micrograph legends & etch contrast (slower)", value=False,
+        "Read micrograph identity, legends & etch contrast (slower)", value=ocr_ok,
         disabled=not ocr_ok,
-        help="Cross-checks each micrograph's burned-in legend and etch contrast via OCR."
+        help="Cross-checks every micrograph's burned-in job number, magnification, "
+             "scale and etch contrast via OCR."
              + ("" if ocr_ok else " Unavailable — Tesseract isn't installed in this environment."))
 
     reviewed = []
@@ -228,12 +229,22 @@ def _extracted_view(rtype, parsed):
         coat_str = (coat.get('type') or coat.get('received') or coat.get('outgoing')
                     or coat.get('present') or '—')
         c1.write(f"**Coating:** {coat_str}")
+        c2.write(f"**Result:** {smp.get('result') or '—'}")
+        pic_count = len(parsed.get('pictures') or [])
+        image_count = parsed.get('micrograph_count')
+        if image_count is not None:
+            c1.write(f"**Evidence:** {image_count} micrograph(s) / {pic_count} caption(s)")
 
         nom, act = parsed.get('nominal', {}), parsed.get('actual', {})
-        if nom or act:
+        actual_entries = (
+            ((parsed.get('composition_meta') or {}).get('actual') or {}).get('entries') or [])
+        actual_raw = {}
+        for entry in actual_entries:
+            actual_raw.setdefault(entry.get('element'), []).append(entry.get('raw') or '—')
+        if nom or act or actual_raw:
             st.markdown("**Composition — Nominal vs Actual (wt%)**")
             rows = []
-            for el in sorted(set(nom) | set(act)):
+            for el in sorted(set(nom) | set(act) | set(actual_raw)):
                 n, a = nom.get(el), act.get(el)
                 if n not in (None, 0) and a is not None:
                     dev_pct = (a - n) / abs(n) * 100
@@ -245,7 +256,8 @@ def _extracted_view(rtype, parsed):
                 rows.append({
                     "": flag, "Element": el,
                     "Nominal": f"{n:g}" if n is not None else "—",
-                    "Actual":  f"{a:g}" if a is not None else "—",
+                    "Actual":  (f"{a:g}" if a is not None
+                                else " / ".join(actual_raw.get(el) or ["—"])),
                     "Δ":       dev,
                 })
             st.dataframe(rows, width="stretch", hide_index=True,
