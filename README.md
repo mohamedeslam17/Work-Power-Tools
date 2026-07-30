@@ -30,13 +30,17 @@ Findings are graded **🔴 Fail / 🟠 Warning / 🔵 Note / 🟢 Pass**.
 
 **Report-centric annotated review.** The annotated report is the default and
 automatic result after upload — there is no separate findings table or evidence
-mode to open. The reviewer presents a **pixel-faithful** render of the report
-*with the issue areas highlighted and numbered to explanations in the same image*:
-the real workbook is converted with **LibreOffice**
+mode to open. The reviewer presents a **pixel-faithful, page-at-a-time** render
+of the report: issue areas are highlighted and numbered on the page, while
+concise matching issue cards remain beside that page. One issue can mark several
+affected cells without being counted or repeated several times. The real
+workbook is converted with **LibreOffice**
 (original fonts, column widths, borders and embedded micrographs intact) and each
-flagged cell is filled, badged and explained. It covers composition deviations,
-hardness, blank header/sign-off fields, captions without an etch status, and coating
-thickness outside the design limits. Implemented in
+flagged cell is filled and badged. Page controls replace the former extremely
+tall stacked image, and the downloadable annotated output is a multi-page PDF.
+The review covers composition deviations, hardness, blank header/sign-off fields,
+captions without an etch status, and coating thickness outside the design limits.
+Implemented in
 [`report_render.py`](report_render.py); cell anchoring comes from
 `lab_review.collect_highlights`.
 
