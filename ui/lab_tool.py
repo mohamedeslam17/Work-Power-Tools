@@ -1,4 +1,5 @@
 """Lab Report Review — 'Is this .xlsx lab report wrong anywhere, and where?'"""
+import html
 import io
 from pathlib import Path
 
@@ -28,7 +29,7 @@ def _cached_review(name, data, ocr):
 
 @st.cache_data(show_spinner=False)
 def _cached_annotated_report(name, data, ocr):
-    """Return one report-centric review canvas.
+    """Return a page-oriented report-centric review package.
 
     The exact LibreOffice rendering is preferred. A spreadsheet-style
     annotated fallback keeps the report visible if exact rendering is not
@@ -38,10 +39,10 @@ def _cached_annotated_report(name, data, ocr):
     exact_status = 'LibreOffice not installed'
     if report_render.libreoffice_available():
         try:
-            png, exact_status = report_render.render_report_faithful(
+            view, exact_status = report_render.render_report_faithful_view(
                 data, parsed, findings=findings, filename=name)
-            if png:
-                return png, 'exact'
+            if view:
+                return view, 'exact'
         except Exception as e:
             exact_status = f'{type(e).__name__}: {e}'
 
@@ -50,8 +51,20 @@ def _cached_annotated_report(name, data, ocr):
             data, parsed, findings=findings, rtype=rtype, filename=name)
     except Exception as e:
         return None, f'{exact_status}; fallback failed: {type(e).__name__}: {e}'
-    return (png, f'fallback: {exact_status}') if png else (
-        None, f'{exact_status}; annotated fallback unavailable')
+    if not png:
+        return None, f'{exact_status}; annotated fallback unavailable'
+    issues, extras = report_render.build_issue_index(parsed, findings)
+    for issue in issues:
+        issue['pages'] = [1]
+    return {
+        'filename': name,
+        'pages': [{'number': 1, 'png': png,
+                   'issue_nums': [issue['num'] for issue in issues]}],
+        'issues': issues,
+        'extras': extras,
+        'annotated_pdf': None,
+        'combined_png': png,
+    }, f'fallback: {exact_status}'
 
 
 @st.cache_data(show_spinner=False)
@@ -174,9 +187,9 @@ def _annotated_report(r, ocr):
     """
     f = r['f']
     with st.spinner(f"Building annotated report for {f.name}…"):
-        png, mode = _cached_annotated_report(f.name, f.getvalue(), ocr)
+        view, mode = _cached_annotated_report(f.name, f.getvalue(), ocr)
 
-    if not png:
+    if not view:
         st.error(f"Could not build the annotated report view — {mode}.")
         return
 
@@ -185,15 +198,132 @@ def _annotated_report(r, ocr):
             "The exact Excel renderer is unavailable, so this is a simplified "
             "annotated sheet view. Issue markers and explanations are still included.")
 
-    st.image(
-        png,
-        width="stretch",
-        caption=("Annotated report — numbered markers identify the affected locations; "
-                 "their explanations are included in the same image."))
-    st.download_button(
-        "⬇ Download annotated report (.png)",
-        data=png,
-        file_name=f"{Path(f.name).stem}_annotated.png",
-        mime="image/png",
-        key=f"fpng_{f.name}",
-        width="stretch")
+    pages = view.get('pages') or []
+    if not pages:
+        st.error("The workbook rendered, but no report pages were produced.")
+        return
+
+    st.markdown("### Annotated report")
+    st.caption(
+        "Open one page at a time. Matching numbers can appear in more than one "
+        "location when a single issue affects several report fields.")
+
+    labels = {
+        page['number']: (
+            f"Page {page['number']}"
+            + (f" · {len(page.get('issue_nums') or [])} issue"
+               f"{'s' if len(page.get('issue_nums') or []) != 1 else ''}"
+               if page.get('issue_nums') else " · clear")
+        )
+        for page in pages
+    }
+    numbers = [page['number'] for page in pages]
+    if len(numbers) <= 6:
+        selected_number = st.pills(
+            "Report page",
+            numbers,
+            default=numbers[0],
+            selection_mode="single",
+            format_func=lambda number: labels[number],
+            key=f"lab_page_{f.name}",
+            label_visibility="collapsed",
+        ) or numbers[0]
+    else:
+        selected_number = st.selectbox(
+            "Report page",
+            numbers,
+            format_func=lambda number: labels[number],
+            key=f"lab_page_{f.name}",
+        )
+    page = next(item for item in pages if item['number'] == selected_number)
+
+    report_col, issue_col = st.columns([3.25, 1.35], gap="large")
+    with report_col:
+        st.markdown(
+            f'<div class="aeg-page-kicker">PAGE {page["number"]} OF {len(pages)}</div>',
+            unsafe_allow_html=True,
+        )
+        st.image(page['png'], width="stretch")
+    with issue_col:
+        _page_findings(view, page)
+
+    download_col, _ = st.columns([1.7, 3.3])
+    with download_col:
+        if view.get('annotated_pdf'):
+            st.download_button(
+                "⬇ Download annotated report (.pdf)",
+                data=view['annotated_pdf'],
+                file_name=f"{Path(f.name).stem}_annotated.pdf",
+                mime="application/pdf",
+                key=f"fpdf_{f.name}",
+                width="stretch",
+            )
+        else:
+            st.download_button(
+                "⬇ Download annotated report (.png)",
+                data=view['combined_png'],
+                file_name=f"{Path(f.name).stem}_annotated.png",
+                mime="image/png",
+                key=f"fpng_{f.name}",
+                width="stretch",
+            )
+
+
+def _page_findings(view, page):
+    """Render concise issue cards beside the selected report page."""
+    page_numbers = set(page.get('issue_nums') or [])
+    page_issues = [
+        issue for issue in view.get('issues') or []
+        if issue['num'] in page_numbers
+    ]
+    st.markdown("#### Issues on this page")
+    if page_issues:
+        for issue in page_issues:
+            _issue_card(issue)
+    else:
+        st.markdown(
+            '<div class="aeg-clear-card">'
+            '<div class="aeg-clear-title">No marked issues</div>'
+            '<div class="aeg-clear-copy">Nothing on this page needs a location marker.</div>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+    unplaced = [
+        issue for issue in view.get('issues') or []
+        if not issue.get('pages')
+    ]
+    extras = list(view.get('extras') or [])
+    if unplaced or extras:
+        st.markdown("#### Report-level checks")
+        for issue in unplaced:
+            _issue_card(issue, show_number=False)
+        for extra in extras:
+            _issue_card(extra, show_number=False)
+
+
+def _issue_card(issue, show_number=True):
+    severity = issue.get('severity', 'warning')
+    label = {
+        'critical': 'Fail',
+        'warning': 'Warning',
+        'info': 'Note',
+        'pass': 'Pass',
+    }.get(severity, 'Review')
+    number = (
+        f'<span class="aeg-issue-number">{issue.get("num")}</span>'
+        if show_number and issue.get('num') is not None else ''
+    )
+    refs = issue.get('refs') or []
+    meta = f"{html.escape(issue.get('category') or 'Review')}"
+    if refs:
+        meta += " · " + html.escape(", ".join(refs))
+    st.markdown(
+        f'<div class="aeg-issue-card aeg-{severity}">'
+        f'<div class="aeg-issue-head">{number}'
+        f'<span class="aeg-issue-label">{html.escape(label)}</span></div>'
+        f'<div class="aeg-issue-meta">{meta}</div>'
+        f'<div class="aeg-issue-copy">{html.escape(issue.get("note") or "")}</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
