@@ -10,6 +10,11 @@ from lab_review import review_report
 from photo_lib import add_to_library
 
 try:
+    from lab_review import COMP_WARN_REL, COMP_CRIT_REL
+except Exception:     # display-only hint; authoritative logic lives in lab_review
+    COMP_WARN_REL, COMP_CRIT_REL = 10.0, 25.0
+
+try:
     import pandas as pd
 except Exception:     # pandas ships with Streamlit; guard just in case
     pd = None
@@ -175,7 +180,167 @@ def _render_detail(r, ocr):
                 file_name=f"{Path(r['name']).stem}_findings.csv", mime="text/csv",
                 key=f"labcsv_{r['name']}", width="stretch")
 
+        with st.expander("Extracted information", expanded=False):
+            _extracted_view(r['rtype'], r['parsed'])
+
         _annotated_report(r, ocr)
+
+
+def _shown(value):
+    return value if value is not None and str(value).strip() else '—'
+
+
+def _hardness_text(entry):
+    entry = entry or {}
+    raw = entry.get('raw')
+    if raw is not None and str(raw).strip():
+        return str(raw)
+    value = entry.get('value')
+    if value is None:
+        return '—'
+    return f"{value:g} {entry.get('unit') or ''}".strip()
+
+
+def _extracted_view(rtype, parsed):
+    """Show the facts used by the reviewer without replacing the report view."""
+    st.caption(
+        "Values read from the workbook. The annotated report remains the main "
+        "review view below.")
+
+    if rtype == 'metallurgical':
+        hdr = parsed.get('header') or {}
+        sample = parsed.get('sample') or {}
+        hardness = parsed.get('hardness') or {}
+        coating = parsed.get('coating') or {}
+        left, right = st.columns(2, gap="large")
+        with left:
+            st.markdown("**Report identity**")
+            st.write(f"**Job:** {_shown(hdr.get('job'))}")
+            st.write(f"**AEG reference:** {_shown(hdr.get('aeg_ref'))}")
+            st.write(f"**Customer:** {_shown(hdr.get('customer'))}")
+            st.write(f"**Customer reference:** {_shown(hdr.get('customer_ref'))}")
+            st.write(f"**Machine:** {_shown(hdr.get('machine'))}")
+            st.write(f"**Quantity:** {_shown(hdr.get('qty'))}")
+            st.write(f"**EOH:** {_shown(hdr.get('eoh'))}")
+        with right:
+            st.markdown("**Sample identity**")
+            st.write(f"**Sample number:** {_shown(sample.get('sample_no'))}")
+            st.write(f"**Component:** {_shown(sample.get('description'))}")
+            st.write(f"**Serial number:** {_shown(sample.get('serial'))}")
+            st.write(f"**Location:** {_shown(sample.get('location'))}")
+            st.write(f"**Material:** {_shown(sample.get('material'))}")
+            st.write(f"**Result:** {_shown(sample.get('result'))}")
+
+        coat_text = next(
+            (coating.get(key) for key in ('type', 'received', 'outgoing', 'present')
+             if coating.get(key) is not None and str(coating.get(key)).strip()),
+            '—',
+        )
+        details_left, details_right = st.columns(2, gap="large")
+        with details_left:
+            st.markdown("**Test details**")
+            st.write(f"**Pre-solution hardness:** {_hardness_text(hardness.get('pre'))}")
+            st.write(f"**Post-solution hardness:** {_hardness_text(hardness.get('post'))}")
+            st.write(f"**Coating:** {coat_text}")
+        with details_right:
+            st.markdown("**Evidence extracted**")
+            caption_count = len(parsed.get('pictures') or [])
+            image_count = parsed.get('micrograph_count')
+            st.write(f"**Picture captions:** {caption_count}")
+            st.write(
+                f"**Embedded micrographs:** "
+                f"{_shown(image_count) if image_count is not None else '—'}")
+
+        comment = parsed.get('comment')
+        if comment is not None and str(comment).strip():
+            st.markdown("**Reported comment**")
+            st.write(str(comment))
+
+        nominal = parsed.get('nominal') or {}
+        actual = parsed.get('actual') or {}
+        actual_entries = (
+            ((parsed.get('composition_meta') or {}).get('actual') or {})
+            .get('entries') or []
+        )
+        actual_raw = {}
+        for entry in actual_entries:
+            element = entry.get('element')
+            if element:
+                actual_raw.setdefault(element, []).append(entry.get('raw') or '—')
+        if nominal or actual or actual_raw:
+            st.markdown("**Composition — nominal vs actual (wt%)**")
+            rows = []
+            for element in sorted(set(nominal) | set(actual) | set(actual_raw)):
+                expected, measured = nominal.get(element), actual.get(element)
+                if expected not in (None, 0) and measured is not None:
+                    deviation_pct = (measured - expected) / abs(expected) * 100
+                    deviation = f"{deviation_pct:+.0f}%"
+                    flag = (
+                        "🔴" if abs(deviation_pct) >= COMP_CRIT_REL
+                        else "🟠" if abs(deviation_pct) >= COMP_WARN_REL
+                        else ""
+                    )
+                else:
+                    deviation, flag = "—", ""
+                rows.append({
+                    "": flag,
+                    "Element": element,
+                    "Nominal": f"{expected:g}" if expected is not None else "—",
+                    "Actual": (
+                        f"{measured:g}" if measured is not None
+                        else " / ".join(actual_raw.get(element) or ["—"])
+                    ),
+                    "Δ": deviation,
+                })
+            st.dataframe(
+                rows,
+                width="stretch",
+                hide_index=True,
+                column_config={"": st.column_config.TextColumn(width="small")},
+            )
+            st.caption(
+                "Deviation hint only: 🟠 ≥ %g%% and 🔴 ≥ %g%%. The numbered "
+                "review comments remain authoritative."
+                % (COMP_WARN_REL, COMP_CRIT_REL)
+            )
+
+    elif rtype == 'coating':
+        left, right = st.columns(2, gap="large")
+        with left:
+            st.write(f"**Report number:** {_shown(parsed.get('report_no'))}")
+            st.write(f"**Title:** {_shown(parsed.get('title'))}")
+        with right:
+            st.write(f"**Component:** {_shown(parsed.get('component'))}")
+            st.write(f"**Embedded images:** {_shown(parsed.get('media'))}")
+
+        rows = parsed.get('rows') or []
+        if rows:
+            st.markdown("**Coating measurements**")
+            st.dataframe([
+                {
+                    "Workbook row": entry.get('row'),
+                    "Design minimum (mm)": entry.get('min'),
+                    "Design maximum (mm)": entry.get('max'),
+                    "Measurements (mm)": ", ".join(
+                        f"{value:g}" for value in entry.get('values') or []),
+                }
+                for entry in rows
+            ], width="stretch", hide_index=True)
+    else:
+        st.info("Only limited information could be extracted from this workbook.")
+
+    legends = parsed.get('legends') or []
+    if legends:
+        st.markdown("**Micrograph legends read from images**")
+        st.dataframe([
+            {
+                "Image": legend.get('image', '—'),
+                "Magnification": legend.get('mag', '—'),
+                "Scale": legend.get('scale', '—'),
+                "Legend ID": legend.get('id', '—'),
+            }
+            for legend in legends
+        ], width="stretch", hide_index=True)
 
 
 def _annotated_report(r, ocr):
