@@ -17,6 +17,7 @@ draws. It never raises into the caller — on any trouble it returns None / [].
 """
 import io
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -497,10 +498,78 @@ def _unique_fill(i, sev):
     return (r, g, b)
 
 
-def render_report_faithful(data, parsed, findings=None, filename=None, dpi=130, timeout=90):
-    """Return (png_bytes, status). status is 'ok' or a short reason on failure
-    (so the caller can fall back to render_report_image). `findings` lets the
-    legend also list warning/critical findings that aren't tied to a cell."""
+def build_issue_index(parsed, findings=None):
+    """Return unique, report-centric issues and unanchored findings.
+
+    A single finding may intentionally point to several cells. It must still be
+    presented and counted once, with every affected cell retained as an anchor.
+    """
+    highlights = sorted(
+        (h for h in collect_highlights(parsed) if h.get('cell')),
+        key=lambda h: (h['cell'][0], h['cell'][1]),
+    )
+    issues = []
+    by_finding = {}
+    for highlight in highlights:
+        key = (highlight.get('category') or 'Review', highlight['note'])
+        issue = by_finding.get(key)
+        if issue is None:
+            issue = {
+                'num': len(issues) + 1,
+                'severity': highlight['severity'],
+                'category': key[0],
+                'note': key[1],
+                'cells': [],
+                'refs': [],
+                'pages': [],
+            }
+            by_finding[key] = issue
+            issues.append(issue)
+        elif _SEV_RANK[highlight['severity']] > _SEV_RANK[issue['severity']]:
+            issue['severity'] = highlight['severity']
+        cell = tuple(highlight['cell'])
+        if cell not in issue['cells']:
+            issue['cells'].append(cell)
+            issue['refs'].append(f'{get_column_letter(cell[1])}{cell[0]}')
+
+    boxed_notes = {issue['note'] for issue in issues}
+
+    def finding_stem(text):
+        """Comparable leading clause for a finding and its longer explanation."""
+        leading = re.split(r'\s+[—–]\s+', text or '', maxsplit=1)[0]
+        return re.sub(r'[\s.]+$', '', leading).casefold()
+
+    boxed_stems = {finding_stem(note) for note in boxed_notes}
+    extras = []
+    by_extra = {}
+    for severity, category, message in findings or []:
+        if (severity not in ('critical', 'warning')
+                or message in boxed_notes
+                or finding_stem(message) in boxed_stems):
+            continue
+        key = (category, message)
+        extra = by_extra.get(key)
+        if extra is None:
+            extra = {
+                'severity': severity,
+                'category': category,
+                'note': message,
+            }
+            by_extra[key] = extra
+            extras.append(extra)
+        elif _SEV_RANK[severity] > _SEV_RANK[extra['severity']]:
+            extra['severity'] = severity
+    return issues, extras
+
+
+def render_report_faithful_view(
+        data, parsed, findings=None, filename=None, dpi=150, timeout=90):
+    """Return a page-oriented annotated report package and a status string.
+
+    The package contains individually annotated page PNGs, unique issue
+    records, report-level findings, and PDF/PNG downloads. This is the primary
+    UI product; it avoids forcing every page and finding into one tall image.
+    """
     if not _PIL:
         return None, 'Pillow unavailable'
     if not _FITZ:
@@ -508,17 +577,25 @@ def render_report_faithful(data, parsed, findings=None, filename=None, dpi=130, 
     if not _find_soffice():
         return None, 'LibreOffice not installed'
     try:
-        return _faithful(data, parsed, findings, filename, dpi, timeout)
+        return _faithful_view(data, parsed, findings, filename, dpi, timeout), 'ok'
     except subprocess.TimeoutExpired:
         return None, 'LibreOffice timed out'
     except Exception as e:
         return None, f'{type(e).__name__}: {e}'
 
 
-def _faithful(data, parsed, findings, filename, dpi, timeout):
+def render_report_faithful(data, parsed, findings=None, filename=None, dpi=130, timeout=90):
+    """Return (png_bytes, status). status is 'ok' or a short reason on failure
+    (so the caller can fall back to render_report_image). `findings` lets the
+    legend also list warning/critical findings that aren't tied to a cell."""
+    view, status = render_report_faithful_view(
+        data, parsed, findings, filename, dpi, timeout)
+    return ((view or {}).get('combined_png'), status)
+
+
+def _faithful_view(data, parsed, findings, filename, dpi, timeout):
     loc = parsed.get('loc') or {}
-    highlights = sorted((h for h in collect_highlights(parsed) if h.get('cell')),
-                        key=lambda h: (h['cell'][0], h['cell'][1]))
+    issues, extras = build_issue_index(parsed, findings)
 
     wb = openpyxl.load_workbook(io.BytesIO(data))      # keep styles + images
     sheet = loc.get('sheet')
@@ -530,25 +607,31 @@ def _faithful(data, parsed, findings, filename, dpi, timeout):
             for cc in range(rng.min_col, rng.max_col + 1):
                 span[(rr, cc)] = rng
 
-    # Group highlights by cell: one fill + one badge per cell, even when a cell
-    # carries several findings (e.g. unetched note + contrast mismatch).
-    groups, by_cell = [], {}
-    for h in highlights:
-        cell = tuple(h['cell'])
-        g = by_cell.get(cell)
-        if g is None:
-            g = {'cell': cell, 'severity': h['severity'], 'notes': [h['note']]}
-            by_cell[cell] = g
-            groups.append(g)
-        else:
-            g['notes'].append(h['note'])
-            if _SEV_RANK[h['severity']] > _SEV_RANK[g['severity']]:
-                g['severity'] = h['severity']
+    # One cell can carry several unique issues, while one issue can point to
+    # several cells. Each cell gets one unique colour locator and a badge with
+    # the relevant issue number(s).
+    cells, by_cell = [], {}
+    for issue in issues:
+        for cell in issue['cells']:
+            group = by_cell.get(cell)
+            if group is None:
+                group = {
+                    'cell': cell,
+                    'severity': issue['severity'],
+                    'issue_nums': [issue['num']],
+                }
+                by_cell[cell] = group
+                cells.append(group)
+            else:
+                if issue['num'] not in group['issue_nums']:
+                    group['issue_nums'].append(issue['num'])
+                if _SEV_RANK[issue['severity']] > _SEV_RANK[group['severity']]:
+                    group['severity'] = issue['severity']
 
-    keys = []
-    for i, g in enumerate(groups):
-        r, c = g['cell']
-        sev = g['severity']
+    anchors = []
+    for i, group in enumerate(cells):
+        r, c = group['cell']
+        sev = group['severity']
         rgb = _unique_fill(i, sev)
         fill = PatternFill('solid', fgColor='%02X%02X%02X' % rgb)
         side = Side(style='medium', color=_BORDER_HEX.get(sev, 'D9821A'))
@@ -561,14 +644,12 @@ def _faithful(data, parsed, findings, filename, dpi, timeout):
             cell = ws.cell(row=rr, column=cc)
             cell.fill = fill
             cell.border = border
-        keys.append({'num': i + 1, 'severity': sev, 'notes': g['notes'],
-                     'rgb': rgb, 'ref': f'{get_column_letter(c)}{r}'})
-
-    # Warning/critical findings not represented by a box (filename, photo
-    # legends, caption numbering, …) — listed so nothing is silently missing.
-    boxed_notes = {h['note'] for h in highlights}
-    extras = [(sev, cat, msg) for (sev, cat, msg) in (findings or [])
-              if sev in ('critical', 'warning') and msg not in boxed_notes]
+        anchors.append({
+            'severity': sev,
+            'issue_nums': sorted(group['issue_nums']),
+            'rgb': rgb,
+            'ref': f'{get_column_letter(c)}{r}',
+        })
 
     # Bound output to the used range and fit to one page wide.
     try:
@@ -586,11 +667,11 @@ def _faithful(data, parsed, findings, filename, dpi, timeout):
         wb.save(xpath)
         pdf = _xlsx_to_pdf(xpath, tmp, timeout)
         if not pdf:
-            return None, 'LibreOffice conversion failed'
+            raise RuntimeError('LibreOffice conversion failed')
         pages = _raster_pdf(pdf, dpi)
     if not pages:
-        return None, 'no pages rendered'
-    return _compose_faithful(pages, keys, extras, filename, dpi), 'ok'
+        raise RuntimeError('no pages rendered')
+    return _compose_faithful_view(pages, anchors, issues, extras, filename, dpi)
 
 
 def _xlsx_to_pdf(xlsx_path, outdir, timeout):
@@ -642,133 +723,126 @@ def _color_bbox(img, rgb, tol=2):
     return mask.getbbox()
 
 
-def _compose_faithful(pages, keys, extras, filename, dpi):
-    margin = 16
-    gap = 12
-    content_w = max(p.width for p in pages)
-    page_w = content_w + 2 * margin
+def _annotate_faithful_pages(pages, anchors, issues, dpi):
+    """Draw issue markers on individual report pages.
 
-    # Locate every flagged cell on whichever page carries its unique fill.
-    located = {}                                       # num -> (page_index, bbox)
-    for k in keys:
-        for pi, pg in enumerate(pages):
-            bb = _color_bbox(pg, k['rgb'])
-            if bb:
-                located[k['num']] = (pi, bb)
+    Cell fills are unique locator colours. Several cells may carry the same
+    issue number, and a cell may carry more than one issue number.
+    """
+    located = {}
+    for index, anchor in enumerate(anchors):
+        for page_index, page in enumerate(pages):
+            bbox = _color_bbox(page, anchor['rgb'])
+            if bbox:
+                located[index] = (page_index, bbox)
                 break
 
-    fsz = max(15, int(content_w / 78))
-    f_title = _font(int(fsz * 1.5), bold=True)
-    f_sub   = _font(int(fsz * 0.95))
-    f_leg   = _font(fsz)
-    f_legb  = _font(fsz, bold=True)
-    f_badge = _font(int(fsz * 0.95), bold=True)
-    title_h = int(fsz * 3.2)
-    line_h = int(fsz * 1.5)
-    entry_gap = int(fsz * 0.6)
-    head_h = int(fsz * 1.8)
-    wrap_chars = max(48, int((page_w - 90) / (fsz * 0.56)))
+    issue_pages = {issue['num']: set() for issue in issues}
+    by_page = {index: [] for index in range(len(pages))}
+    for index, (page_index, bbox) in located.items():
+        anchor = anchors[index]
+        by_page[page_index].append((anchor, bbox))
+        for number in anchor['issue_nums']:
+            issue_pages[number].add(page_index + 1)
 
-    def wrap_notes(notes):
-        lines = []
-        for note in notes:
-            lines += textwrap.wrap(note, wrap_chars) or ['']
-        return lines or ['']
+    radius = max(13, int(dpi * 0.105))
+    font = _font(max(13, int(radius * 1.05)), bold=True)
+    page_entries = []
+    annotated_images = []
+    for page_index, source in enumerate(pages):
+        page = source.copy().convert('RGB')
+        draw = ImageDraw.Draw(page)
+        page_issue_nums = set()
+        for anchor, bbox in by_page[page_index]:
+            numbers = anchor['issue_nums']
+            page_issue_nums.update(numbers)
+            label = ','.join(str(number) for number in numbers)
+            color = _SEV_RGB[anchor['severity']]
 
-    # Boxed findings (numbered) then report-level extras (bulleted).
-    key_entries = []
-    for k in keys:
-        notes = list(k['notes'])
-        notes[0] = f"[{k['ref']}]  {notes[0]}"
-        key_entries.append({'badge': str(k['num']), 'severity': k['severity'],
-                            'lines': wrap_notes(notes)})
-    extra_entries = [{'badge': None, 'severity': sev, 'lines': wrap_notes([f'{cat} — {msg}'])}
-                     for sev, cat, msg in extras]
+            # Reinforce the affected region after rasterisation.
+            draw.rounded_rectangle(
+                [bbox[0], bbox[1], max(bbox[0] + 2, bbox[2] - 1),
+                 max(bbox[1] + 2, bbox[3] - 1)],
+                radius=3,
+                outline=color,
+                width=max(2, int(dpi / 72)),
+            )
 
-    def block_h(entries):
-        return sum(line_h * len(e['lines']) + entry_gap for e in entries)
+            label_w = max(2 * radius, int(_textw(draw, label, font) + radius))
+            x1 = min(page.width - 3, bbox[2] + max(2, radius // 3))
+            x0 = max(3, x1 - label_w)
+            y0 = max(3, bbox[1] - radius)
+            y1 = y0 + 2 * radius
+            draw.rounded_rectangle(
+                [x0, y0, x1, y1],
+                radius=radius,
+                fill=color,
+                outline=_WHITE,
+                width=max(2, int(dpi / 72)),
+            )
+            draw.text(
+                ((x0 + x1) / 2, (y0 + y1) / 2),
+                label,
+                font=font,
+                fill=_WHITE,
+                anchor='mm',
+            )
 
-    leg_h = entry_gap
-    if key_entries:
-        leg_h += head_h + block_h(key_entries)
-    if extra_entries:
-        leg_h += head_h + block_h(extra_entries)
-    if not key_entries and not extra_entries:
-        leg_h += int(fsz * 2)
+        output = io.BytesIO()
+        page.save(output, format='PNG', optimize=True)
+        page_entries.append({
+            'number': page_index + 1,
+            'png': output.getvalue(),
+            'issue_nums': sorted(page_issue_nums),
+        })
+        annotated_images.append(page)
 
-    # Page vertical offsets in the stacked canvas.
-    y = title_h + margin
-    offs = []
-    for pg in pages:
-        offs.append(y)
-        y += pg.height + gap
-    total_h = y - gap + margin + leg_h
+    for issue in issues:
+        issue['pages'] = sorted(issue_pages.get(issue['num'], set()))
+    return page_entries, annotated_images
 
-    canvas = Image.new('RGB', (page_w, total_h), _WHITE)
-    d = ImageDraw.Draw(canvas)
 
-    # Title band.
-    d.rectangle([0, 0, page_w, title_h], fill=_TITLE_BG)
-    d.text((margin, int(fsz * 0.5)),
-           _fit(d, filename or 'Lab report', f_title, page_w - 2 * margin),
-           font=f_title, fill=_WHITE)
-    counts = {}
-    for k in keys:
-        counts[k['severity']] = counts.get(k['severity'], 0) + 1
-    sub = 'Pixel-faithful annotated review — ' + (
-        ', '.join(f'{counts[s]} {s}' for s in ('critical', 'warning', 'info')
-                  if counts.get(s)) or 'no cell-level issues flagged')
-    d.text((margin + 1, int(fsz * 2.0)), sub, font=f_sub, fill=(200, 208, 220))
+def _pages_to_pdf(pages, dpi):
+    if not pages:
+        return None
+    output = io.BytesIO()
+    first, rest = pages[0].convert('RGB'), [page.convert('RGB') for page in pages[1:]]
+    first.save(
+        output,
+        format='PDF',
+        save_all=True,
+        append_images=rest,
+        resolution=dpi,
+    )
+    return output.getvalue()
 
-    # Paste the faithful pages, framed.
-    for pg, oy in zip(pages, offs):
-        canvas.paste(pg, (margin, oy))
-        d.rectangle([margin, oy, margin + pg.width, oy + pg.height],
-                    outline=(210, 214, 220), width=1)
 
-    # Numbered badges on the located cells.
-    br = int(dpi * 0.085)
-    for k in keys:
-        if k['num'] not in located:
-            continue
-        pi, bb = located[k['num']]
-        cx, cy = margin + bb[2], offs[pi] + bb[1]
-        color = _SEV_RGB[k['severity']]
-        d.ellipse([cx - br, cy - br, cx + br, cy + br], fill=color, outline=_WHITE, width=2)
-        d.text((cx, cy), str(k['num']), font=f_badge, fill=_WHITE, anchor='mm')
+def _stack_pages(pages):
+    """Compatibility/download image; the interactive UI uses one page at a time."""
+    if not pages:
+        return None
+    margin, gap = 12, 12
+    width = max(page.width for page in pages) + 2 * margin
+    height = sum(page.height for page in pages) + gap * (len(pages) - 1) + 2 * margin
+    canvas = Image.new('RGB', (width, height), (245, 247, 250))
+    y = margin
+    for page in pages:
+        x = (width - page.width) // 2
+        canvas.paste(page, (x, y))
+        y += page.height + gap
+    output = io.BytesIO()
+    canvas.save(output, format='PNG', optimize=True)
+    return output.getvalue()
 
-    # Legend.
-    rr = int(fsz * 0.7)
-    tx = margin + 2 * rr + 10
 
-    def draw_block(entries, ly):
-        for e in entries:
-            color = _SEV_RGB[e['severity']]
-            if e['badge'] is not None:
-                d.ellipse([margin, ly, margin + 2 * rr, ly + 2 * rr], fill=color)
-                d.text((margin + rr, ly + rr), e['badge'], font=f_badge,
-                       fill=_WHITE, anchor='mm')
-            else:
-                dot = int(fsz * 0.3)
-                d.ellipse([margin + rr - dot, ly + rr - dot,
-                           margin + rr + dot, ly + rr + dot], fill=color)
-            for j, line in enumerate(e['lines']):
-                d.text((tx, ly + j * line_h - 1), line, font=f_leg,
-                       fill=_TEXT if j == 0 else _MUTED)
-            ly += line_h * len(e['lines']) + entry_gap
-        return ly
-
-    ly = (offs[-1] + pages[-1].height + gap + margin) if pages else title_h + margin
-    if key_entries:
-        d.text((margin, ly), 'Findings', font=f_legb, fill=_TEXT)
-        ly = draw_block(key_entries, ly + head_h)
-    if extra_entries:
-        d.text((margin, ly), 'Also flagged (not tied to a cell)', font=f_legb, fill=_TEXT)
-        ly = draw_block(extra_entries, ly + head_h)
-    if not key_entries and not extra_entries:
-        d.text((margin, ly), 'No cell-level issues to highlight on this sheet.',
-               font=f_leg, fill=_MUTED)
-
-    out = io.BytesIO()
-    canvas.save(out, format='PNG')
-    return out.getvalue()
+def _compose_faithful_view(pages, anchors, issues, extras, filename, dpi):
+    page_entries, annotated_images = _annotate_faithful_pages(
+        pages, anchors, issues, dpi)
+    return {
+        'filename': filename or 'Lab report',
+        'pages': page_entries,
+        'issues': issues,
+        'extras': extras,
+        'annotated_pdf': _pages_to_pdf(annotated_images, dpi),
+        'combined_png': _stack_pages(annotated_images),
+    }
