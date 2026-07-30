@@ -26,28 +26,28 @@ Two report families are recognised automatically:
 | **Metallurgical** | Filename ↔ content (job / type / component / customer); workbook formula/error integrity; Actual-vs-Nominal composition (element-by-element, duplicate/misaligned headers, `<LOD` major elements, chemistry-total sanity); hardness (pre/post-solution sanity + built-in alloy reference); sample ↔ serial traceability; explicit report disposition; sign-off; coating cell ↔ comment (presence & type); caption ↔ embedded-image completeness; caption integrity (duplicate/gap numbers, etch status required, comment over-references); comment ↔ material/Result verdict; micrograph job identity, legends, etch contrast and burned-in thickness. |
 | **Coating**       | Filename ↔ content; coating-thickness measurements vs design MIN/MAX limits; sign-off; reference-micrograph presence. |
 
-Findings are graded **🔴 Fail / 🟠 Warning / 🔵 Note / 🟢 Pass** and shown on screen.
+Findings are graded **🔴 Fail / 🟠 Warning / 🔵 Note / 🟢 Pass**.
 
-**Annotated report view.** Alongside the findings list, the reviewer offers a
-**pixel-faithful** render of the report *with the issue areas highlighted and
-numbered to a legend*: the real workbook is converted with **LibreOffice**
+**Report-centric annotated review.** The annotated report is the default and
+automatic result after upload — there is no separate findings table or evidence
+mode to open. The reviewer presents a **pixel-faithful** render of the report
+*with the issue areas highlighted and numbered to explanations in the same image*:
+the real workbook is converted with **LibreOffice**
 (original fonts, column widths, borders and embedded micrographs intact) and each
 flagged cell is filled, badged and explained. It covers composition deviations,
 hardness, blank header/sign-off fields, captions without an etch status, and coating
-thickness outside the design limits — and the embedded micrographs are separately
-annotated (legend / scale-bar regions boxed, low contrast and any burned-in thickness
-flagged). Implemented in [`report_render.py`](report_render.py); cell anchoring comes
-from `lab_review.collect_highlights`.
+thickness outside the design limits. Implemented in
+[`report_render.py`](report_render.py); cell anchoring comes from
+`lab_review.collect_highlights`.
 
-The findings list renders immediately; the render is built on demand, the
-first time you open the **Annotated view** for a report (LibreOffice takes a
-few seconds), so slow work never blocks the fast findings list. It needs
-LibreOffice — `packages.txt` installs `libreoffice-calc`, and the PDF is
-rasterised with the existing **PyMuPDF** dependency; if LibreOffice isn't
-available, the annotated view says so when you open it. The cell highlights
-are placed by filling each flagged cell with a uniquely-detectable colour in the
-workbook, rendering, then finding that colour back in the raster — so a badge lands
-exactly on the cell with no spreadsheet-to-pixel geometry.
+LibreOffice takes a few seconds and is installed by `packages.txt` as
+`libreoffice-calc`; the PDF is rasterised with **PyMuPDF**. If exact rendering is
+unavailable, the reviewer automatically shows a simplified annotated sheet instead
+of an empty evidence area. Cell highlights are placed by filling each flagged cell
+with a uniquely detectable colour in the workbook, rendering it, then locating that
+colour in the raster — so every numbered badge lands on the actual affected cell.
+When several reports are uploaded, a compact report selector replaces the former
+batch table and keeps the review focused on one annotated report at a time.
 
 ### 🖼️ Photo Library *(new)*
 Extracts the embedded micrographs from a reviewed report into a **per-alloy**
