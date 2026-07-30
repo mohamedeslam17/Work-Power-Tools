@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from openpyxl import Workbook
 
@@ -12,7 +13,9 @@ from lab_review import (
     _review_evidence_claims,
     _review_legends,
     _review_traceability,
+    _select_magnification,
     collect_highlights,
+    picture_magnification_verdicts,
     review_filename,
 )
 
@@ -179,27 +182,10 @@ class LabReviewRegressionTests(unittest.TestCase):
             for message in messages(findings, "warning")
         ))
 
-    def test_unsupported_600x_caption_is_release_blocking(self):
+    def test_written_600x_is_not_rejected(self):
         parsed = {
             "pictures": [
                 ("Picture 1:", "Middle Wall Micrograph\nOrtho. Acid Etched 600x"),
-            ],
-            "comment": "",
-        }
-
-        findings = _review_captions(parsed)
-
-        self.assertTrue(any(
-            "Unsupported magnification 600x" in message
-            and "25x, 50x, 100x, 200x, 500x, 1000x" in message
-            for message in messages(findings, "critical")
-        ))
-
-    def test_approved_caption_magnifications_are_accepted(self):
-        parsed = {
-            "pictures": [
-                (f"Picture {index}:", f"Ortho. Acid Etched {mag}x")
-                for index, mag in enumerate((25, 50, 100, 200, 500, 1000), 1)
             ],
             "comment": "",
         }
@@ -210,6 +196,79 @@ class LabReviewRegressionTests(unittest.TestCase):
             category == "Magnification"
             for _severity, category, _message in findings
         ))
+
+    def test_one_ocr_number_cannot_be_promoted_to_a_fact(self):
+        selected, votes = _select_magnification([
+            "7646_E_500x-1",
+            "7646_E_600x-1",
+            "unreadable",
+        ])
+
+        self.assertIsNone(selected)
+        self.assertEqual(votes, {500: 1, 600: 1})
+
+    def test_consensus_accepts_600_without_an_allow_list(self):
+        selected, votes = _select_magnification([
+            "7646_E_600x-1",
+            "7646 E 600x",
+            "7646_E_500x-1",
+        ])
+
+        self.assertEqual(selected, 600)
+        self.assertEqual(votes, {600: 2, 500: 1})
+
+    def test_caption_wins_when_stable_ocr_disagrees(self):
+        image = {
+            "image": "image1.png",
+            "mag": "600x",
+            "ocr_mag": "600x",
+            "mag_source": "ocr",
+            "mag_votes": {"600x": 2, "500x": 1},
+            "mag_read_count": 3,
+            "id": "7646_E_600x-1",
+        }
+        pair = [(
+            "Picture 1:",
+            "Middle Wall Micrograph\nOrtho. Acid Etched 500x",
+            image,
+        )]
+
+        with patch("lab_review._picture_image_pairs", return_value=pair):
+            verdicts = picture_magnification_verdicts(
+                [image],
+                [("Picture 1:", "Ortho. Acid Etched 500x")],
+                b"workbook",
+            )
+
+        self.assertEqual(image["mag"], "500x")
+        self.assertEqual(image["ocr_mag"], "600x")
+        self.assertEqual(image["mag_source"], "caption")
+        self.assertNotIn("id", image)
+        self.assertEqual(verdicts[0]["severity"], "warning")
+        self.assertIn("caption states 500x", verdicts[0]["note"])
+        self.assertIn("OCR consistently read 600x", verdicts[0]["note"])
+
+    def test_matching_written_600x_is_preserved(self):
+        image = {
+            "image": "image1.png",
+            "mag": "600x",
+            "ocr_mag": "600x",
+            "mag_source": "ocr",
+            "mag_votes": {"600x": 3},
+            "mag_read_count": 3,
+        }
+        pair = [("Picture 1:", "Ortho. Acid Etched 600x", image)]
+
+        with patch("lab_review._picture_image_pairs", return_value=pair):
+            verdicts = picture_magnification_verdicts(
+                [image],
+                [("Picture 1:", "Ortho. Acid Etched 600x")],
+                b"workbook",
+            )
+
+        self.assertEqual(verdicts, [])
+        self.assertEqual(image["mag"], "600x")
+        self.assertEqual(image["mag_source"], "caption")
 
     def test_title_identity_accepts_machine_aliases(self):
         cases = [
@@ -273,7 +332,7 @@ class LabReviewRegressionTests(unittest.TestCase):
         ))
         self.assertTrue(any("title machine/set" in message for message in critical))
 
-    def test_new_identity_and_magnification_failures_are_marked_on_report(self):
+    def test_identity_and_magnification_warnings_are_marked_on_report(self):
         title_note = (
             'Report title says Stage 1, but the internal component description '
             'says Stage 2 ("2nd Stage Vane").'
@@ -287,8 +346,19 @@ class LabReviewRegressionTests(unittest.TestCase):
                 "result": "Acceptable",
             },
             "pictures": [
-                ("Picture 1:", "Middle Wall Micrograph\nOrtho. Acid Etched 600x"),
+                ("Picture 1:", "Middle Wall Micrograph\nOrtho. Acid Etched 500x"),
             ],
+            "photo_magnification": [{
+                "index": 0,
+                "label": "Picture 1:",
+                "severity": "warning",
+                "note": (
+                    "Picture 1: written caption states 500x, while legend OCR "
+                    "consistently read 600x in 2 of 3 preprocessing passes. "
+                    "Treat the caption as the recorded value and verify the "
+                    "burned-in legend; OCR may be wrong."
+                ),
+            }],
             "comment": "A sufficiently long metallurgical discussion for this report.",
             "micrograph_count": 1,
             "signoff": {"met_lab": "Lab", "mat_eng": "Engineer", "date": "2026-07-30"},
@@ -319,6 +389,7 @@ class LabReviewRegressionTests(unittest.TestCase):
         self.assertTrue(any(
             item["category"] == "Magnification"
             and item["cell"] == (20, 4)
+            and item["severity"] == "warning"
             and "600x" in item["note"]
             for item in highlights
         ))
