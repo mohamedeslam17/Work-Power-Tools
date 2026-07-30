@@ -1049,12 +1049,6 @@ def _review_captions(parsed):
                          f'Comment refers to Picture {max(refs)} but only {len(pics)} '
                          f'picture(s) are present.'))
 
-    for value, entry in sorted(_invalid_caption_magnifications(pics).items()):
-        findings.append((
-            'critical',
-            'Magnification',
-            _invalid_magnification_message(value, entry['labels']),
-        ))
     return findings
 
 
@@ -1213,49 +1207,53 @@ def review_coating(parsed):
 # speckle-surrounded text is best-effort: values are correct when read, but not
 # every image yields one. Findings are therefore advisory.
 _MAG_PATS = [
-    re.compile(r'(\d{2,4})\s*[xX%]\s*[-_]\s*(\d)'),   # 500x-1  (magnification + index)
-    re.compile(r'E\s*[_ €F]?\s*(\d{2,4})\s*[xX%]'),   # E_500x
-    re.compile(r'(?<![\d.])(\d{2,4})\s*[xX%]'),       # 500x
+    re.compile(r'(\d{1,5})\s*[xX%]\s*[-_]\s*(\d)'),   # 500x-1  (magnification + index)
+    re.compile(r'E\s*[_ €F]?\s*(\d{1,5})\s*[xX%]'),   # E_500x
+    re.compile(r'(?<![\d.])(\d{1,5})\s*[xX%]'),       # 500x
 ]
 # Digit-bounded, not \b-bounded: "7420_E_500x-4" has no \w/\W boundary after
 # the job number (underscore is a word char too), so \b(\d{4})\b never matches
 # the documented convention above.
 _JOB_PAT   = re.compile(r'(?<!\d)(\d{4})(?!\d)')
 _SCALE_PAT = re.compile(r'(\d{1,3})\s*[µuμyptwb]+m', re.I)
-_CAP_MAG   = re.compile(r'(\d{2,4})\s*[xX]\b')
-
-# Magnifications available in the AEG metallography-report workflow. Treat
-# other written values (for example 600x) as report-data errors instead of
-# accepting every plausible microscope number.
-APPROVED_MAGNIFICATIONS = (25, 50, 100, 200, 500, 1000)
+_CAP_MAG   = re.compile(r'(\d{1,5})\s*[xX]\b')
 
 
-def _invalid_caption_magnifications(pictures):
-    """Unsupported written magnifications grouped by value.
-
-    Returns {magnification: {'labels': [...], 'indexes': [...]}} so the finding
-    and the annotated report can share exactly the same wording and anchors.
-    """
-    invalid = {}
-    for index, (label, caption) in enumerate(pictures or []):
-        for match in _CAP_MAG.finditer(caption or ''):
+def _magnification_from_ocr(text):
+    """One plausible magnification from a single OCR preprocessing pass."""
+    for pattern in _MAG_PATS:
+        match = pattern.search(text or '')
+        if match:
             value = int(match.group(1))
-            if value in APPROVED_MAGNIFICATIONS:
-                continue
-            entry = invalid.setdefault(value, {'labels': [], 'indexes': []})
-            shown = (label or f'Picture {index + 1}').rstrip(':')
-            if shown not in entry['labels']:
-                entry['labels'].append(shown)
-            if index not in entry['indexes']:
-                entry['indexes'].append(index)
-    return invalid
+            if 1 <= value <= 50000:
+                return value
+    return None
 
 
-def _invalid_magnification_message(value, labels):
-    where = ', '.join(labels)
-    approved = ', '.join(f'{mag}x' for mag in APPROVED_MAGNIFICATIONS)
-    return (f'Unsupported magnification {value}x in {where}. '
-            f'Approved report magnifications are {approved}.')
+def _select_magnification(ocr_reads):
+    """Select a stable OCR magnification by voting across preprocessing reads.
+
+    A number is accepted only when at least two independent threshold passes
+    agree and there is no tie. One isolated read such as 600x is retained in
+    the vote metadata but never promoted to a reported magnification.
+    """
+    candidates = [
+        value for value in (_magnification_from_ocr(text) for text in ocr_reads)
+        if value is not None
+    ]
+    votes = Counter(candidates)
+    if not votes:
+        return None, {}
+    ranked = votes.most_common()
+    value, count = ranked[0]
+    tied = len(ranked) > 1 and ranked[1][1] == count
+    return (value if count >= 2 and not tied else None), dict(votes)
+
+
+def _caption_magnification(caption):
+    """Single written caption magnification (the report's source of record)."""
+    values = {int(match.group(1)) for match in _CAP_MAG.finditer(caption or '')}
+    return f'{next(iter(values))}x' if len(values) == 1 else None
 
 
 def _safe_ocr(im, cfg='--psm 7'):
@@ -1294,22 +1292,28 @@ def _read_legend_im(im):
     w, h = im.size
     lc = im.crop((0, int(h * 0.90), int(w * 0.55), h))           # ID + magnification
     rc = im.crop((int(w * 0.72), int(h * 0.88), w, h))           # scale bar
-    lblob = ' '.join(_safe_ocr(_binarize(lc, t)) for t in (110, 130, 150))
+    lreads = [_safe_ocr(_binarize(lc, t)) for t in (110, 130, 150)]
+    lblob = ' '.join(lreads)
     rblob = ' '.join(_safe_ocr(_binarize(rc, t)) for t in (110, 140))
 
     out = {}
     job_m = _JOB_PAT.search(lblob)
-    mag_val, idx = None, None
-    for pat in _MAG_PATS:
-        for m in pat.finditer(lblob):
-            n = int(m.group(1))
-            if 25 <= n <= 20000:
-                mag_val, idx = n, (m.group(2) if pat.groups == 2 else None)
-                break
-        if mag_val is not None:
-            break
+    mag_val, votes = _select_magnification(lreads)
+    if votes:
+        out['mag_votes'] = {f'{value}x': count for value, count in sorted(votes.items())}
+        out['mag_read_count'] = len(lreads)
     if mag_val is not None:
-        out['mag'] = f'{mag_val}x'
+        mag = f'{mag_val}x'
+        out['ocr_mag'] = mag
+        out['mag'] = mag
+        out['mag_source'] = 'ocr'
+        out['mag_confidence'] = votes[mag_val] / len(lreads)
+        idx = None
+        for read in lreads:
+            match = _MAG_PATS[0].search(read or '')
+            if match and int(match.group(1)) == mag_val:
+                idx = match.group(2)
+                break
         out['id'] = (f'{job_m.group(1)}_' if job_m else '') + f'E_{mag_val}x' + \
                     (f'-{idx}' if idx else '')
     if job_m:
@@ -1372,7 +1376,8 @@ def analyze_images(data, want_bytes=False, max_images=40):
 def read_image_legends(data, max_images=40):
     """Back-compat: the legend subset of analyze_images()."""
     images, ocr_used = analyze_images(data, max_images=max_images)
-    legends = [im for im in images if im.get('mag') or im.get('scale')]
+    legends = [im for im in images
+               if im.get('ocr_mag') or im.get('scale') or im.get('job') or im.get('id')]
     return legends, ocr_used
 
 
@@ -1418,6 +1423,58 @@ def picture_etch_verdicts(images, pictures, data):
         if note:
             out.append({'index': idx_of.get(label), 'label': label,
                         'severity': 'warning', 'note': note})
+    return out
+
+
+def picture_magnification_verdicts(images, pictures, data):
+    """Reconcile each written caption with its paired micrograph's stable OCR.
+
+    The written caption is the report's source of record. OCR is accepted only
+    after multi-pass consensus and is retained as secondary evidence. A
+    disagreement is therefore a warning to inspect the burned-in legend, never
+    a rejection of either number.
+    """
+    if not data:
+        return None
+    pairs = _picture_image_pairs(data, pictures, images)
+    if not pairs:
+        return None
+    idx_of = {}
+    for i, (label, _) in enumerate(pictures or []):
+        idx_of.setdefault(label, i)
+    out = []
+    for label, cap, im in pairs:
+        caption_mag = _caption_magnification(cap)
+        ocr_mag = im.get('ocr_mag') or (
+            im.get('mag') if im.get('mag_source') == 'ocr' else None)
+        if caption_mag:
+            im['caption_mag'] = caption_mag
+            im['mag'] = caption_mag
+            im['mag_source'] = 'caption'
+        if not (caption_mag and ocr_mag and caption_mag != ocr_mag):
+            continue
+        # An ID built from the disputed OCR magnitude is not safe to use for
+        # duplicate-ID checks or downstream metadata.
+        im.pop('id', None)
+        votes = im.get('mag_votes') or {}
+        count = votes.get(ocr_mag)
+        total = im.get('mag_read_count')
+        consensus = (
+            f' in {count} of {total} preprocessing passes'
+            if count is not None and total else ''
+        )
+        pic = (label or 'Picture').rstrip(':')
+        note = (
+            f'{pic}: written caption states {caption_mag}, while legend OCR '
+            f'consistently read {ocr_mag}{consensus}. Treat the caption as the '
+            f'recorded value and verify the burned-in legend; OCR may be wrong.'
+        )
+        out.append({
+            'index': idx_of.get(label),
+            'label': label,
+            'severity': 'warning',
+            'note': note,
+        })
     return out
 
 
@@ -1473,11 +1530,8 @@ def _review_thickness(parsed, images):
 
 def _caption_mags(pictures):
     """Magnifications mentioned in the written picture captions, e.g. {'200x'}."""
-    mags = set()
-    for _, cap in pictures or []:
-        for m in _CAP_MAG.finditer(cap or ''):
-            mags.add(f'{m.group(1)}x')
-    return mags
+    return {mag for _, cap in pictures or []
+            for mag in [_caption_magnification(cap)] if mag}
 
 
 def _digit_dist(a, b):
@@ -1498,25 +1552,15 @@ def _review_legends(legends, ocr_used, caption_mags, report_job=None):
                          'Could not read a legend from any embedded micrograph.'))
         return findings
 
-    img_mags = sorted({l['mag'] for l in legends if l.get('mag')},
+    img_mags = sorted({
+        l.get('ocr_mag') or l.get('mag')
+        for l in legends if l.get('ocr_mag') or l.get('mag')
+    },
                       key=lambda s: int(s[:-1]))
     findings.append(('info', 'Photo legends',
                      f'Read legends from {len(legends)} micrograph(s); '
-                     f'magnifications: {", ".join(img_mags) if img_mags else "n/a"}.'))
-
-    unsupported_ocr = [
-        mag for mag in img_mags
-        if int(mag[:-1]) not in APPROVED_MAGNIFICATIONS and mag not in caption_mags
-    ]
-    if unsupported_ocr:
-        approved = ', '.join(f'{mag}x' for mag in APPROVED_MAGNIFICATIONS)
-        findings.append((
-            'warning',
-            'Photo legends',
-            f'OCR read unsupported magnification(s) {", ".join(unsupported_ocr)} '
-            f'from image legends; approved values are {approved}. Verify the '
-            f'burned-in labels because OCR can misread small text.',
-        ))
+                     f'stable OCR magnifications: '
+                     f'{", ".join(img_mags) if img_mags else "n/a"}.'))
 
     # Two visibly different micrographs sharing one burned-in ID means at
     # least one was captured/labelled wrong — the AEG "-n" suffix exists to
@@ -1527,17 +1571,6 @@ def _review_legends(legends, ocr_used, caption_mags, report_job=None):
         findings.append(('warning', 'Photo legends',
                          f'Multiple micrographs share the identical burned-in ID '
                          f'{", ".join(dupes)} — verify they aren\'t the same image mislabeled.'))
-
-    # Cross-check magnifications burned into the images against the captions.
-    if img_mags and caption_mags:
-        missing = [m for m in img_mags if m not in caption_mags]
-        if missing:
-            findings.append(('warning', 'Photo legends',
-                             f'Magnification(s) {", ".join(missing)} appear in image legends '
-                             f'but in no written caption — check the captions.'))
-        else:
-            findings.append(('pass', 'Photo legends',
-                             'Image-legend magnifications all match the written captions.'))
 
     # Cross-check the job number burned into every legend against the report.
     # A previous implementation passed the whole set as soon as ONE image
@@ -1821,7 +1854,14 @@ def review_report(filename, data, ocr=True):
     images = []
     if ocr:
         images, ocr_used = analyze_images(data)
-        legends = [im for im in images if im.get('mag') or im.get('scale')]
+        mag_verdicts = picture_magnification_verdicts(
+            images, parsed.get('pictures', []), data)
+        for verdict in mag_verdicts or []:
+            findings.append((verdict['severity'], 'Magnification', verdict['note']))
+        parsed['photo_magnification'] = mag_verdicts or []
+        legends = [im for im in images
+                   if im.get('ocr_mag') or im.get('scale')
+                   or im.get('job') or im.get('id')]
         cap_mags = _caption_mags(parsed.get('pictures', []))
         report_job = parsed.get('header', {}).get('job')
         findings += _review_legends(legends, ocr_used, cap_mags, report_job)
@@ -1830,7 +1870,9 @@ def review_report(filename, data, ocr=True):
         findings += _review_thickness(parsed, images)
         parsed['photo_etch'] = etch_verdicts or []
     parsed['images'] = images
-    parsed['legends'] = [im for im in images if im.get('mag') or im.get('scale')]
+    parsed['legends'] = [im for im in images
+                         if im.get('ocr_mag') or im.get('scale')
+                         or im.get('job') or im.get('id')]
     return rtype, parsed, findings
 
 
@@ -2000,11 +2042,12 @@ def collect_highlights(parsed):
                 f'{(label or "?").rstrip(":")} caption states unetched / as-polished — '
                 f'confirm intended (a microstructure assessment is normally etched).')
 
-    for value, invalid in sorted(_invalid_caption_magnifications(pics).items()):
-        note = _invalid_magnification_message(value, invalid['labels'])
-        for index in invalid['indexes']:
-            entry = ploc[index] if 0 <= index < len(ploc) else {}
-            add(anchor(entry), 'critical', 'Magnification', f'{value}x invalid', note)
+    # ── Magnification — stable legend OCR disagrees with paired caption ──
+    for verdict in parsed.get('photo_magnification') or []:
+        idx = verdict.get('index')
+        entry = ploc[idx] if (idx is not None and 0 <= idx < len(ploc)) else {}
+        add(anchor(entry), verdict.get('severity', 'warning'), 'Magnification',
+            'legend OCR?', verdict['note'])
 
     # ── Photo etch — per-picture caption↔contrast mismatch (anchor to caption) ──
     for v in parsed.get('photo_etch') or []:
