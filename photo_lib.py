@@ -96,8 +96,16 @@ def _records(filename, data, parsed, rtype):
         return []
     alloy, job, meta = _report_meta(filename, parsed, rtype)
     raw = _raw_image_bytes(data)
-    from lab_review import (report_etchants, image_etchant, report_ht, image_ht,
-                            image_captions, caption_etchant, caption_ht)
+    from lab_review import (
+        _caption_magnification,
+        report_etchants,
+        image_etchant,
+        report_ht,
+        image_ht,
+        image_captions,
+        caption_etchant,
+        caption_ht,
+    )
     pics = parsed.get('pictures')
     et_by_mag, et_primary = report_etchants(pics)
     ht_by_mag, ht_primary = report_ht(pics)
@@ -107,8 +115,11 @@ def _records(filename, data, parsed, rtype):
         name = im.get('image')
         if not name or name not in raw:
             continue
-        mag = im.get('mag')
         cap = caps.get(name)
+        # The written, paired caption is authoritative. Stable OCR is only a
+        # fallback when no trustworthy caption↔image mapping is available.
+        mag = _caption_magnification(cap) if cap is not None else None
+        mag = mag or im.get('caption_mag') or im.get('ocr_mag') or im.get('mag')
         if cap is not None:                  # exact caption for this image
             etchant = caption_etchant(cap) or et_primary or 'Unspecified'
             ht = caption_ht(cap) or ht_primary or 'Unspecified'
