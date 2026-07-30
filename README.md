@@ -1,7 +1,11 @@
 # Work-Power-Tools
 
 Materials-engineering tools for Ansaldo Energia (AEG), packaged as a single
-Streamlit app with four tabs.
+Streamlit app with four tools. `app.py` is a thin router; the presentation
+layer lives in `ui/` (`ui/theme.py`, `ui/components.py` for the shared
+severity model / findings list / batch table, and one module per tool). The
+domain logic each tool calls into — `lab_review.py`, `iir_review.py`,
+`sem_convert.py`, `report_render.py`, `photo_lib.py` — is unchanged.
 
 ## Tools
 
@@ -35,10 +39,12 @@ annotated (legend / scale-bar regions boxed, low contrast and any burned-in thic
 flagged). Implemented in [`report_render.py`](report_render.py); cell anchoring comes
 from `lab_review.collect_highlights`.
 
-The render happens automatically for every reviewed report (LibreOffice takes a
-few seconds per report). It needs LibreOffice — `packages.txt` installs
-`libreoffice-calc`, and the PDF is rasterised with the existing **PyMuPDF** dependency;
-if LibreOffice isn't available, the annotated view is unavailable. The cell highlights
+The findings list renders immediately; the render is built on demand, the
+first time you open the **Annotated view** for a report (LibreOffice takes a
+few seconds), so slow work never blocks the fast findings list. It needs
+LibreOffice — `packages.txt` installs `libreoffice-calc`, and the PDF is
+rasterised with the existing **PyMuPDF** dependency; if LibreOffice isn't
+available, the annotated view says so when you open it. The cell highlights
 are placed by filling each flagged cell with a uniquely-detectable colour in the
 workbook, rendering, then finding that colour back in the raster — so a badge lands
 exactly on the cell with no spreadsheet-to-pixel geometry.
@@ -48,7 +54,8 @@ Extracts the embedded micrographs from a reviewed report into a **per-alloy**
 folder structure with a JSON index, and serves an in-app gallery: pick an alloy
 → see its micrographs with the data of the report they came from (job, magnification,
 etch state, source, any thickness measurements). Implemented in
-[`photo_lib.py`](photo_lib.py). Add to it via the button in the review tab, or the CLI:
+[`photo_lib.py`](photo_lib.py). Add to it via **Actions → Add to photo library**
+in Lab Report Review, or the CLI:
 
 ```bash
 python3 photo_lib.py "path/to/report.xlsx" [more.xlsx ...]
@@ -89,7 +96,8 @@ that **post-solution** readings are expected to run *below* it (the solution-
 treated state precedes re-aging), so those are informational, not failures.
 Values are advisory — verify against the controlling spec.
 
-**Micrograph analysis (OCR).** With the *Analyse micrographs* option on, the
+**Micrograph analysis (OCR).** Off by default so the findings list renders
+instantly; switch on *Also read micrograph legends & etch contrast* and the
 reviewer reads each embedded micrograph's burned-in legend (`<job>_E_<mag>x-<n>`
 + scale bar) and cross-checks the magnification and job number against the
 captions; gauges etched-vs-low-contrast via edge density (advisory — faint
@@ -129,8 +137,10 @@ cross-checks), **Completeness** (a photo per caption, page numbering) and **Spar
 the damage-driven *Expected Replacement Components* matrix tallied per component and
 reconciled to the serial protocol (position coverage + scrap), plus the consumables
 *Spare Parts List*. Each check's
-severity is tunable (🔴 Fail / 🟠 Warn / 🔵 Info / ⚪ Off) live in the UI; defaults live in
-`iir_review.CHECK_CATALOG`. Review several at once for a combined **Batch Summary** workbook.
+severity is tunable (🔴 Fail / 🟠 Warn / 🔵 Info / ⚪ Off) live in the UI, via a
+**Check severities** popover with Strict / Default / Lenient presets or
+per-check tuning; defaults live in `iir_review.CHECK_CATALOG`. Review several
+at once for a combined **Batch Summary** workbook.
 
 ```bash
 python3 iir_review.py "report.xlsx"     # one report  → findings checklist
