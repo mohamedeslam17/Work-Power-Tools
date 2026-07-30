@@ -23,7 +23,7 @@ Two report families are recognised automatically:
 
 | Family            | Checks performed |
 |-------------------|------------------|
-| **Metallurgical** | Report title ↔ content identity (job / type / stage / component / machine-set / customer); workbook formula/error integrity; Actual-vs-Nominal composition (element-by-element, duplicate/misaligned headers, `<LOD` major elements, chemistry-total sanity); hardness (pre/post-solution sanity + built-in alloy reference); duplicate sample/serial identifiers; explicit report disposition; sign-off; coating cell ↔ comment (presence & type); caption ↔ embedded-image completeness; caption integrity (duplicate/gap numbers, etch status required, approved magnifications only, comment over-references); comment ↔ material/Result verdict; micrograph job identity, legends, etch contrast and burned-in thickness. |
+| **Metallurgical** | Report title ↔ content identity (job / type / stage / component / machine-set / customer); workbook formula/error integrity; Actual-vs-Nominal composition (element-by-element, duplicate/misaligned headers, `<LOD` major elements, chemistry-total sanity); hardness (pre/post-solution sanity + built-in alloy reference); duplicate sample/serial identifiers; explicit report disposition; sign-off; coating cell ↔ comment (presence & type); caption ↔ embedded-image completeness; caption integrity (duplicate/gap numbers, etch status required, caption ↔ image-legend magnification, comment over-references); comment ↔ material/Result verdict; micrograph job identity, legends, etch contrast and burned-in thickness. |
 | **Coating**       | Filename ↔ content; coating-thickness measurements vs design MIN/MAX limits; sign-off; reference-micrograph presence. |
 
 Findings are graded **🔴 Fail / 🟠 Warning / 🔵 Note / 🟢 Pass**.
@@ -107,10 +107,14 @@ post-HT etching reads as low-contrast); and reads burned-in thickness labels
 needs the **Tesseract** engine (`packages.txt` installs `tesseract-ocr`; the app
 degrades gracefully without it).
 
-Written caption magnifications are checked even without OCR. The approved report
-set is **25x, 50x, 100x, 200x, 500x and 1000x**; values such as **600x** are
-release-blocking. OCR-only unsupported readings are warnings because small
-burned-in text can be misread.
+Magnification has no hard-coded allow-list: **600x and any other positive written
+value are valid report data**. The written caption is the source of record. Each
+image legend is OCR-read through three different preprocessing passes, and a
+number is accepted as stable OCR only when at least two passes agree without a
+tie. An isolated or ambiguous number is suppressed. If stable OCR disagrees with
+the paired caption, the reviewer marks that caption with a warning to inspect the
+burned-in legend; it does not reject either value. Downstream photo-library
+metadata also prefers the paired written caption over OCR.
 
 **Etch handling.** A caption that explicitly states *unetched / as-polished* is
 surfaced on its own (legitimate for thickness / crack work, but worth confirming
