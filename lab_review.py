@@ -28,6 +28,7 @@ import os
 import re
 import sys
 import zipfile
+from collections import Counter
 
 import openpyxl
 
@@ -147,6 +148,15 @@ def _alloy_key(material):
 
 # Placeholder strings that mean "field not actually filled in".
 _PLACEHOLDERS = {'', 'n/a', 'na', 'not provided', 'to follow', 'tbd', '-', '/'}
+_EXCEL_ERRORS = {
+    '#NULL!', '#DIV/0!', '#VALUE!', '#REF!', '#NAME?', '#NUM!', '#N/A',
+    '#GETTING_DATA',
+}
+_NOT_QUANTIFIED = re.compile(
+    r'^(?:<\s*(?:lod|loq|mdl)|(?:below|under)\s+(?:detection|quantification)'
+    r'|not\s+detected|n\.?d\.?)$',
+    re.I,
+)
 
 
 # ── Low-level cell helpers ────────────────────────────────────────────────
@@ -196,7 +206,45 @@ def _value_below(ws, row, col, max_scan=6):
 
 
 def _is_placeholder(v):
-    return _txt(v).lower() in _PLACEHOLDERS
+    text = _txt(v)
+    return text.lower() in _PLACEHOLDERS or text.upper() in _EXCEL_ERRORS
+
+
+def _excel_errors(wb):
+    """Visible Excel error values, including cached formula failures."""
+    out = []
+    for ws in wb.worksheets:
+        for row in ws.iter_rows():
+            for cell in row:
+                value = _txt(cell.value).upper()
+                if value in _EXCEL_ERRORS:
+                    out.append({
+                        'sheet': ws.title,
+                        'cell': cell.coordinate,
+                        'row': cell.row,
+                        'col': cell.column,
+                        'value': value,
+                    })
+    return out
+
+
+def _formula_issues(wb):
+    """Formula constructs that make a released workbook non-self-contained."""
+    out = []
+    for ws in wb.worksheets:
+        for row in ws.iter_rows():
+            for cell in row:
+                formula = _txt(cell.value)
+                if cell.data_type == 'f' and re.search(r'\[[^\]]+\][^!]*!', formula):
+                    out.append({
+                        'sheet': ws.title,
+                        'cell': cell.coordinate,
+                        'row': cell.row,
+                        'col': cell.column,
+                        'formula': formula,
+                        'kind': 'external-reference',
+                    })
+    return out
 
 
 def _num(v):
@@ -285,7 +333,8 @@ def _sample(ws):
                 return val, {'label': (hrow, c), 'value': vloc}
         return None, None
 
-    for key, substr in (('description', 'description'), ('serial', 's/n'),
+    for key, substr in (('sample_no', 'sample nr'), ('description', 'description'),
+                        ('serial', 's/n'),
                         ('location', 'location'), ('material', 'material'),
                         ('result', 'result')):
         out[key], lc = below(substr)
@@ -327,7 +376,7 @@ def _coating(ws):
 
 
 def _composition(ws, which):
-    """Extract {element: value} for which='Nominal' or 'Actual'.
+    """Extract numeric composition plus the table's raw/header metadata.
 
     Handles the two layouts seen in practice: element headers in the
     '(Nominal/Actual)' label row with values below, OR element headers in the
@@ -337,8 +386,9 @@ def _composition(ws, which):
     pat = r'\(\s*(?:Nominal|Minimal)\s*\)' if which == 'Nominal' else r'\(\s*Actual\s*\)'
     lbl = _find(ws, pat)
     comp, loc = {}, {}
+    meta = {'entries': [], 'duplicate_headers': []}
     if not lbl:
-        return comp, loc
+        return comp, loc, meta
     lrow = lbl[0]
 
     def elem_cells(r):
@@ -349,18 +399,35 @@ def _composition(ws, which):
     elif lrow > 1 and len(elem_cells(lrow - 1)) >= 2:   # elements above, values in label row
         ehdr, vrow = lrow - 1, lrow
     else:
-        return comp, loc
-    for cell in elem_cells(ehdr):
-        val = _num(ws.cell(row=vrow, column=cell.column).value)
+        return comp, loc, meta
+
+    header_cells = elem_cells(ehdr)
+    counts = Counter(_txt(cell.value).capitalize() for cell in header_cells)
+    meta['duplicate_headers'] = sorted(el for el, count in counts.items() if count > 1)
+    for cell in header_cells:
+        raw = ws.cell(row=vrow, column=cell.column).value
+        val = _num(raw)
+        el = _txt(cell.value).capitalize()
+        entry = {
+            'element': el,
+            'raw': _txt(raw),
+            'value': val,
+            'header_cell': cell.coordinate,
+            'value_cell': ws.cell(row=vrow, column=cell.column).coordinate,
+            'row': vrow,
+            'col': cell.column,
+        }
+        meta['entries'].append(entry)
         if val is not None:
-            el = _txt(cell.value).capitalize()
             comp[el] = val
             loc[el] = (vrow, cell.column)
-    return comp, loc
+        elif el not in loc:
+            loc[el] = (vrow, cell.column)
+    return comp, loc, meta
 
 
 def _comment(ws):
-    lbl = _find(ws, r'^Comment\s*:')
+    lbl = _find(ws, r'^Comments?\s*:')
     if not lbl:
         return None, {}
     val, vloc = _value_below_loc(ws, *lbl)
@@ -391,13 +458,13 @@ def _signoff(ws):
     return out, loc
 
 
-def parse_metallurgical(wb, media=0):
+def parse_metallurgical(wb, media=0, micrograph_count=None):
     ws = _met_sheet(wb)
     header, lh    = _header(ws)
     sample, ls    = _sample(ws)
     hardness, lhd = _hardness(ws)
-    nominal, ln   = _composition(ws, 'Nominal')
-    actual, la    = _composition(ws, 'Actual')
+    nominal, ln, nominal_meta = _composition(ws, 'Nominal')
+    actual, la, actual_meta    = _composition(ws, 'Actual')
     coating, lc   = _coating(ws)
     comment, lcm  = _comment(ws)
     pictures, lp  = _pictures(ws)
@@ -408,11 +475,16 @@ def parse_metallurgical(wb, media=0):
         'hardness':  hardness,
         'nominal':   nominal,
         'actual':    actual,
+        'composition_meta': {
+            'nominal': nominal_meta,
+            'actual': actual_meta,
+        },
         'coating':   coating,
         'comment':   comment,
         'pictures':  pictures,
         'signoff':   signoff,
         'media':     media,
+        'micrograph_count': micrograph_count,
         'loc': {
             'sheet':    ws.title,
             'header':   lh,
@@ -463,16 +535,51 @@ def _composition_deviations(nominal, actual):
     return deviations, systemic
 
 
-def _review_composition(nominal, actual):
+def _review_composition(nominal, actual, composition_meta=None):
     findings = []
     if not nominal or not actual:
         findings.append(('warning', 'Composition',
                          'Could not read both Nominal and Actual composition tables.'))
-        return findings
+        # Keep reviewing the table structure: a partially parsed table can still
+        # reveal a duplicate header or an explicit <LOD result.
 
     common = sorted(set(nominal) & set(actual))
     deviations, systemic = _composition_deviations(nominal, actual)
     n_dev, n_common = len(deviations), len(common)
+    composition_meta = composition_meta or {}
+    actual_meta = composition_meta.get('actual') or {}
+    entries = actual_meta.get('entries') or []
+    actual_headers = {e.get('element') for e in entries if e.get('element')}
+
+    duplicates = actual_meta.get('duplicate_headers') or []
+    if duplicates:
+        findings.append(('critical', 'Composition',
+                         f'Actual composition table repeats element header(s): '
+                         f'{", ".join(duplicates)} — at least one column is mislabeled, so the '
+                         f'chemistry cannot be accepted as reported.'))
+
+    for entry in entries:
+        raw = entry.get('raw') or ''
+        el = entry.get('element')
+        if not el or entry.get('value') is not None or not _NOT_QUANTIFIED.match(raw):
+            continue
+        nom = nominal.get(el)
+        if nom is not None and nom >= 0.5:
+            findings.append(('critical', 'Composition',
+                             f'{el}: actual result is "{raw}" while nominal is {nom:g} wt% — '
+                             f'a major alloying element was not quantified.'))
+        else:
+            findings.append(('warning', 'Composition',
+                             f'{el}: actual result is "{raw}" — verify the analytical method '
+                             f'and detection limit.'))
+
+    numeric_entries = [e['value'] for e in entries if e.get('value') is not None]
+    if len(numeric_entries) >= 5:
+        total = sum(numeric_entries)
+        if total < 95.0 or total > 105.0:
+            findings.append(('critical', 'Composition',
+                             f'Actual composition totals {total:.2f} wt%, outside the '
+                             f'95–105 wt% sanity band — check missing/misaligned columns.'))
 
     # A few elements off is normal service depletion / EDS scatter → warnings,
     # unless a single element is itself far enough outside tolerance to be
@@ -491,15 +598,29 @@ def _review_composition(nominal, actual):
             findings.append((sev, 'Composition',
                              f'{el}: actual {act:g} vs nominal {nom:g} wt% ({rel:+.0f}%){extra}.'))
 
-    only_nom = sorted(set(nominal) - set(actual))
-    only_act = sorted(set(actual) - set(nominal))
+    only_nom = sorted(set(nominal) - (actual_headers or set(actual)))
+    only_act = sorted((actual_headers or set(actual)) - set(nominal))
     if only_nom:
         findings.append(('info', 'Composition',
                          f'In spec but not reported in actual: {", ".join(only_nom)}.'))
     if only_act:
-        findings.append(('info', 'Composition',
-                         f'Reported but not in nominal spec: {", ".join(only_act)}.'))
-    if not deviations:
+        major = []
+        minor = []
+        for el in only_act:
+            values = [e.get('value') for e in entries
+                      if e.get('element') == el and e.get('value') is not None]
+            if values and max(abs(v) for v in values) >= 1.0:
+                major.append(f'{el} {max(values, key=abs):g} wt%')
+            else:
+                minor.append(el)
+        if major:
+            findings.append(('critical', 'Composition',
+                             f'Major element(s) reported but absent from the nominal table: '
+                             f'{", ".join(major)} — verify the headers and stated alloy.'))
+        if minor:
+            findings.append(('info', 'Composition',
+                             f'Reported but not in nominal spec: {", ".join(minor)}.'))
+    if nominal and actual and not deviations:
         findings.append(('pass', 'Composition',
                          f'All {len(common)} matched elements within ±{COMP_WARN_REL:g}% tolerance.'))
     return findings
@@ -599,6 +720,10 @@ def _review_comment(parsed):
         findings.append(('info', 'Comment',
                          f'Result defers to the comment; the comment verdict reads '
                          f'{"not suitable / negative" if neg else "suitable / positive"}.'))
+    elif 'see comment' in rlow and not neg and not pos:
+        findings.append(('critical', 'Disposition',
+                         'Result says "See comment", but the comment gives no clear '
+                         'accept / reject / repair disposition.'))
     return findings
 
 
@@ -664,6 +789,30 @@ def _review_hardness(hardness, material):
     return findings
 
 
+def _review_evidence_claims(parsed):
+    """Flag conclusions that claim more than the recorded evidence establishes."""
+    comment = parsed.get('comment') or ''
+    claims_mechanical_restoration = re.search(
+        r'(?:restor\w*.{0,80}mechanical\s+propert|'
+        r'mechanical\s+propert.{0,80}restor\w*)',
+        comment,
+        re.I | re.DOTALL,
+    )
+    if not claims_mechanical_restoration:
+        return []
+
+    # These templates only expose pre- and post-solution hardness. Neither is a
+    # final aged-condition mechanical verification, and micrographs alone cannot
+    # demonstrate restored mechanical properties.
+    hardness = parsed.get('hardness') or {}
+    if not any(key in hardness for key in ('post_age', 'final', 'aged')):
+        return [('warning', 'Evidence',
+                 'Comment claims that mechanical properties were restored, but the '
+                 'report contains no final aged-condition mechanical result; '
+                 'microstructure alone does not verify mechanical properties.')]
+    return []
+
+
 def _review_completeness(parsed):
     findings = []
     hdr = parsed['header']
@@ -690,8 +839,19 @@ def _review_completeness(parsed):
     elif uncaptioned:
         findings.append(('info', 'Micrographs',
                          f'{len(uncaptioned)} of {len(pics)} pictures have no caption.'))
-    if parsed.get('media', 0) == 0:
+    micrographs = parsed.get('micrograph_count')
+    if micrographs == 0:
         findings.append(('warning', 'Micrographs', 'No embedded images found in the workbook.'))
+    elif micrographs is not None and pics:
+        if micrographs < len(pics):
+            findings.append(('critical', 'Micrographs',
+                             f'{len(pics)} picture caption(s) but only {micrographs} embedded '
+                             f'micrograph(s) — {len(pics) - micrographs} evidence image(s) '
+                             f'are missing.'))
+        elif micrographs > len(pics):
+            findings.append(('warning', 'Micrographs',
+                             f'{micrographs} embedded micrograph(s) but only {len(pics)} '
+                             f'picture caption(s) — check for uncatalogued or stray images.'))
 
     so = parsed['signoff']
     missing = [lbl for key, lbl in (('met_lab', 'Met. Lab'), ('mat_eng', 'Mat. Eng'),
@@ -700,6 +860,63 @@ def _review_completeness(parsed):
         findings.append(('warning', 'Sign-off', f'Missing sign-off field(s): {", ".join(missing)}.'))
     else:
         findings.append(('pass', 'Sign-off', 'Lab, engineer and date all present.'))
+    return findings
+
+
+def _identifier_tokens(text, kind):
+    """Normalised identifiers from stacked/space-separated sample or S/N cells."""
+    raw = _txt(text).upper()
+    if not raw:
+        return []
+    if kind == 'sample':
+        hits = re.findall(r'\bMS\s*[-_]?\s*[A-Z0-9]+\b', raw)
+        return [re.sub(r'[\s_-]+', '', hit) for hit in hits]
+    tokens = []
+    for block in re.split(r'[\n;,]+', raw):
+        for part in re.split(r'\s{2,}', block.strip()):
+            token = re.sub(r'\s+', '', part)
+            if len(token) >= 4 and re.fullmatch(r'[A-Z0-9-]+', token) and re.search(r'\d', token):
+                tokens.append(token)
+    return tokens
+
+
+def _review_traceability(parsed):
+    findings = []
+    sample = parsed.get('sample') or {}
+    sample_ids = _identifier_tokens(sample.get('sample_no'), 'sample')
+    serial_ids = _identifier_tokens(sample.get('serial'), 'serial')
+
+    if sample_ids and serial_ids and len(sample_ids) != len(serial_ids):
+        findings.append(('warning', 'Traceability',
+                         f'{len(sample_ids)} sample number(s) but {len(serial_ids)} serial/part '
+                         f'number(s) — the sample-to-part mapping is incomplete.'))
+    for label, values in (('sample number', sample_ids), ('serial/part number', serial_ids)):
+        duplicates = sorted(value for value, count in Counter(values).items() if count > 1)
+        if duplicates:
+            findings.append(('warning', 'Traceability',
+                             f'Duplicate {label}(s): {", ".join(duplicates)}.'))
+
+    result = sample.get('result')
+    if _is_placeholder(result):
+        findings.append(('warning', 'Disposition', 'Result field is blank or invalid.'))
+    return findings
+
+
+def _review_workbook_integrity(parsed):
+    errors = parsed.get('excel_errors') or []
+    formulas = parsed.get('formula_issues') or []
+    findings = []
+    if errors:
+        shown = ', '.join(f'{e["sheet"]}!{e["cell"]}={e["value"]}' for e in errors[:6])
+        extra = f' (+{len(errors) - 6} more)' if len(errors) > 6 else ''
+        findings.append(('critical', 'Workbook integrity',
+                         f'Excel error value(s) present: {shown}{extra}.'))
+    if formulas:
+        shown = ', '.join(f'{e["sheet"]}!{e["cell"]} {e["formula"]}' for e in formulas[:4])
+        extra = f' (+{len(formulas) - 4} more)' if len(formulas) > 4 else ''
+        findings.append(('critical', 'Workbook integrity',
+                         f'External-workbook formula reference(s) make the report '
+                         f'non-self-contained: {shown}{extra}.'))
     return findings
 
 
@@ -840,10 +1057,14 @@ def _review_captions(parsed):
 
 def review_metallurgical(parsed):
     findings = []
+    findings += _review_workbook_integrity(parsed)
     findings += _review_completeness(parsed)
+    findings += _review_traceability(parsed)
     findings += _review_hardness(parsed['hardness'], parsed['sample'].get('material'))
-    findings += _review_composition(parsed['nominal'], parsed['actual'])
+    findings += _review_composition(
+        parsed['nominal'], parsed['actual'], parsed.get('composition_meta'))
     findings += _review_comment(parsed)
+    findings += _review_evidence_claims(parsed)
     findings += _review_captions(parsed)
     return findings
 
@@ -939,7 +1160,7 @@ def parse_coating(wb, media=0):
 
 
 def review_coating(parsed):
-    findings = []
+    findings = _review_workbook_integrity(parsed)
     rows = parsed.get('rows', [])
     if not rows:
         findings.append(('warning', 'Coating', 'Could not read the coating-coverage assessment table.'))
@@ -975,7 +1196,8 @@ def review_coating(parsed):
     else:
         findings.append(('pass', 'Sign-off', 'Prepared-by, approved-by and date all present.'))
 
-    if parsed.get('media', 0) == 0:
+    micrographs = parsed.get('micrograph_count')
+    if micrographs == 0:
         findings.append(('warning', 'Micrographs', 'No embedded reference micrographs found.'))
     return findings
 
@@ -1267,19 +1489,27 @@ def _review_legends(legends, ocr_used, caption_mags, report_job=None):
             findings.append(('pass', 'Photo legends',
                              'Image-legend magnifications all match the written captions.'))
 
-    # Cross-check the job number burned into the legends against the report.
-    # OCR misreads single digits, so all genuine photos share one job number:
-    # pass if any legend matches exactly, and only warn when readings clearly
-    # diverge (≥2 digits) — that suggests a micrograph from another report.
+    # Cross-check the job number burned into every legend against the report.
+    # A previous implementation passed the whole set as soon as ONE image
+    # matched, which hid a stray image from another job. Mixed exact/non-exact
+    # readings are therefore always surfaced. A uniform one-digit mismatch is
+    # still informational because it can be a repeatable OCR error.
     legend_jobs = [l['job'] for l in legends if l.get('job')]
     if report_job and report_job.isdigit() and legend_jobs:
-        if report_job in legend_jobs:
+        distinct = sorted(set(legend_jobs))
+        mismatched = sorted({job for job in legend_jobs if job != report_job})
+        if not mismatched:
             findings.append(('pass', 'Photo legends',
                              f'Micrograph legends carry the report job number ({report_job}).'))
+        elif report_job in legend_jobs:
+            findings.append(('warning', 'Photo legends',
+                             f'Mixed micrograph job numbers: report {report_job}, but some '
+                             f'images read {", ".join(mismatched)} — verify that no image was '
+                             f'copied from another report.'))
         else:
             best = min(legend_jobs, key=lambda j: _digit_dist(j, report_job))
-            if _digit_dist(best, report_job) >= 2:
-                seen = ", ".join(sorted(set(legend_jobs)))
+            if len(distinct) > 1 or _digit_dist(best, report_job) >= 2:
+                seen = ", ".join(distinct)
                 findings.append(('warning', 'Photo legends',
                                  f'Legend job number(s) [{seen}] do not match the report job '
                                  f'{report_job} — verify the micrographs belong to this report '
@@ -1402,19 +1632,31 @@ def review_report(filename, data, ocr=True):
           each embedded micrograph is read and cross-checked against captions.
     """
     wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True)
+    wb_formulas = openpyxl.load_workbook(io.BytesIO(data), data_only=False)
     rtype = detect_type(wb)
     media = _media_count(data)
+    excel_errors = _excel_errors(wb)
+    formula_issues = _formula_issues(wb_formulas)
+    micrograph_names = _anchor_order(data) if _PIL_AVAILABLE else None
+    micrograph_count = len(micrograph_names) if micrograph_names is not None else None
 
     if rtype == 'coating':
         parsed = parse_coating(wb, media)
+        parsed['excel_errors'] = excel_errors
+        parsed['formula_issues'] = formula_issues
+        parsed['micrograph_count'] = micrograph_count
         findings = review_coating(parsed)
     elif rtype == 'metallurgical':
-        parsed = parse_metallurgical(wb, media)
+        parsed = parse_metallurgical(wb, media, micrograph_count)
+        parsed['excel_errors'] = excel_errors
+        parsed['formula_issues'] = formula_issues
         findings = review_metallurgical(parsed)
     else:
-        parsed = {}
+        parsed = {'excel_errors': excel_errors, 'formula_issues': formula_issues,
+                  'micrograph_count': micrograph_count}
         findings = [('warning', 'Format',
                      'Unrecognised layout — not classified as a metallurgical or coating report.')]
+        findings += _review_workbook_integrity(parsed)
 
     findings += review_filename(filename, parsed, rtype)
 
@@ -1464,6 +1706,18 @@ def collect_highlights(parsed):
         entry = entry or {}
         return entry.get('value') or entry.get('label')
 
+    # ── Workbook integrity — visible errors / external formula references ──
+    for error in parsed.get('excel_errors') or []:
+        add((error.get('row'), error.get('col')), 'critical', 'Workbook integrity',
+            error.get('value') or 'Excel error',
+            f'{error.get("sheet")}!{error.get("cell")} contains '
+            f'{error.get("value")}.')
+    for issue in parsed.get('formula_issues') or []:
+        add((issue.get('row'), issue.get('col')), 'critical', 'Workbook integrity',
+            'external formula',
+            f'{issue.get("sheet")}!{issue.get("cell")} uses external-workbook '
+            f'formula {issue.get("formula")}.')
+
     # ── Composition — Actual cells out of tolerance vs Nominal ──
     deviations, systemic = _composition_deviations(
         parsed.get('nominal') or {}, parsed.get('actual') or {})
@@ -1472,13 +1726,27 @@ def collect_highlights(parsed):
         sev = 'critical' if systemic else sev
         add(aloc.get(el), sev, 'Composition', f'{el} {rel:+.0f}%',
             f'{el}: actual {act:g} vs nominal {nom:g} wt% ({rel:+.0f}%).')
+    comp_meta = (parsed.get('composition_meta') or {}).get('actual') or {}
+    duplicate_headers = set(comp_meta.get('duplicate_headers') or [])
+    for entry in comp_meta.get('entries') or []:
+        el, raw = entry.get('element'), entry.get('raw') or ''
+        cell = (entry.get('row'), entry.get('col'))
+        if el in duplicate_headers:
+            add(cell, 'critical', 'Composition', f'duplicate {el}',
+                f'Actual composition table repeats element header {el}.')
+        if entry.get('value') is None and _NOT_QUANTIFIED.match(raw):
+            nom = (parsed.get('nominal') or {}).get(el)
+            sev = 'critical' if nom is not None and nom >= 0.5 else 'warning'
+            note = (f'{el}: actual result is "{raw}"'
+                    + (f' while nominal is {nom:g} wt%.' if nom is not None else '.'))
+            add(cell, sev, 'Composition', f'{el} {raw}', note)
 
     # ── Hardness — post-solution should not exceed pre-solution ──
     hd = parsed.get('hardness') or {}
     pre = (hd.get('pre') or {}).get('value')
     post = (hd.get('post') or {}).get('value')
     hloc = loc.get('hardness') or {}
-    if pre is not None and post is not None and post > pre + 0.5:
+    if pre is not None and post is not None and post > pre + 2:
         note = (f'Post-solution hardness ({post:g} HRC) exceeds pre-solution '
                 f'({pre:g} HRC) — solution treatment normally softens the material.')
         for key in ('pre', 'post'):
@@ -1496,6 +1764,33 @@ def collect_highlights(parsed):
     if _is_placeholder(smp.get('material')):
         add(anchor((loc.get('sample') or {}).get('material')), 'warning',
             'Completeness', 'Material blank', 'Sample material/alloy not stated.')
+
+    # ── Traceability — sample-number / serial-number scope mismatch ──
+    sample_ids = _identifier_tokens(smp.get('sample_no'), 'sample')
+    serial_ids = _identifier_tokens(smp.get('serial'), 'serial')
+    if sample_ids and serial_ids and len(sample_ids) != len(serial_ids):
+        note = (f'{len(sample_ids)} sample number(s) but {len(serial_ids)} serial/part '
+                f'number(s) — the sample-to-part mapping is incomplete.')
+        sloc = loc.get('sample') or {}
+        for key in ('sample_no', 'serial'):
+            add(anchor(sloc.get(key)), 'warning', 'Traceability', 'count mismatch', note)
+
+    # ── Disposition — "See comment" must lead to an actual verdict ──
+    result = smp.get('result') or ''
+    comment = parsed.get('comment') or ''
+    if 'see comment' in result.lower():
+        has_negative = bool(re.search(
+            r'not\s+suitable|unsuitable|not\s+recommend|\breject|\bscrap|'
+            r'beyond\s+repair|non[-\s]?conform|unacceptable', comment, re.I))
+        has_positive = bool(re.search(
+            r'(?<!not )(?:\bsuitable for|\bacceptable|recommended for|'
+            r'reconditi|fit for service|return to service)', comment, re.I))
+        if not has_negative and not has_positive:
+            note = ('Result says "See comment", but the comment gives no clear '
+                    'accept / reject / repair disposition.')
+            sloc = loc.get('sample') or {}
+            add(anchor(sloc.get('result')), 'critical', 'Disposition', 'no verdict', note)
+            add(anchor(loc.get('comment')), 'critical', 'Disposition', 'no verdict', note)
 
     # ── Completeness — missing or very short comment ──
     if len((parsed.get('comment') or '').strip()) < 40:
@@ -1520,6 +1815,12 @@ def collect_highlights(parsed):
     # ── Captions — no etch status, or explicitly unetched ──
     pics = parsed.get('pictures') or []
     ploc = loc.get('pictures') or []
+    micrographs = parsed.get('micrograph_count')
+    if micrographs is not None and micrographs < len(pics):
+        note = (f'{len(pics)} picture caption(s) but only {micrographs} embedded '
+                f'micrograph(s) — {len(pics) - micrographs} evidence image(s) are missing.')
+        for entry in ploc[micrographs:]:
+            add(anchor(entry), 'critical', 'Micrographs', 'image missing', note)
     no_etch = [(label or '?').rstrip(':') for label, cap in pics
                if not _ETCH_PAT.search(f"{label} {cap or ''}")]
     no_etch_note = f'No etch status in caption(s): {", ".join(no_etch)}.'
