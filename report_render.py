@@ -651,17 +651,6 @@ def _faithful_view(data, parsed, findings, filename, dpi, timeout):
             'ref': f'{get_column_letter(c)}{r}',
         })
 
-    # Bound output to the used range and fit to one page wide.
-    try:
-        from openpyxl.worksheet.properties import PageSetupProperties
-        ws.print_area = ws.dimensions
-        ws.page_setup.orientation = 'landscape'
-        ws.page_setup.fitToWidth = 1
-        ws.page_setup.fitToHeight = 0
-        ws.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
-    except Exception:
-        pass
-
     with tempfile.TemporaryDirectory() as tmp:
         xpath = os.path.join(tmp, 'annotated.xlsx')
         wb.save(xpath)
@@ -817,6 +806,291 @@ def _pages_to_pdf(pages, dpi):
     return output.getvalue()
 
 
+def _wrap_download_text(draw, text, font, max_width):
+    """Wrap text by rendered pixel width without losing long tokens."""
+    paragraphs = str(text or '').splitlines() or ['']
+    lines = []
+    for paragraph in paragraphs:
+        words = paragraph.split()
+        if not words:
+            lines.append('')
+            continue
+        line = ''
+        for word in words:
+            candidate = f'{line} {word}'.strip()
+            if not line or _textw(draw, candidate, font) <= max_width:
+                line = candidate
+                continue
+
+            lines.append(line)
+            line = ''
+            while word and _textw(draw, word, font) > max_width:
+                cut = len(word)
+                while cut > 1 and _textw(draw, word[:cut], font) > max_width:
+                    cut -= 1
+                lines.append(word[:cut])
+                word = word[cut:]
+            line = word
+        if line:
+            lines.append(line)
+    return lines or ['']
+
+
+def _download_issue_cards(records, panel_width, panel_height, dpi):
+    """Prepare fully wrapped cards and split long comments into continuations."""
+    scale = max(0.8, dpi / 150.0)
+    pad = max(18, int(24 * scale))
+    card_pad = max(12, int(15 * scale))
+    title_font = _font(max(15, int(18 * scale)), bold=True)
+    meta_font = _font(max(11, int(13 * scale)), bold=True)
+    note_font = _font(max(13, int(16 * scale)))
+    title_lh = max(19, int(24 * scale))
+    meta_lh = max(16, int(19 * scale))
+    note_lh = max(18, int(23 * scale))
+    card_width = panel_width - 2 * pad
+    text_width = card_width - 2 * card_pad
+    usable_height = panel_height - max(94, int(116 * scale)) - pad
+    max_note_lines = max(
+        1,
+        int((usable_height - 2 * card_pad - title_lh - meta_lh - 12) / note_lh),
+    )
+
+    probe = Image.new('RGB', (8, 8), _WHITE)
+    draw = ImageDraw.Draw(probe)
+    cards = []
+    for record in records:
+        number = record.get('num')
+        severity = record.get('severity', 'warning')
+        label = {
+            'critical': 'FAIL',
+            'warning': 'WARNING',
+            'info': 'NOTE',
+            'pass': 'PASS',
+        }.get(severity, 'REVIEW')
+        title = f'{number}. {label}' if number is not None else f'REPORT CHECK - {label}'
+        refs = record.get('refs') or []
+        meta = record.get('category') or 'Review'
+        if refs:
+            meta += ' - ' + ', '.join(refs)
+        meta_lines = _wrap_download_text(draw, meta, meta_font, text_width)
+        note_lines = _wrap_download_text(
+            draw, record.get('note') or '', note_font, text_width)
+
+        # Long comments remain complete by continuing them in another card/page.
+        chunk_size = max(1, max_note_lines - max(0, len(meta_lines) - 1))
+        chunks = [
+            note_lines[index:index + chunk_size]
+            for index in range(0, len(note_lines), chunk_size)
+        ] or [['']]
+        for index, chunk in enumerate(chunks):
+            chunk_title = title + (' (continued)' if index else '')
+            height = (
+                2 * card_pad + title_lh + 5
+                + len(meta_lines) * meta_lh + 6
+                + len(chunk) * note_lh
+            )
+            cards.append({
+                'severity': severity,
+                'title': chunk_title,
+                'title_font': title_font,
+                'title_lh': title_lh,
+                'meta_lines': meta_lines,
+                'meta_font': meta_font,
+                'meta_lh': meta_lh,
+                'note_lines': chunk,
+                'note_font': note_font,
+                'note_lh': note_lh,
+                'padding': card_pad,
+                'height': height,
+            })
+    return cards, pad, usable_height
+
+
+def _paginate_download_cards(cards, usable_height, gap):
+    """Pack issue cards onto panels without dropping overflow comments."""
+    if not cards:
+        return [[]]
+    groups, current, used = [], [], 0
+    for card in cards:
+        needed = card['height'] + (gap if current else 0)
+        if current and used + needed > usable_height:
+            groups.append(current)
+            current, used = [], 0
+            needed = card['height']
+        current.append(card)
+        used += needed
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _download_page_records(page_entry, issues, extras, first_page):
+    numbers = set(page_entry.get('issue_nums') or [])
+    records = [issue for issue in issues if issue.get('num') in numbers]
+    if first_page:
+        records.extend(issue for issue in issues if not issue.get('pages'))
+        records.extend(extras or [])
+    return records
+
+
+def _draw_download_panel(
+        canvas, panel_x, panel_width, page_number, report_count, filename,
+        cards, panel_index, panel_count, pad, dpi):
+    """Draw comments beside one annotated report page."""
+    draw = ImageDraw.Draw(canvas)
+    scale = max(0.8, dpi / 150.0)
+    draw.rectangle(
+        [panel_x, 0, panel_x + panel_width, canvas.height],
+        fill=(246, 248, 251),
+    )
+    draw.line(
+        [(panel_x, 0), (panel_x, canvas.height)],
+        fill=(205, 211, 220),
+        width=max(2, int(2 * scale)),
+    )
+
+    heading_font = _font(max(20, int(27 * scale)), bold=True)
+    sub_font = _font(max(11, int(13 * scale)), bold=True)
+    file_font = _font(max(10, int(12 * scale)))
+    x = panel_x + pad
+    y = pad
+    draw.text((x, y), 'Review comments', font=heading_font, fill=_TEXT)
+    y += max(31, int(38 * scale))
+    page_label = f'REPORT PAGE {page_number} OF {report_count}'
+    if panel_count > 1:
+        page_label += f'  |  COMMENTS {panel_index} OF {panel_count}'
+    draw.text((x, y), page_label, font=sub_font, fill=(83, 96, 116))
+    y += max(22, int(27 * scale))
+    draw.text(
+        (x, y),
+        _fit(draw, filename or 'Lab report', file_font, panel_width - 2 * pad),
+        font=file_font,
+        fill=(104, 115, 132),
+    )
+    y += max(30, int(39 * scale))
+
+    if not cards:
+        clear_font = _font(max(15, int(18 * scale)), bold=True)
+        body_font = _font(max(12, int(15 * scale)))
+        body_lines = _wrap_download_text(
+            draw,
+            'The report page is included unchanged except for any numbered markers.',
+            body_font,
+            panel_width - 4 * pad,
+        )
+        body_lh = max(17, int(21 * scale))
+        clear_height = max(
+            96,
+            2 * pad + max(25, int(30 * scale)) + len(body_lines) * body_lh,
+        )
+        draw.rounded_rectangle(
+            [x, y, panel_x + panel_width - pad, y + clear_height],
+            radius=max(8, int(10 * scale)),
+            fill=(244, 252, 247),
+            outline=(87, 174, 116),
+            width=max(1, int(2 * scale)),
+        )
+        draw.text(
+            (x + pad, y + pad),
+            'No marked issues on this page',
+            font=clear_font,
+            fill=(32, 122, 67),
+        )
+        body_y = y + pad + max(28, int(33 * scale))
+        for line in body_lines:
+            draw.text(
+                (x + pad, body_y),
+                line,
+                font=body_font,
+                fill=(79, 98, 87),
+            )
+            body_y += body_lh
+        return
+
+    gap = max(10, int(13 * scale))
+    for card in cards:
+        color = _SEV_RGB.get(card['severity'], _SEV_RGB['warning'])
+        fill = {
+            'critical': (255, 247, 247),
+            'warning': (255, 250, 243),
+            'info': (247, 250, 255),
+            'pass': (246, 252, 248),
+        }.get(card['severity'], _WHITE)
+        x1 = panel_x + panel_width - pad
+        y1 = min(canvas.height - pad, y + card['height'])
+        draw.rounded_rectangle(
+            [x, y, x1, y1],
+            radius=max(8, int(10 * scale)),
+            fill=fill,
+            outline=(213, 219, 228),
+            width=max(1, int(1.5 * scale)),
+        )
+        draw.rounded_rectangle(
+            [x, y, x + max(5, int(6 * scale)), y1],
+            radius=max(2, int(3 * scale)),
+            fill=color,
+        )
+        tx = x + card['padding']
+        ty = y + card['padding']
+        draw.text(
+            (tx, ty),
+            card['title'],
+            font=card['title_font'],
+            fill=color,
+        )
+        ty += card['title_lh'] + 5
+        for line in card['meta_lines']:
+            draw.text((tx, ty), line, font=card['meta_font'], fill=(96, 108, 126))
+            ty += card['meta_lh']
+        ty += 6
+        for line in card['note_lines']:
+            draw.text((tx, ty), line, font=card['note_font'], fill=(45, 55, 72))
+            ty += card['note_lh']
+        y = y1 + gap
+
+
+def _compose_download_pages(
+        annotated_pages, page_entries, issues, extras, filename, dpi):
+    """Create PDF-ready pages with every issue comment visibly embedded."""
+    download_pages = []
+    report_count = len(annotated_pages)
+    for index, (report, entry) in enumerate(zip(annotated_pages, page_entries)):
+        report = report.convert('RGB')
+        scale = max(0.8, dpi / 150.0)
+        panel_width = max(int(report.width * 0.42), int(500 * scale))
+        records = _download_page_records(entry, issues, extras, index == 0)
+        cards, pad, usable_height = _download_issue_cards(
+            records, panel_width, report.height, dpi)
+        gap = max(10, int(13 * scale))
+        card_groups = _paginate_download_cards(cards, usable_height, gap)
+        # Overflow comments use additional side columns on the same PDF page.
+        # The annotated download therefore keeps exactly the report's source
+        # page count while guaranteeing that every comment remains visible.
+        canvas = Image.new(
+            'RGB',
+            (report.width + panel_width * len(card_groups), report.height),
+            _WHITE,
+        )
+        canvas.paste(report, (0, 0))
+        for panel_index, group in enumerate(card_groups, start=1):
+            panel_x = report.width + panel_width * (panel_index - 1)
+            _draw_download_panel(
+                canvas,
+                panel_x,
+                panel_width,
+                entry.get('number', index + 1),
+                report_count,
+                filename,
+                group,
+                panel_index,
+                len(card_groups),
+                pad,
+                dpi,
+            )
+        download_pages.append(canvas)
+    return download_pages
+
+
 def _stack_pages(pages):
     """Compatibility/download image; the interactive UI uses one page at a time."""
     if not pages:
@@ -838,11 +1112,13 @@ def _stack_pages(pages):
 def _compose_faithful_view(pages, anchors, issues, extras, filename, dpi):
     page_entries, annotated_images = _annotate_faithful_pages(
         pages, anchors, issues, dpi)
+    download_pages = _compose_download_pages(
+        annotated_images, page_entries, issues, extras, filename, dpi)
     return {
         'filename': filename or 'Lab report',
         'pages': page_entries,
         'issues': issues,
         'extras': extras,
-        'annotated_pdf': _pages_to_pdf(annotated_images, dpi),
+        'annotated_pdf': _pages_to_pdf(download_pages, dpi),
         'combined_png': _stack_pages(annotated_images),
     }
