@@ -54,6 +54,7 @@ from lab_vocab import (  # noqa: E402,F401
     _PICNUM, _ETCH_PAT, _UNETCHED_PAT, _ALLOY_PAT, _norm_alloy,
     _ETCHANT_VOCAB, caption_etchant, report_etchants, image_etchant,
     _HT_VOCAB, HT_ORDER, caption_ht, report_ht, image_ht,
+    comment_picture_refs,
 )
 
 # ── Reference data ────────────────────────────────────────────────────────
@@ -581,6 +582,29 @@ def _review_composition(nominal, actual, composition_meta=None):
                              f'Actual composition totals {total:.2f} wt%, outside the '
                              f'95–105 wt% sanity band — check missing/misaligned columns.'))
 
+    # _composition() computes duplicate_headers/entries for the Nominal table
+    # too (nominal_meta below), but until now nothing downstream ever looked
+    # at it — a mislabeled/duplicated column in the *spec* side of the table
+    # was invisible even though the identical fault on the Actual side (right
+    # above) is a critical finding. Mirror both of the Actual-side structural
+    # checks for Nominal.
+    nominal_meta = composition_meta.get('nominal') or {}
+    nominal_entries = nominal_meta.get('entries') or []
+    nominal_duplicates = nominal_meta.get('duplicate_headers') or []
+    if nominal_duplicates:
+        findings.append(('critical', 'Composition',
+                         f'Nominal composition table repeats element header(s): '
+                         f'{", ".join(nominal_duplicates)} — at least one column is mislabeled, '
+                         f'so the spec cannot be accepted as reported.'))
+    nominal_numeric = [e['value'] for e in nominal_entries if e.get('value') is not None]
+    if len(nominal_numeric) >= 5:
+        nominal_total = sum(nominal_numeric)
+        if nominal_total < 95.0 or nominal_total > 105.0:
+            findings.append(('critical', 'Composition',
+                             f'Nominal composition totals {nominal_total:.2f} wt%, outside the '
+                             f'95–105 wt% sanity band — the spec table may be for the wrong '
+                             f'alloy or have missing/misaligned columns.'))
+
     # A few elements off is normal service depletion / EDS scatter → warnings,
     # unless a single element is itself far enough outside tolerance to be
     # critical regardless of how many others are affected. Many elements off
@@ -649,6 +673,25 @@ def _review_comment(parsed):
     comment = parsed.get('comment') or ''
     coat = parsed.get('coating') or {}
     if not comment:
+        # collect_highlights() already treats an empty comment as "no verdict"
+        # when Result defers to it (has_negative/has_positive both false on
+        # ''), so the annotated view flags this — the plain findings list must
+        # match instead of silently passing it via the early return below.
+        result = (parsed.get('sample') or {}).get('result') or ''
+        if 'see comment' in result.lower():
+            findings.append(('critical', 'Disposition',
+                             'Result says "See comment", but there is no comment at all '
+                             '— the report gives no accept / reject / repair disposition.'))
+        # A named coating type recorded in the cells (not a blank/'N/A' placeholder)
+        # with zero comment text means the coating condition — thickness, coverage,
+        # degradation — was never actually described anywhere in the report.
+        present = (coat.get('present') or '').strip().lower()
+        cell_types = _coating_types_in(coat.get('type'))
+        if present != 'no' and (present == 'yes' or (cell_types and not _is_placeholder(coat.get('type')))):
+            label = "/".join(sorted(cell_types)) or coat.get('type')
+            findings.append(('warning', 'Comment',
+                             f'Coating cell records a coating ({label}), but there is no '
+                             f'comment describing its condition, thickness or coverage.'))
         return findings
     cl = comment.lower()
 
@@ -892,6 +935,12 @@ def _review_traceability(parsed):
             findings.append(('warning', 'Traceability',
                              f'Duplicate {label}(s): {", ".join(duplicates)}.'))
 
+    # NOTE: a sample-number-count vs serial-number-count check was tried here
+    # (PR #5) and deliberately removed (PR #7) after it false-positived on real
+    # reports — a part can legitimately be sampled without a legible/recorded
+    # serial. See test_sample_and_serial_count_mismatch_is_intentionally_skipped.
+    # Do not re-add a hard count comparison without addressing that.
+
     result = sample.get('result')
     if _is_placeholder(result):
         findings.append(('warning', 'Disposition', 'Result field is blank or invalid.'))
@@ -1042,8 +1091,7 @@ def _review_captions(parsed):
                              f'as-polished — confirm intended (a microstructure '
                              f'assessment is normally etched).'))
 
-    refs = [int(m.group(1)) for m in
-            re.finditer(r'pic(?:ture)?\.?\s*(?:no\.?\s*)?(\d+)', comment, re.I)]
+    refs = comment_picture_refs(comment)
     if refs and max(refs) > len(pics):
         findings.append(('warning', 'Captions',
                          f'Comment refers to Picture {max(refs)} but only {len(pics)} '
@@ -1624,7 +1672,13 @@ _PART_SYNONYMS = [
 def _component_identity(text):
     """Return (stage_number, canonical_part) from free report-title text."""
     raw = text or ''
-    lowered = raw.lower()
+    # Filenames use '_' as the word separator (e.g. "..._1st_Stage_Bucket_...").
+    # Regex '_' is a \w character, so a \b-anchored pattern like \bbucket\b or
+    # \b(\d{1,2})...stage\b never matches across it — every underscore-joined
+    # filename would silently fail to match a component/stage it clearly names.
+    # Normalising '_' to a space first makes the existing \b patterns work for
+    # both filenames and the space-separated internal description text.
+    lowered = raw.replace('_', ' ').lower()
     part = next((name for pat, name in _PART_SYNONYMS if re.search(pat, lowered)), None)
     stage_match = (
         re.search(r'\b(\d{1,2})\s*(?:st|nd|rd|th)?\s*(?:stage|stg)\b', lowered)
@@ -1958,6 +2012,13 @@ def collect_highlights(parsed):
             note = (f'{el}: actual result is "{raw}"'
                     + (f' while nominal is {nom:g} wt%.' if nom is not None else '.'))
             add(cell, sev, 'Composition', f'{el} {raw}', note)
+    nom_meta = (parsed.get('composition_meta') or {}).get('nominal') or {}
+    nom_duplicate_headers = set(nom_meta.get('duplicate_headers') or [])
+    for entry in nom_meta.get('entries') or []:
+        el = entry.get('element')
+        if el in nom_duplicate_headers:
+            add((entry.get('row'), entry.get('col')), 'critical', 'Composition',
+                f'duplicate {el}', f'Nominal composition table repeats element header {el}.')
 
     # ── Hardness — post-solution should not exceed pre-solution ──
     hd = parsed.get('hardness') or {}

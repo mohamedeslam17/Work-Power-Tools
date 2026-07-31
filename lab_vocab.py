@@ -17,11 +17,39 @@ _ETCH_PAT = re.compile(r'etch|unetched|as[-\s]?polished|kalling|glyceregia|oxali
 # Captions that explicitly state the section was NOT etched (vs simply omitting
 # the etch status). 'etch' in _ETCH_PAT also matches 'unetched', so these are
 # recognised as *having* an etch status — they just need surfacing on their own.
-_UNETCHED_PAT = re.compile(r'\bunetched\b|as[-\s]?polished', re.I)
+# 'un[-\s]?etched' (not a bare \bunetched\b) so the common hyphenated spelling
+# "Un-etched" — seen in real AEG captions — isn't silently missed.
+_UNETCHED_PAT = re.compile(r'\bun[-\s]?etched\b|as[-\s]?polished', re.I)
 _ALLOY_PAT = re.compile(
     r'\b(?:IN[-\s]?\d{3}(?:LC)?|GTD[-\s]?\d{3}|Ren[eé][-\s]?\d+|Nimonic[-\s]?\d+|'
     r'Inconel[-\s]?\d+|Hastelloy[-\s]?\w?|Waspaloy|Mar[-\s]?M[-\s]?\d+|'
     r'FSX[-\s]?\d+|Udimet[-\s]?\d+|C[-\s]?263)\b', re.I)
+
+# Picture references inside free-text comments, e.g. "(Pic. 1)", "(Ref. pics.
+# 4-8)", "Pics. 3 and 4". The original 'pic(?:ture)?\.?\s*(?:no\.?\s*)?(\d+)'
+# only matched the singular "Pic"/"Picture" — real AEG comments overwhelmingly
+# write the plural "Pics." with an en-dash range ("Ref. pics. 1-4"), which that
+# pattern never matched at all, so a comment referencing a picture that doesn't
+# exist could slip through silently. This version accepts the plural, then
+# expands "a-b"/"a-b" (hyphen or en/em dash) ranges and "a and b" lists so every
+# individual number the sentence refers to is captured.
+_PIC_REF_LIST = re.compile(
+    r'pics?(?:ture)?\.?\s*(?:no\.?\s*)?(\d+(?:\s*(?:[-–—,]|and|to)\s*\d+)*)',
+    re.I,
+)
+_PIC_REF_NUM = re.compile(r'\d+')
+
+
+def comment_picture_refs(text):
+    """Set of every picture number a comment refers to (ranges expanded)."""
+    out = set()
+    for m in _PIC_REF_LIST.finditer(text or ''):
+        span = m.group(1)
+        nums = [int(n) for n in _PIC_REF_NUM.findall(span)]
+        is_range = (len(nums) >= 2 and re.search(r'[-–—]|\bto\b', span, re.I)
+                    and not re.search(r',|\band\b', span, re.I))
+        out.update(range(min(nums), max(nums) + 1) if is_range else nums)
+    return out
 
 
 def _norm_alloy(s):

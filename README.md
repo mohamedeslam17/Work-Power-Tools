@@ -187,3 +187,52 @@ python3 -m unittest discover -s tests -v
   adjust them to match your controlling specification.
 * Raw customer report `.xlsx` files are **not tracked in git** (`*.xlsx` is
   git-ignored); supply your own workbooks at runtime / on the command line.
+
+### Blind spots found and fixed against real reports (2026-07-31)
+
+Running the reviewer against three real AEG metallurgical reports (job 7398,
+7504, 7646 — all now mirrored as regression tests) surfaced gaps where the
+tool either missed something in *those* reports or a check silently never
+fired the way its own docstring/README claimed:
+
+* **Title-identity false positives on underscore filenames.** `_component_identity`
+  matched component/stage with `\b`-anchored regexes, but `_` is a regex word
+  character, so `\bbucket\b` never matches `..._Stage_Bucket_...` — the exact
+  naming convention AEG's own filenames use. Every real report was reporting a
+  spurious "title doesn't state Stage N / component" warning. Fixed by
+  normalising `_` to a space before matching.
+* **Hyphenated "Un-etched" caption not recognised.** `_UNETCHED_PAT` required
+  the literal contiguous word `unetched`; report 7504's Picture 1 caption
+  ("Un-etched 25x") was silently treated as if it had no explicit
+  unetched/as-polished note at all.
+* **Comment picture-references blind to "Pics." (plural) and ranges.** The
+  over-reference check (`Comment refers to Picture N but only M are present`)
+  used `pic(?:ture)?\.?\s*(\d+)`, which never matches the plural "Pics." or an
+  en-dash range ("Ref. pics. 9–10") — the exact phrasing used throughout these
+  reports' comments. A comment citing a picture that doesn't exist, phrased
+  the way AEG actually writes it, would have gone completely unflagged.
+* **"Result: See comment" with a genuinely empty comment undersold.** When the
+  comment cell was entirely blank (report 7398), `_review_comment` returned
+  before ever checking the Result-defers-to-comment case, so the only finding
+  was a generic "comment is short" warning — the annotated PDF view already
+  treated this as a hard "no verdict" (`collect_highlights`), but the plain
+  findings list/CLI output didn't. Now both paths agree and it's a critical
+  Disposition finding.
+* **Nominal-table duplicate/total checks were dead code.** `_composition()`
+  computes `duplicate_headers` and a sanity-checkable `entries` list for the
+  *Nominal* table exactly like it does for Actual, but `_review_composition`
+  and `collect_highlights` only ever read the `actual` half of that metadata —
+  a mislabeled/duplicated column or corrupted total on the spec side of the
+  table was structurally invisible. Both now get the same treatment as Actual.
+* **Coating recorded but never described.** A coating type is stated in the
+  structured cells but the comment says nothing about it (report 7398, no
+  comment at all) — now a warning instead of silence.
+
+One additional check — comparing sample-number count to serial-number count
+(4 samples vs 3 serials in report 7504) — was deliberately **not**
+reinstated: it was tried once (PR #5) and explicitly reverted (PR #7) after
+producing false positives on real reports, since a part can legitimately be
+sampled without a legible/recorded serial. See
+`test_sample_and_serial_count_mismatch_is_intentionally_skipped` in
+[`tests/test_lab_review.py`](tests/test_lab_review.py) before reopening that
+idea.

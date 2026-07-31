@@ -101,6 +101,40 @@ class LabReviewRegressionTests(unittest.TestCase):
             for message in messages(findings, "critical")
         ))
 
+    def test_see_comment_with_no_comment_at_all_is_critical(self):
+        # _review_comment used to bail out silently on an empty comment, so a
+        # report with Result="See comment" and literally no comment text (as
+        # in the real 7398 report) only ever got a generic Completeness
+        # warning — never the stronger Disposition failure that an *ambiguous*
+        # comment gets. collect_highlights() already treated it as "no
+        # verdict"; the plain findings list must agree.
+        parsed = {
+            "comment": None,
+            "coating": {},
+            "sample": {"material": "GTD 111", "result": "See comment"},
+        }
+
+        findings = _review_comment(parsed)
+
+        self.assertTrue(any(
+            "no comment at all" in message
+            for message in messages(findings, "critical")
+        ))
+
+    def test_coating_cell_without_any_comment_is_flagged(self):
+        parsed = {
+            "comment": None,
+            "coating": {"present": None, "type": "MCrAIY", "received": None, "outgoing": None},
+            "sample": {"material": "GTD 111", "result": "Acceptable"},
+        }
+
+        findings = _review_comment(parsed)
+
+        self.assertTrue(any(
+            "no comment describing its condition" in message
+            for message in messages(findings, "warning")
+        ))
+
     def test_microstructure_does_not_prove_restored_mechanical_properties(self):
         parsed = {
             "comment": (
@@ -134,6 +168,112 @@ class LabReviewRegressionTests(unittest.TestCase):
         self.assertFalse(any(
             "sample-to-part mapping" in message
             for message in messages(findings)
+        ))
+
+    def test_nominal_duplicate_header_is_flagged(self):
+        # _composition() already computed duplicate_headers/entries for the
+        # NOMINAL table (mirroring the Actual side), but _review_composition
+        # only ever read composition_meta['actual'] — a mislabeled/duplicated
+        # column in the spec itself was silently invisible.
+        nominal = {"Al": 3.0, "Cr": 14.0}
+        actual = {"Al": 2.9, "Cr": 13.5}
+        meta = {
+            "nominal": {
+                "duplicate_headers": ["Cr"],
+                "entries": [
+                    {"element": "Al", "raw": "3.0", "value": 3.0, "row": 13, "col": 6},
+                    {"element": "Cr", "raw": "14.0", "value": 14.0, "row": 13, "col": 7},
+                    {"element": "Cr", "raw": "14.0", "value": 14.0, "row": 13, "col": 8},
+                ],
+            },
+            "actual": {"duplicate_headers": [], "entries": []},
+        }
+
+        findings = _review_composition(nominal, actual, meta)
+
+        self.assertTrue(any(
+            "Nominal composition table repeats element header" in message
+            for message in messages(findings, "critical")
+        ))
+
+    def test_nominal_total_outside_sanity_band_is_flagged(self):
+        meta = {
+            "nominal": {
+                "duplicate_headers": [],
+                "entries": [
+                    {"element": el, "raw": str(v), "value": v}
+                    for el, v in {"Ni": 20.0, "Cr": 5.0, "Co": 4.0, "Mo": 1.0, "W": 1.0}.items()
+                ],
+            },
+            "actual": {"duplicate_headers": [], "entries": []},
+        }
+
+        findings = _review_composition({}, {}, meta)
+
+        self.assertTrue(any(
+            "Nominal composition totals" in message and "sanity band" in message
+            for message in messages(findings, "critical")
+        ))
+
+    def test_hyphenated_unetched_caption_is_recognised(self):
+        # _UNETCHED_PAT required the literal contiguous word "unetched", so the
+        # common hyphenated spelling "Un-etched" (used in real AEG captions,
+        # e.g. report 7504's Picture 1) was never surfaced as an explicit
+        # unetched/as-polished caption.
+        parsed = {
+            "pictures": [
+                ("Picture 1:", "Micrograph- Shroud Tip Overview\nUn-etched 25x"),
+            ],
+            "comment": "",
+        }
+
+        findings = _review_captions(parsed)
+
+        self.assertTrue(any(
+            "states unetched / as-polished" in message
+            for message in messages(findings, "info")
+        ))
+
+    def test_plural_pics_range_reference_is_parsed(self):
+        # The old regex only matched singular "Pic"/"Picture" — real AEG
+        # comments write the plural "Pics." with an en-dash range ("Ref. pics.
+        # 9-10"), which never matched at all, so an out-of-range reference
+        # written that way could slip through unflagged.
+        parsed = {
+            "pictures": [(f"Picture {n}:", "Etched 500x") for n in range(1, 5)],
+            "comment": "Solution HT was performed (Ref. pics. 9–10).",
+        }
+
+        findings = _review_captions(parsed)
+
+        self.assertTrue(any(
+            "Comment refers to Picture 10 but only 4 picture(s)" in message
+            for message in messages(findings, "warning")
+        ))
+
+    def test_underscore_separated_filename_matches_stage_and_component(self):
+        # Real AEG filenames use '_' as the word separator. Regex '_' counts
+        # as a \w character, so \b-anchored patterns (component/stage) never
+        # matched across it — every underscore-joined filename spuriously
+        # looked like it disagreed with its own report content.
+        parsed = {
+            "header": {"job": "7398", "machine": "MS7001", "customer": "AEN SAUDI"},
+            "sample": {"description": "1st Stage Bucket"},
+        }
+
+        findings = review_filename(
+            "7398__AEN_Saudi_FS.7_1st_Stage_Bucket_Metallurgical_Report__AEG_final.xlsx",
+            parsed,
+            "metallurgical",
+        )
+
+        self.assertFalse(any(
+            severity in ("critical", "warning") and category == "Title identity"
+            for severity, category, _message in findings
+        ))
+        self.assertTrue(any(
+            "stage" in message and "component" in message
+            for message in messages(findings, "pass")
         ))
 
     def test_spaced_serial_prefix_is_one_identifier(self):
