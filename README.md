@@ -236,3 +236,50 @@ sampled without a legible/recorded serial. See
 `test_sample_and_serial_count_mismatch_is_intentionally_skipped` in
 [`tests/test_lab_review.py`](tests/test_lab_review.py) before reopening that
 idea.
+
+### Second audit pass — a 27-report real batch (2026-07-31)
+
+Reviewing a batch of 27 real AEG reports (`FS.7`/`FS.7FA`/`FS.5`/`V84.2`
+buckets, vanes and nozzles) surfaced two more classes of issue:
+
+* **Disposition vocabulary didn't match house style.** `_review_comment` only
+  recognised explicit words like "acceptable"/"suitable for"/"fit for
+  service" as a positive verdict. Across this batch that vocabulary is
+  almost never used — the actual convention is to state the outcome as the
+  microstructure or mechanical properties having been **restored**/
+  **recovered** by the heat-treatment cycle ("the final microstructure was
+  restored through subsequent stress relief and aging"), with no explicit
+  accept/reject phrase at all. Because of that gap, ~90% of real reports hit
+  the critical "no clear disposition" finding even when they clearly stated
+  a successful outcome in the shop's own words. Fixed by recognising an
+  unnegated restore/recover verb as the same positive signal as "acceptable"
+  (still excluding negated forms like "could not be restored" or "only
+  partially recovered"). The duplicated pos/neg-detection logic in
+  `_review_comment` and `collect_highlights` was also factored into one
+  shared `_comment_disposition()` helper so the two can't drift apart again
+  the way the empty-comment case did in the first audit pass. This dropped
+  the false-critical rate on the batch from 27/30 to 18/30 reports — the
+  remaining 18 are genuinely comment-only narratives with no accept/reject
+  wording of any kind (positive or negative), which is a real documentation
+  gap worth surfacing, not a tool bug.
+* **`_canon_machine` only recognised GE frame sizes 6/7/9.** One real report
+  used "FS.5" (GE Frame 5, MS5001 — a real frame size the code simply didn't
+  list), so the machine/set cross-check silently produced no finding at all
+  for that report instead of matching or flagging it. Frame 5 is now
+  recognised alongside 6/7/9.
+
+**New capability: cross-report duplicate-composition detection.** No
+single-report check can catch this — it only appears once you diff a batch.
+Comparing all 27 reports pairwise found two different AEG job numbers
+(6630 and 6991 — different customer references, serial numbers, sign-off
+engineers and dates, so genuinely different physical parts) reporting a
+**byte-identical Actual composition across all 9 matched elements**.
+Independent EDS/ICP analysis of two different parts is not expected to match
+to the exact reported decimal on every element; this is very likely a
+copy-paste — one report's composition table was probably never re-entered
+from that job's own lab results. Added `find_duplicate_compositions()` in
+[`lab_review.py`](lab_review.py), wired into the multi-file CLI
+(`python3 lab_review.py *.xlsx` now prints a "CROSS-REPORT (batch-only)
+findings" section), into [`batch_review.py`](batch_review.py)'s aggregate
+report, and into the Streamlit batch-upload flow
+([`ui/lab_tool.py`](ui/lab_tool.py)) as a banner above the report selector.

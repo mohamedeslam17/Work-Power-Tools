@@ -6,7 +6,7 @@ from pathlib import Path
 import streamlit as st
 
 import report_render
-from lab_review import review_report
+from lab_review import review_report, find_duplicate_compositions
 from photo_lib import add_to_library
 
 try:
@@ -145,6 +145,11 @@ def render():
         return
 
     if len(ok) > 1:
+        cross_findings = find_duplicate_compositions(
+            [(r['name'], r['parsed']) for r in ok if r['rtype'] == 'metallurgical'])
+        for _sev, _cat, msg in cross_findings:
+            st.error(f"🔴 Possible copied composition data — {msg}")
+
         ranked = sorted(ok, key=lambda r: components.RANK[components.verdict(r['counts'])])
         idx = st.selectbox(
             "Report",

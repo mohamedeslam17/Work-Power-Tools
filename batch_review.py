@@ -20,7 +20,8 @@ import glob
 import collections
 
 from lab_review import (review_report, HARDNESS_REF, _alloy_key,
-                        caption_etchant, _coating_types_in)
+                        caption_etchant, _coating_types_in,
+                        find_duplicate_compositions)
 
 
 def _present(v):
@@ -46,7 +47,9 @@ def audit(folder, ocr=False):
         'elements': collections.Counter(),
         'anomalies': collections.defaultdict(list),
         'errors': [],
+        'duplicate_compositions': [],
     }
+    met_reports = []   # (name, parsed) for every metallurgical report — cross-report check
 
     for path in files:
         name = os.path.basename(path)
@@ -70,6 +73,7 @@ def audit(folder, ocr=False):
             continue
 
         if rtype == 'metallurgical':
+            met_reports.append((name, parsed))
             hdr, smp = parsed.get('header', {}), parsed.get('sample', {})
             mat = smp.get('material')
             if _present(mat):
@@ -102,6 +106,7 @@ def audit(folder, ocr=False):
             if _present(hdr.get('machine')):
                 agg['machines'][hdr['machine'].strip()] += 1
 
+    agg['duplicate_compositions'] = find_duplicate_compositions(met_reports)
     _report(len(files), agg)
 
 
@@ -128,6 +133,12 @@ def _report(total, agg):
     _section('Customers seen', agg['customers'])
     _section('Machine types seen', agg['machines'])
     _section('Composition elements seen', agg['elements'])
+
+    if agg['duplicate_compositions']:
+        print(f"\n🔴 POSSIBLE COPIED COMPOSITION DATA — "
+              f"{len(agg['duplicate_compositions'])} cross-report match(es):")
+        for _sev, _cat, msg in agg['duplicate_compositions']:
+            print(f'  {msg}')
 
     if agg['anomalies']:
         print('\n⚠ PARSER GAPS / ANOMALIES (investigate these):')

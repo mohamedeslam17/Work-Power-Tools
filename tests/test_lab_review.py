@@ -4,6 +4,7 @@ from unittest.mock import patch
 from openpyxl import Workbook
 
 from lab_review import (
+    _canon_machine,
     _comment,
     _formula_issues,
     _review_comment,
@@ -15,6 +16,7 @@ from lab_review import (
     _review_traceability,
     _select_magnification,
     collect_highlights,
+    find_duplicate_compositions,
     picture_magnification_verdicts,
     review_filename,
 )
@@ -118,6 +120,51 @@ class LabReviewRegressionTests(unittest.TestCase):
 
         self.assertTrue(any(
             "no comment at all" in message
+            for message in messages(findings, "critical")
+        ))
+
+    def test_restored_microstructure_counts_as_a_positive_disposition(self):
+        # Auditing 27 real AEG reports found the plain accept/reject
+        # vocabulary ("acceptable", "suitable for", ...) essentially never
+        # appears — the house style states the outcome as the microstructure
+        # or properties having been *restored*/*recovered* by the repair heat
+        # treatment, with no explicit accept/reject phrase anywhere. Without
+        # recognising that as a positive signal, nearly every real report hit
+        # the critical "no clear disposition" finding.
+        parsed = {
+            "comment": (
+                "Stress relief was followed by aging to recover the "
+                "microstructure with the reformation of the strengthening "
+                "phase (gamma prime), as shown in Pics 3 & 4."
+            ),
+            "coating": {},
+            "sample": {"material": "GTD-111", "result": "See comment"},
+        }
+
+        findings = _review_comment(parsed)
+
+        self.assertFalse(any(
+            "no clear accept / reject / repair disposition" in message
+            for message in messages(findings, "critical")
+        ))
+        self.assertTrue(any(
+            "suitable / positive" in message for message in messages(findings, "info")
+        ))
+
+    def test_negated_restore_is_not_a_positive_disposition(self):
+        parsed = {
+            "comment": (
+                "Embrittlement was severe and the microstructure could not "
+                "be restored by the standard solution heat treatment."
+            ),
+            "coating": {},
+            "sample": {"material": "GTD-111", "result": "See comment"},
+        }
+
+        findings = _review_comment(parsed)
+
+        self.assertTrue(any(
+            "no clear accept / reject / repair disposition" in message
             for message in messages(findings, "critical")
         ))
 
@@ -447,6 +494,53 @@ class LabReviewRegressionTests(unittest.TestCase):
                     "machine/set" in message
                     for message in messages(findings, "pass")
                 ))
+
+    def test_frame_5_machine_alias_is_recognised(self):
+        # _canon_machine restricted the GE frame digit to [679]; a real report
+        # in a 27-report batch used "FS.5" (GE Frame 5 exists — MS5001), which
+        # silently failed to resolve at all, dropping the machine/set
+        # cross-check for that report instead of matching or flagging it.
+        self.assertEqual(_canon_machine('AEN Saudi FS.5 1st Stage Bucket'), 'MS5001')
+        self.assertEqual(_canon_machine('MS 5001'), 'MS5001')
+
+    def test_duplicate_actual_composition_across_different_jobs_is_flagged(self):
+        # Found on a real 27-report batch: two different AEG job numbers
+        # (different customer refs, serials, engineers, dates) carried a
+        # byte-identical Actual composition on every matched element — almost
+        # certainly a copy-paste, since independent EDS/ICP results are not
+        # expected to match exactly. A single-report review can never see
+        # this; it only becomes visible across a batch.
+        actual = {
+            'Ni': 59.53, 'Cr': 13.57, 'Co': 9.14, 'Mo': 1.46,
+            'W': 4.73, 'Al': 2.49, 'Ti': 4.81, 'Ta': 3.05, 'Fe': 0.08,
+        }
+        reports = [
+            ('6630.xlsx', {'header': {'job': '6630'}, 'actual': dict(actual)}),
+            ('6991.xlsx', {'header': {'job': '6991'},
+                           'actual': dict(actual, Cu=0.07)}),
+            ('unrelated.xlsx', {'header': {'job': '7000'},
+                                 'actual': {'Ni': 61.0, 'Cr': 12.0, 'Co': 9.0,
+                                            'Mo': 1.5, 'W': 4.0}}),
+        ]
+
+        findings = find_duplicate_compositions(reports)
+
+        self.assertEqual(len(findings), 1)
+        severity, category, message = findings[0]
+        self.assertEqual(severity, 'critical')
+        self.assertEqual(category, 'Composition')
+        self.assertIn('6630.xlsx', message)
+        self.assertIn('6991.xlsx', message)
+        self.assertIn('9 matched element', message)
+
+    def test_same_job_number_is_not_a_duplicate_composition_signal(self):
+        actual = {'Ni': 60.0, 'Cr': 14.0, 'Co': 9.5, 'Mo': 1.5, 'W': 3.8}
+        reports = [
+            ('a.xlsx', {'header': {'job': '7000'}, 'actual': dict(actual)}),
+            ('b.xlsx', {'header': {'job': '7000'}, 'actual': dict(actual)}),
+        ]
+
+        self.assertEqual(find_duplicate_compositions(reports), [])
 
     def test_title_identity_rejects_stage_component_and_machine_mismatches(self):
         parsed = {

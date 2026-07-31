@@ -667,6 +667,40 @@ def _coating_types_in(text):
     return {name for name, pat in _COATING_TYPE_PATS if re.search(pat, t, re.I)}
 
 
+# Explicit accept/reject vocabulary for a comment's service verdict.
+_DISPOSITION_NEG = re.compile(
+    r'not\s+suitable|unsuitable|not\s+recommend|\breject|\bscrap|'
+    r'beyond\s+repair|non[-\s]?conform|unacceptable', re.I)
+_DISPOSITION_POS = re.compile(
+    r'(?<!not )(?:\bsuitable for|\bacceptable|recommended for|'
+    r'reconditi|fit for service|return to service)', re.I)
+# A repair-metallurgy comment almost never spells out "acceptable"/"suitable"
+# — the AEG house style states the outcome as the microstructure or
+# mechanical properties having been *restored*/*recovered* by the
+# heat-treatment cycle (e.g. "the final microstructure was restored through
+# stress relief and aging"), with no explicit accept/reject phrase anywhere.
+# Auditing 30 real reports found the plain accept/reject vocabulary above
+# missing on almost every one for exactly this reason — every report was
+# spuriously landing on the "no clear disposition" critical finding. Treat an
+# unnegated restore/recover verb the same as an explicit "acceptable", unless
+# it's itself negated ("could not be restored", "only partially recovered").
+_DISPOSITION_RESTORE_NEG = re.compile(
+    r'(?:\bnot\b|cannot|can\'t|could\s+not|couldn\'t|unable\s+to|'
+    r'fail(?:ed|s)?\s+to|did\s+not|didn\'t|only\s+partially|\bpartially\b)'
+    r'\s+(?:\w+\s+){0,3}(?:restor\w*|recover\w*)', re.I)
+_DISPOSITION_RESTORE_POS = re.compile(r'\b(?:restor\w*|recover\w*)\b', re.I)
+
+
+def _comment_disposition(comment):
+    """(has_positive, has_negative) service-verdict signals in a comment."""
+    text = comment or ''
+    neg = bool(_DISPOSITION_NEG.search(text))
+    pos = bool(_DISPOSITION_POS.search(text))
+    if not pos and _DISPOSITION_RESTORE_POS.search(text) and not _DISPOSITION_RESTORE_NEG.search(text):
+        pos = True
+    return pos, neg
+
+
 def _review_comment(parsed):
     """Flag where the free-text comment contradicts the coating cells."""
     findings = []
@@ -747,10 +781,7 @@ def _review_comment(parsed):
     # Service verdict in the comment vs the Result cell.
     result = (parsed.get('sample') or {}).get('result') or ''
     rlow = result.lower()
-    neg = re.search(r'not\s+suitable|unsuitable|not\s+recommend|\breject|\bscrap|'
-                    r'beyond\s+repair|non[-\s]?conform|unacceptable', cl)
-    pos = re.search(r'(?<!not )(?:\bsuitable for|\bacceptable|recommended for|'
-                    r'reconditi|fit for service|return to service)', cl)
+    pos, neg = _comment_disposition(comment)
     result_pos = bool(re.search(r'accept|suitable|conform|\bpass\b', rlow)) and 'see comment' not in rlow
     result_neg = bool(re.search(r'reject|not\s+suitable|scrap|unacceptable', rlow))
     if result_pos and neg and not pos:
@@ -1701,6 +1732,12 @@ def _canon_machine(text):
 
     The aliases below reflect the forms used by the supplied reports:
     FS.7 ≡ MS7001 and 7FA ≡ MS7001FA. V-series names remain explicit.
+
+    GE heavy-duty frame sizes include 5 as well as 6/7/9 — a real report in a
+    27-report batch used "FS.5", which the frame digit class here originally
+    restricted to [679], silently dropping the machine/set cross-check for
+    that report (neither matching nor flagging a mismatch) instead of
+    resolving it like every other frame size.
     """
     raw = (text or '').upper()
 
@@ -1708,12 +1745,12 @@ def _canon_machine(text):
     if v_model:
         return f'V{v_model.group(1)}.{v_model.group(2)}'
 
-    ms_model = re.search(r'(?<![A-Z0-9])MS\s*([679])\s*001\s*([A-Z]{1,3})?', raw)
+    ms_model = re.search(r'(?<![A-Z0-9])MS\s*([5679])\s*001\s*([A-Z]{1,3})?', raw)
     if ms_model:
         frame, suffix = ms_model.group(1), ms_model.group(2) or ''
         return f'{frame}{suffix}' if suffix else f'MS{frame}001'
 
-    fs_model = re.search(r'(?<![A-Z0-9])FS\s*[.\-]?\s*([679])(?!\d)', raw)
+    fs_model = re.search(r'(?<![A-Z0-9])FS\s*[.\-]?\s*([5679])(?!\d)', raw)
     if fs_model:
         return f'MS{fs_model.group(1)}001'
 
@@ -1930,6 +1967,51 @@ def review_report(filename, data, ocr=True):
     return rtype, parsed, findings
 
 
+def find_duplicate_compositions(reports, min_common=5):
+    """Cross-report check: near-identical Actual composition across different
+    job numbers.
+
+    A single-report review can never see this — it only becomes visible
+    across a batch. Independent EDS/ICP analysis of two different physical
+    parts is not expected to match on every reported element to the exact
+    reported decimal; when it does, the composition table was very likely
+    copied from another report instead of entered from that job's own
+    results. Found on a real 27-report batch: two different AEG job numbers
+    (different customer references, serial numbers, sign-off engineers and
+    dates) carried a byte-identical Actual composition across all 9 matched
+    elements.
+
+    `reports` is [(filename, parsed), ...] as returned by review_report() for
+    each metallurgical report in the batch. Returns (severity, category,
+    message) findings naming both reports in every matching pair.
+    """
+    findings = []
+    entries = []
+    for name, parsed in reports:
+        actual = (parsed or {}).get('actual')
+        job = _txt(((parsed or {}).get('header') or {}).get('job'))
+        if actual and len(actual) >= min_common:
+            entries.append((name, job, actual))
+
+    for i in range(len(entries)):
+        name_a, job_a, actual_a = entries[i]
+        for j in range(i + 1, len(entries)):
+            name_b, job_b, actual_b = entries[j]
+            if job_a and job_b and job_a == job_b:
+                continue   # same job — a revision/re-upload, not a copy-paste signal
+            common = set(actual_a) & set(actual_b)
+            if len(common) < min_common:
+                continue
+            if all(actual_a[el] == actual_b[el] for el in common):
+                findings.append(('critical', 'Composition',
+                                 f'"{name_a}" (job {job_a or "?"}) and "{name_b}" '
+                                 f'(job {job_b or "?"}) report an identical Actual '
+                                 f'composition on all {len(common)} matched element(s) — '
+                                 f'independent lab results are not expected to match '
+                                 f'exactly; verify one wasn\'t copied from the other.'))
+    return findings
+
+
 def summarize(findings):
     """Return counts per severity."""
     out = {'critical': 0, 'warning': 0, 'info': 0, 'pass': 0}
@@ -2048,12 +2130,7 @@ def collect_highlights(parsed):
     result = smp.get('result') or ''
     comment = parsed.get('comment') or ''
     if 'see comment' in result.lower():
-        has_negative = bool(re.search(
-            r'not\s+suitable|unsuitable|not\s+recommend|\breject|\bscrap|'
-            r'beyond\s+repair|non[-\s]?conform|unacceptable', comment, re.I))
-        has_positive = bool(re.search(
-            r'(?<!not )(?:\bsuitable for|\bacceptable|recommended for|'
-            r'reconditi|fit for service|return to service)', comment, re.I))
+        has_positive, has_negative = _comment_disposition(comment)
         if not has_negative and not has_positive:
             note = ('Result says "See comment", but the comment gives no clear '
                     'accept / reject / repair disposition.')
@@ -2147,10 +2224,12 @@ def main():
     if len(sys.argv) < 2:
         print(__doc__)
         sys.exit(1)
+    reports = []
     for path in sys.argv[1:]:
         with open(path, 'rb') as f:
             data = f.read()
         rtype, parsed, findings = review_report(path, data)
+        reports.append((path, parsed))
         counts = summarize(findings)
         print('=' * 78)
         print(f'{path}')
@@ -2163,6 +2242,15 @@ def main():
         for lg in parsed.get('legends', []):
             bits = [lg[k] for k in ('id', 'mag', 'scale') if lg.get(k)]
             print(f'     · {lg["image"]}: {"  ".join(bits)}')
+
+    if len(reports) > 1:
+        cross_findings = find_duplicate_compositions(reports)
+        if cross_findings:
+            print('=' * 78)
+            print('CROSS-REPORT (batch-only) findings:')
+            for sev, cat, msg in cross_findings:
+                tag = {'critical': 'FAIL', 'warning': 'WARN', 'info': 'INFO', 'pass': 'OK  '}[sev]
+                print(f'   [{tag}] {cat}: {msg}')
 
 
 if __name__ == '__main__':
