@@ -1731,7 +1731,8 @@ def _canon_machine(text):
     """Canonical machine/set designation from a filename or report header.
 
     The aliases below reflect the forms used by the supplied reports:
-    FS.7 ≡ MS7001 and 7FA ≡ MS7001FA. V-series names remain explicit.
+    FS.7 ≡ MS7001, FS.7FA ≡ MS7001FA, and 7FA ≡ MS7001FA. V-series names
+    remain explicit.
 
     GE heavy-duty frame sizes include 5 as well as 6/7/9 — a real report in a
     27-report batch used "FS.5", which the frame digit class here originally
@@ -1750,9 +1751,16 @@ def _canon_machine(text):
         frame, suffix = ms_model.group(1), ms_model.group(2) or ''
         return f'{frame}{suffix}' if suffix else f'MS{frame}001'
 
-    fs_model = re.search(r'(?<![A-Z0-9])FS\s*[.\-]?\s*([5679])(?!\d)', raw)
+    # The FS.<frame> form can carry the same variant suffix glued on directly
+    # (e.g. "FS.7FA"), exactly like the bare short_f form below — a report
+    # title stating "FS.7FA" is a full, correct match for an internal
+    # "MS7001FA" Machine Type. The suffix group used to be missing here, so
+    # a title that fully and correctly named the variant was truncated to
+    # "FS.7" and then reported as disagreeing with its own content.
+    fs_model = re.search(r'(?<![A-Z0-9])FS\s*[.\-]?\s*([5679])([A-Z]{1,3})?(?!\d)', raw)
     if fs_model:
-        return f'MS{fs_model.group(1)}001'
+        frame, suffix = fs_model.group(1), fs_model.group(2) or ''
+        return f'{frame}{suffix}' if suffix else f'MS{frame}001'
 
     short_f = re.search(r'(?<![A-Z0-9])([679])\s*F\s*([A-Z]?)(?![A-Z0-9])', raw)
     if short_f:

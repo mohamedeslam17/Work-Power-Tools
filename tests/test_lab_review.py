@@ -495,6 +495,37 @@ class LabReviewRegressionTests(unittest.TestCase):
                     for message in messages(findings, "pass")
                 ))
 
+    def test_fs_dot_frame_variant_suffix_is_captured(self):
+        # A real report's title was "FS.7FA" -- a fully correct, explicit
+        # match for an internal Machine Type of "MS7001FA". _canon_machine's
+        # FS.<frame> branch never captured a trailing suffix (only the bare
+        # "7FA" form did), so the title was truncated to "MS7001" and then
+        # reported as disagreeing with its own, entirely correct, content.
+        self.assertEqual(_canon_machine('FS.7FA'), '7FA')
+        self.assertEqual(_canon_machine('MS7001FA'), '7FA')
+        # A bare "FS.7" (no stated suffix) still canonicalises the old way.
+        self.assertEqual(_canon_machine('FS.7'), 'MS7001')
+
+    def test_fs_dot_frame_variant_matches_internal_machine_type(self):
+        parsed = {
+            "header": {"job": "6579", "machine": "MS7001FA", "customer": "AEN Saudi"},
+            "sample": {"description": "3rd Stage Bucket"},
+        }
+
+        findings = review_filename(
+            "6579 AEN Saudi FS.7FA 3rd Stage Bucket Metallurgical Report.xlsx",
+            parsed,
+            "metallurgical",
+        )
+
+        self.assertFalse(any(
+            severity in ("critical", "warning") and category == "Title identity"
+            for severity, category, _message in findings
+        ))
+        self.assertTrue(any(
+            "machine/set" in message for message in messages(findings, "pass")
+        ))
+
     def test_frame_5_machine_alias_is_recognised(self):
         # _canon_machine restricted the GE frame digit to [679]; a real report
         # in a 27-report batch used "FS.5" (GE Frame 5 exists — MS5001), which

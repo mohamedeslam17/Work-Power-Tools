@@ -267,6 +267,15 @@ buckets, vanes and nozzles) surfaced two more classes of issue:
   list), so the machine/set cross-check silently produced no finding at all
   for that report instead of matching or flagging it. Frame 5 is now
   recognised alongside 6/7/9.
+* **`_canon_machine`'s `FS.<frame>` branch silently dropped the variant
+  suffix.** A real report's title was "FS.7FA" — a fully correct, explicit
+  match for its internal Machine Type "MS7001FA" — but only the bare `7FA`
+  form (no "FS." prefix) captured a trailing suffix; the `FS.` branch matched
+  first and returned just `MS7001`, truncating a title that was already
+  100% correct and then reporting it as disagreeing with its own content.
+  The frame number and the variant suffix (FA/B/EA/…) are both real
+  discriminators and are now captured the same way regardless of which
+  prefix form (`FS.`, `MS`, or bare) the title uses, for every frame size.
 
 **New capability: cross-report duplicate-composition detection.** No
 single-report check can catch this — it only appears once you diff a batch.
