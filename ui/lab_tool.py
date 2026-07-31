@@ -5,6 +5,7 @@ from pathlib import Path
 
 import streamlit as st
 
+import composition_store
 import report_render
 from lab_review import review_report, find_duplicate_compositions
 from photo_lib import add_to_library
@@ -30,6 +31,16 @@ def _cached_review(name, data, ocr):
     """Parse + rule-check one report. Cached on the file bytes so filtering
     findings afterwards never re-parses the workbook."""
     return review_report(name, data, ocr=ocr)
+
+
+@st.cache_data(show_spinner=False)
+def _cached_composition_history(name, data, parsed):
+    """Cross-SESSION duplicate-composition check against every previously
+    reviewed report, then records this one into that history (idempotent per
+    job number) — so a report reviewed alone today can still be caught
+    copying one reviewed weeks ago. Cached on file bytes so a Streamlit
+    rerun doesn't re-hit the storage backend or write a duplicate entry."""
+    return composition_store.check_and_record(name, parsed)
 
 
 @st.cache_data(show_spinner=False)
@@ -128,6 +139,9 @@ def render():
         try:
             with st.spinner(f"Reviewing {f.name}…"):
                 rtype, parsed, findings = _cached_review(f.name, f.getvalue(), ocr)
+                if rtype == 'metallurgical':
+                    findings = findings + _cached_composition_history(
+                        f.name, f.getvalue(), parsed)
         except Exception as e:
             reviewed.append({'name': f.name, 'error': str(e)})
             continue
@@ -143,6 +157,11 @@ def render():
     ok = [r for r in reviewed if 'error' not in r]
     if not ok:
         return
+
+    if any(r['rtype'] == 'metallurgical' for r in ok):
+        st.caption(
+            f"Composition history (cross-session copy detection): "
+            f"**{composition_store.backend_name()}**")
 
     if len(ok) > 1:
         cross_findings = find_duplicate_compositions(

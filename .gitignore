@@ -10,5 +10,10 @@ __pycache__/
 photo_library/*
 !photo_library/.gitkeep
 
+# customer chemistry fingerprints (local composition-store backend) — same
+# rationale as photo_library/: keep the folder, not customer-derived data
+composition_store/*
+!composition_store/.gitkeep
+
 # Streamlit secrets (never commit)
 .streamlit/secrets.toml

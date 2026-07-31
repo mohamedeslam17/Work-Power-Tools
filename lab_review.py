@@ -2232,12 +2232,22 @@ def main():
     if len(sys.argv) < 2:
         print(__doc__)
         sys.exit(1)
+    # Lazy import: keeps the core reviewer (used by every caller, including
+    # the test suite) free of the gh_store/drive_store network dependency —
+    # only the CLI entry point needs cross-session history.
+    try:
+        import composition_store
+    except Exception:
+        composition_store = None
+
     reports = []
     for path in sys.argv[1:]:
         with open(path, 'rb') as f:
             data = f.read()
         rtype, parsed, findings = review_report(path, data)
         reports.append((path, parsed))
+        if composition_store is not None and rtype == 'metallurgical':
+            findings = findings + composition_store.check_and_record(path, parsed)
         counts = summarize(findings)
         print('=' * 78)
         print(f'{path}')

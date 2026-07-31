@@ -53,6 +53,37 @@ colour in the raster — so every numbered badge lands on the actual affected ce
 When several reports are uploaded, a compact report selector replaces the former
 batch table and keeps the review focused on one annotated report at a time.
 
+**Cross-session duplicate-composition detection.** A copied composition table
+(one report's Actual chemistry pasted into another instead of that job's own
+lab results) can't be caught by looking at one report alone, and reports
+aren't always uploaded together — most of the time it's one report per
+session. [`composition_store.py`](composition_store.py) gives the reviewer
+memory: every metallurgical report's fingerprint (job number, alloy,
+filename, Actual composition) is checked against **every previously
+reviewed report** — regardless of when it was reviewed — and then stored,
+so a report checked today can still be caught copying one checked weeks ago.
+A match requires a different job number and an exact match on every one of
+at least 5 commonly-reported elements (independent EDS/ICP results on two
+different parts are not expected to match to the reported decimal on that
+many elements by chance). Storage is pluggable and auto-selected exactly
+like the [photo library](#🖼️-photo-library-new) below — GitHub, Google
+Drive, or a local `composition_store/` folder — reusing each backend's
+auth/transport code but writing to its own path so the two indexes never
+collide. When several reports are uploaded together, the same check also
+runs *within* that batch via `lab_review.find_duplicate_compositions()`
+(surfaced as a banner above the report selector, and in `batch_review.py`'s
+aggregate report) — the persistent store and the in-batch check are
+independent and can both fire on the same pair.
+
+`batch_review.py` deliberately does **not** write into the persistent store
+— it's a one-off audit/tuning script, and auto-recording every corpus it's
+pointed at would pollute real production history with test-run data. Only
+the CLI (`lab_review.py`) and the Streamlit app record into it.
+
+```bash
+python3 composition_store.py report.xlsx [more.xlsx ...]   # check + record, standalone
+```
+
 ### 🖼️ Photo Library *(new)*
 Extracts the embedded micrographs from a reviewed report into a **per-alloy**
 folder structure with a JSON index, and serves an in-app gallery: pick an alloy
