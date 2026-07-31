@@ -67,9 +67,13 @@ at least 5 commonly-reported elements (independent EDS/ICP results on two
 different parts are not expected to match to the reported decimal on that
 many elements by chance). Storage is pluggable and auto-selected exactly
 like the [photo library](#🖼️-photo-library-new) below — GitHub, Google
-Drive, or a local `composition_store/` folder — reusing each backend's
-auth/transport code but writing to its own path so the two indexes never
-collide. When several reports are uploaded together, the same check also
+Drive, or a local `composition_store/` folder — **reusing whichever backend
+you've already configured for the photo library**, same secrets, zero extra
+setup: the GitHub backend commits `composition_index/fingerprints.json`
+into this repo, the Drive backend keeps its own "AEG Composition Index"
+folder (separate from "AEG Photo Library") using the same OAuth
+credentials. Only the storage *path* is different per backend, so the two
+indexes never collide. When several reports are uploaded together, the same check also
 runs *within* that batch via `lab_review.find_duplicate_compositions()`
 (surfaced as a banner above the report selector, and in `batch_review.py`'s
 aggregate report) — the persistent store and the in-batch check are
