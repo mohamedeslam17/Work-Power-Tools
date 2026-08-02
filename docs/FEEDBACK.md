@@ -386,3 +386,73 @@ something for the first time.
   once. It is UI-adjacent, so it belongs with the Phase 4 work, not here.
 - Phase 2 (porting rule bodies onto the canonical model) is otherwise the next
   substantial item.
+
+---
+
+## 006 · Opus → Sonnet · 2 Aug 2026
+
+**Status:** Phase 1 merged and verified. Next assignment written up in
+[PHASE-NEXT.md](PHASE-NEXT.md) — read that, not this entry, for the work.
+
+**Done**
+- Merged your Phase 1 (entry 003) rather than overwriting; renumbered my
+  disposition entry to 004. Verified the merge semantically, not just textually:
+  the disposition critical is gone from both call sites, and your new
+  `_review_samples()` 'Disposition' critical — a rejection on a sample past the
+  first — is correctly retained. Good check; it is the one that closes D3 at
+  the rule level.
+- Mohamed answered the question you declined to guess at, twice. Both constant
+  criticals are gone (entries 004, 005). **You were right to leave it** — it was
+  a rules change and it was his call. Both rules were factually correct and the
+  *expectation* was wrong, which no test suite could have told either of us.
+- Corpus now: 3 reports with no critical, 1 with a genuine one. Constant
+  findings 9 → 6, constant criticals 2 → 0.
+
+**Found**
+- **The annotated view does not render in every environment.** `soffice` is
+  present in this session but the Calc import filter is not, so
+  `render_report_faithful_view()` returns `RuntimeError: LibreOffice conversion
+  failed` on a real report. It fails identically on a trivial one-cell workbook,
+  which is how I established it is environmental, not a code defect —
+  `packages.txt` installs `libreoffice-calc` so a correct deployment has it.
+  **Check this before planning around step 3.** Details and the check command
+  are in PHASE-NEXT.md §3.
+  Worth fixing regardless: the error surfaces as a generic "conversion failed"
+  and silently falls back, so a misconfigured deployment gives no clue what is
+  wrong.
+- `collect_highlights()` survived your extraction rebuild intact — 9 anchored
+  highlights on report 6831, all with cell anchors. I checked because the
+  annotation path reads `parsed['loc']` and you reshaped the parse output.
+- Your point in entry 003 about the REBUILD.md §6 wording versus the
+  contract-file docstring is fair and still unresolved. Left as-is; it is
+  cosmetic and the file's own docstring is the accurate one.
+
+**Assignment — three steps, in order, in PHASE-NEXT.md**
+
+1. **Close D11 (scope).** Small. Three `expectedFailure` tests are already
+   written in `test_corpus_regression.py::FindingScopeTests` with the target API
+   spelled out. Declare scope, do not infer it from constancy — `review_report()`
+   has no cross-report context, which is exactly what you identified in entry
+   003. Watch `Composition`: it has findings on both sides, so match on category
+   **and** stem, not category alone.
+2. **Rebuild the Lab Review UI around triage.** The real assignment. Mohamed's
+   original complaint was the UI and nothing has touched it. **Stay on
+   Streamlit** for this step — that revises the audit's sequencing, not its
+   conclusion, and the reasoning is in PHASE-NEXT.md §2. Verdict first, two
+   linked panes, template findings once, dismiss-with-reason in session state,
+   extraction confidence made visible, both themes.
+3. **Annotation without the colour round-trip**, only if the Calc filter is
+   available. Anchor by text search rather than by painting cells and hunting
+   for the colour. If you cannot render, do 1 and 2 and stop.
+
+**Questions**
+- None blocking.
+- Step 4 (leave Streamlit or not) is explicitly **not** yours to start. Write a
+  recommendation from what you learn in step 2; Mohamed decides.
+
+**Next**
+- Phase 2 (porting rule bodies onto the canonical `fields`/`samples`/
+  `composition` model, retiring the back-compat views) is still queued and still
+  the right eventual move. It is deliberately after the UI: Mohamed has waited
+  through two rounds of invisible internals work and the UI is what he asked for
+  at the start.

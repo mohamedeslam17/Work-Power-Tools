@@ -13,20 +13,28 @@ python3 scripts/recover_corpus.py             # real reports -> corpus/ (gitigno
 python3 -m unittest discover -s tests -v      # baseline BEFORE you change anything
 ```
 
-Expected baseline: **59 tests, 16 expected failures, rest passing.**
+Expected baseline, with `requirements.txt` installed and the corpus
+recovered: **68 tests, 3 expected failures, rest passing** — the three are the
+D11 scope tests, which are step 1 of your assignment.
+
+**Current assignment: [PHASE-NEXT.md](PHASE-NEXT.md).** Phase 1 (extraction) is
+done and merged; that file supersedes REBUILD.md §5 for what to do now.
 
 **Recover the corpus first.** `tests/test_corpus_regression.py` runs against
 five real AEG reports and skips silently without them — and synthetic fixtures
 did not catch one single defect that the real files caught. Never commit or
 rename those files: they are customer documents, and the title-identity checks
 read the filename.
-`tests/test_report_render.py` needs PyMuPDF (`fitz`); if it is not installed
-that error is pre-existing and not yours.
+`tests/test_report_render.py` needs PyMuPDF (`fitz`) — it is in
+`requirements.txt`, so install those first or you will see an import error that
+is not yours. The annotated *view* additionally needs the LibreOffice Calc
+import filter, which is a separate thing and is missing in some environments —
+see PHASE-NEXT.md §3 before relying on it.
 
 Then read, in order:
 
-1. `docs/REBUILD.md` §2 (what is broken) and §4 (the model you are building)
-2. `tests/test_parser_contract.py` — your acceptance criteria, executable
+1. `docs/PHASE-NEXT.md` — the current assignment, in order
+2. `docs/REBUILD.md` §2 (the defect register) and §4 (the document model)
 3. `docs/FEEDBACK.md` — the last entry tells you where things stand
 
 ## The expected-failure mechanic
@@ -43,12 +51,11 @@ A red suite saying `unexpected successes=1` means you finished something.
 ## Ground rules
 
 **Scope**
-- Phase 1 only, as scoped in REBUILD.md §5, in the order given in FEEDBACK.md
-  entry 002 (which supersedes entry 001). Do not start Phase 2+ without
-  raising it in FEEDBACK.md first.
-- Do not touch `sem_convert.py`, the rule bodies, or `.streamlit/`.
-- No UI changes in Phase 1. The point is to prove the extraction fix in
-  isolation.
+- Whatever `PHASE-NEXT.md` currently scopes, in the order it gives. Do not
+  start anything past it without raising it in FEEDBACK.md first.
+- Do not touch `sem_convert.py`.
+- Phase 1 is finished; its "no UI changes" rule no longer applies — the UI is
+  now the assignment.
 
 **Tests**
 - Never delete or weaken an existing test. Each marks a real defect found on a

@@ -197,15 +197,57 @@ class FindingScopeTests(unittest.TestCase):
             "a critical that fires on 100% of reports hides the real ones")
 
     @unittest.expectedFailure
-    def test_report_specific_findings_outnumber_constant_ones(self):
-        """D11. A review's output should be mostly about the report in hand."""
-        constant, per = self._constant_findings()
-        for job, keys in per.items():
-            with self.subTest(job=job):
-                specific = len(keys - constant)
-                self.assertGreater(
-                    specific, len(keys & constant),
-                    f"{job}: {len(keys & constant)} constant vs {specific} specific")
+    def test_scope_partitioning_exists(self):
+        """D11, remaining work. Six findings still fire on all four reports —
+        four warnings and two infos. None is wrong; each says the TEMPLATE has
+        no field for something (test method, controlled report number,
+        sequential page numbers, a sampling plan, matching element sets).
+
+        Unlike the two criticals, these should NOT be deleted — they are real
+        gaps worth fixing at source. They should be said ONCE, about the
+        template, instead of on every report forever.
+
+        Target API, deliberately declarative and in one place so no rule body
+        changes and the mapping is reviewable:
+
+            lab_review.TEMPLATE_SCOPED          # ((category, stem_pattern), ...)
+            lab_review.partition_by_scope(findings) -> (report, template)
+        """
+        report, template = L.partition_by_scope(review(MET["6831"])[2])
+        self.assertTrue(template, "nothing was classified as template-scoped")
+        self.assertTrue(report, "everything was classified as template-scoped")
+
+    @unittest.expectedFailure
+    def test_no_report_scoped_finding_is_constant_across_the_corpus(self):
+        """D11's real acceptance criterion. After partitioning, a finding that
+        survives into the per-report list must be capable of being absent from
+        some other report. Anything constant belongs in the template bucket."""
+        per = {}
+        for job, name in MET.items():
+            report, _template = L.partition_by_scope(review(name)[2])
+            per[job] = stems(report)
+        counts = Counter(k for keys in per.values() for k in keys)
+        constant = sorted(k for k, c in counts.items() if c == len(MET))
+        self.assertEqual(constant, [], "these are template-scoped, not report-scoped")
+
+    @unittest.expectedFailure
+    def test_template_findings_are_identical_across_reports(self):
+        """The other half: the template bucket should be stable, because it
+        describes the template, not the report. If it varies per report, the
+        classification is picking up report content by mistake."""
+        buckets = []
+        for name in MET.values():
+            _report, template = L.partition_by_scope(review(name)[2])
+            buckets.append(frozenset(stems(template)))
+        self.assertEqual(len(set(buckets)), 1, f"template bucket varies: {buckets}")
+
+    def test_the_genuine_critical_stays_report_scoped(self):
+        """Guard: whatever scoping does, 6943's duplicated serial must remain a
+        per-report finding. It is the one true critical in the corpus."""
+        findings = review(MET["6943"])[2]
+        crit = [m for s, _c, m in findings if s == "critical"]
+        self.assertTrue(any("uplicate" in m for m in crit),
+                        "the duplicated-serial critical disappeared")
 
 
 if __name__ == "__main__":
