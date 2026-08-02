@@ -35,6 +35,7 @@ import zipfile
 from collections import Counter
 
 import openpyxl
+from openpyxl.utils import get_column_letter
 
 # Optional OCR / imaging stack. The reviewer works without it — legend, etch
 # and thickness reading from micrographs are skipped gracefully when Pillow /
@@ -163,9 +164,16 @@ _EXCEL_ERRORS = {
 }
 _NOT_QUANTIFIED = re.compile(
     r'^(?:<\s*(?:lod|loq|mdl)|(?:below|under)\s+(?:detection|quantification)'
-    r'|not\s+detected|n\.?d\.?)$',
+    r'|not\s+detected|n\.?d\.?|[<≤]\s*\d[\d.,]*)$',
     re.I,
 )
+# Words that mark a digit as part of a cross-reference (a note/revision
+# number) rather than a measurement. `_num()` must not promote these to a
+# fabricated numeric result (D5).
+_NUM_REJECT = re.compile(r'\b(?:note|rev|revision|see|pending)\b', re.I)
+# A left-censored / below-detection-limit numeric form, e.g. '<0.01' — this
+# means "not quantified", not "equal to 0.01" (D5).
+_BELOW_LOD_NUMERIC = re.compile(r'^[<≤]\s*-?\d')
 
 
 # ── Low-level cell helpers ────────────────────────────────────────────────
@@ -214,6 +222,164 @@ def _value_below(ws, row, col, max_scan=6):
     return _value_below_loc(ws, row, col, max_scan)[0]
 
 
+# ── Label→value resolution engine ─────────────────────────────────────────
+# `_find()` above answers "where does this pattern appear on the sheet" and is
+# still right for structural markers (report-type sniffing, table anchors,
+# composition markers) where the pattern is meant to hit inside a longer
+# string. Individual scalar fields need a stricter question: "is this cell
+# ITSELF the label" — otherwise a sentence that merely mentions the label's
+# words captures the field (D2), and the value scan needs to stop at the next
+# label rather than walking onto it (D9) or a neighbouring field's own value.
+#
+# Two different strictness levels are used deliberately:
+#   * `_find_label` / `_label_match` — strict, used to LOCATE a field's own
+#     label. A match must consume (almost) the whole cell; prose that merely
+#     contains the label text is rejected.
+#   * the boundary index built by `_build_boundary_index` — permissive by
+#     design, used only to STOP a value scan early. Stopping one cell too
+#     soon just yields "not found", which is far safer than the scan
+#     wandering onto the wrong text (the actual shape of D9), so it is fine
+#     for this set to occasionally include a false positive.
+_HEADER_LABELS = {
+    'customer':     r'Customer',
+    'customer_ref': r'Customer\s*Ref(?:erence)?\.?\s*(?:No\.?|Number)?',
+    'aeg_ref':      r'AEG\s*Ref(?:erence)?\.?\s*(?:No\.?|Number)?',
+    'job':          r'AEG\s*Job\s*(?:No\.?|Number)?',
+    'machine':      r'Machine\s*Type',
+    'qty':          r'Quantity(?:\s*per\s*(?:set|batch))?',
+    'eoh':          r'EOH',
+}
+_HARDNESS_LABELS = {'pre': r'Pre-?\s*Solution', 'post': r'Post-?\s*Solution'}
+_COATING_LABELS = {
+    'present':  r'^Coating\s*$',
+    'type':     r'^Type of Coating',
+    'received': r'Received\s*Coating',
+    'outgoing': r'Outgoing\s*Coating',
+}
+_SIGNOFF_LABELS = {
+    'met_lab': r'Met\.?\s*Lab',
+    'mat_eng': r'(?:Mat|Met)\.?\s*Eng',
+    'date':    r'^Date\s*:',
+}
+_COMMENT_LABEL = r'Comments?'
+_SAMPLE_HEADER_LABEL = r'Sample\s*nr'
+_PICTURE_LABEL = r'Picture\s*\d+'
+_COMPOSITION_LABELS = (r'\(\s*(?:Nominal|Minimal)\s*\)', r'\(\s*Actual\s*\)')
+
+
+def _cell_label_text(v):
+    """Cell text with one optional trailing ':' removed, or None if blank."""
+    t = _txt(v)
+    if not t:
+        return None
+    return t[:-1].rstrip() if t.endswith(':') else t
+
+
+def _label_match(pattern, text):
+    """Whether `text` (already colon-stripped) IS the label `pattern` names,
+    not merely prose that mentions it — the pattern must consume the cell;
+    whatever it leaves behind must carry no further letters or digits."""
+    m = re.match(pattern, text, re.I)
+    return bool(m) and not re.search(r'[A-Za-z0-9]', text[m.end():])
+
+
+def _find_label(ws, pattern):
+    """(row, col) of the first cell that IS the label `pattern` names."""
+    for row in ws.iter_rows():
+        for cell in row:
+            text = _cell_label_text(cell.value)
+            if text and _label_match(pattern, text):
+                return cell.row, cell.column
+    return None
+
+
+def _build_boundary_index(ws):
+    """(row, col) set of every cell that looks like SOME label — the stop-set
+    for value scans. Built once per sheet and shared across every field."""
+    strict = (list(_HEADER_LABELS.values())
+              + [_COMMENT_LABEL, _SAMPLE_HEADER_LABEL, _PICTURE_LABEL])
+    loose = (list(_HARDNESS_LABELS.values()) + list(_COATING_LABELS.values())
+             + list(_SIGNOFF_LABELS.values()) + list(_COMPOSITION_LABELS))
+    boundary = set()
+    for row in ws.iter_rows():
+        for cell in row:
+            text = _cell_label_text(cell.value)
+            if not text:
+                continue
+            if any(_label_match(pattern, text) for pattern in strict):
+                boundary.add((cell.row, cell.column))
+                continue
+            full = _txt(cell.value)
+            if any(re.search(pattern, full, re.I) for pattern in loose):
+                boundary.add((cell.row, cell.column))
+    return boundary
+
+
+def _scan_right(ws, row, col, boundary, max_scan=12):
+    for c in range(col + 1, col + 1 + max_scan):
+        if (row, c) in boundary:
+            break
+        t = _txt(ws.cell(row=row, column=c).value)
+        if t:
+            return t, (row, c)
+    return None, None
+
+
+def _scan_below(ws, row, col, boundary, max_scan=6):
+    for r in range(row + 1, row + 1 + max_scan):
+        if (r, col) in boundary:
+            break
+        t = _txt(ws.cell(row=r, column=col).value)
+        if t:
+            return t, (r, col)
+    return None, None
+
+
+def _resolve_label_value(ws, row, col, boundary, primary='right', max_right=12, max_below=6):
+    """Value for the label at (row, col): the primary direction first, the
+    other as a fallback (D10 — some template variants stack the value below
+    the label instead of beside it). Never crosses a boundary cell (D9)."""
+    order = ((_scan_right, max_right), (_scan_below, max_below))
+    if primary == 'below':
+        order = order[::-1]
+    for scan_fn, max_scan in order:
+        val, loc = scan_fn(ws, row, col, boundary, max_scan)
+        if val is not None:
+            return val, loc
+    return None, None
+
+
+def _coord(loc):
+    if not loc:
+        return None
+    row, col = loc
+    return f'{get_column_letter(col)}{row}'
+
+
+def _resolve_field(ws, pattern, boundary, primary='right'):
+    """A single scalar field's full record: value/raw/cell/status/confidence
+    (the D1 fix) via the strict label finder and boundary-aware value scan.
+
+    status: 'found' (label + value both present), 'empty' (label located,
+    value cell genuinely blank — a report defect) or 'not_located' (label
+    itself never found — an extraction failure, never a finding about the
+    report).
+    """
+    lbl = _find_label(ws, pattern)
+    if not lbl:
+        return ({'value': None, 'raw': None, 'cell': None,
+                 'status': 'not_located', 'confidence': 0.0},
+                {'label': None, 'value': None})
+    raw, vloc = _resolve_label_value(ws, lbl[0], lbl[1], boundary, primary=primary)
+    if raw is None:
+        return ({'value': None, 'raw': None, 'cell': None,
+                 'status': 'empty', 'confidence': 1.0},
+                {'label': lbl, 'value': None})
+    return ({'value': raw, 'raw': raw, 'cell': _coord(vloc),
+             'status': 'found', 'confidence': 1.0},
+            {'label': lbl, 'value': vloc})
+
+
 def _is_placeholder(v):
     text = _txt(v)
     return text.lower() in _PLACEHOLDERS or text.upper() in _EXCEL_ERRORS
@@ -259,12 +425,21 @@ def _formula_issues(wb):
 def _num(v):
     """Parse a float from a cell that may carry units/symbols. Handles both the
     English '12.5' / '1,234.56' and the European '12,5' / '1.234,56' forms
-    (common on Italian-lab reports); returns None when there's no number."""
+    (common on Italian-lab reports); returns None when there's no number.
+
+    Deliberately refuses two shapes that used to fabricate a measurement
+    (D5): a digit that is really a cross-reference ('see note 3' -> 3.0), and
+    a left-censored below-detection-limit value ('<0.01' -> 0.01, silently
+    losing the below-LOD meaning). Both must come back None, not a number.
+    """
     if v is None:
         return None
     if isinstance(v, (int, float)):
         return float(v)
-    m = re.search(r'-?\d[\d.,  ]*\d|-?\d', str(v))
+    text = str(v).strip()
+    if _BELOW_LOD_NUMERIC.match(text) or _NUM_REJECT.search(text):
+        return None
+    m = re.search(r'-?\d[\d.,  ]*\d|-?\d', text)
     if not m:
         return None
     s = re.sub(r'[ \s]', '', m.group())     # drop spaces / non-breaking spaces
@@ -337,30 +512,30 @@ def _met_sheet(wb):
     return wb.worksheets[0]
 
 
-def _header(ws):
-    out, loc = {}, {}
-    labels = {
-        'customer':     r'^Customer\s*:',
-        'customer_ref': r'Customer\s*Ref',
-        'aeg_ref':      r'AEG.*Ref',
-        'job':          r'AEG.*Job',
-        'machine':      r'Machine\s*Type',
-        'qty':          r'Quantity',
-        'eoh':          r'\bEOH\b',
-    }
-    for key, pat in labels.items():
-        lbl = _find(ws, pat)
-        if lbl:
-            out[key], vloc = _value_right_loc(ws, *lbl)
-            loc[key] = {'label': lbl, 'value': vloc}
-    return out, loc
+def _header(ws, boundary):
+    """Header fields, both as the back-compat {key: value} view and as full
+    {key: {value, raw, cell, status, confidence}} records (the D1 fix)."""
+    fields, out, loc = {}, {}, {}
+    for key, pat in _HEADER_LABELS.items():
+        rec, lc = _resolve_field(ws, pat, boundary, primary='right')
+        fields[key] = rec
+        out[key] = rec['value']
+        loc[key] = lc
+    return fields, out, loc
 
 
-def _sample(ws):
+def _samples(ws, boundary):
+    """Every row of the sample table, not just the first (D3).
+
+    A row belongs to the table as long as its `sample nr` cell (the table's
+    primary column) is non-empty and is not itself another label — the first
+    blank or label-boundary cell in that column ends the table, so a later
+    section that happens to reuse the same column is never mistaken for more
+    sample rows.
+    """
     hdr = _find(ws, r'Sample\s*nr')
-    out, loc = {}, {}
     if not hdr:
-        return out, loc
+        return [], []
     hrow = hdr[0]
     headers = {}
     for cell in ws[hrow]:
@@ -368,21 +543,37 @@ def _sample(ws):
         if t:
             headers[t] = cell.column
 
-    def below(substr):
+    def col_for(substr):
         for h, c in headers.items():
             if substr in h:
-                val, vloc = _value_below_loc(ws, hrow, c)
-                return val, {'label': (hrow, c), 'value': vloc}
-        return None, None
+                return c
+        return None
 
-    for key, substr in (('sample_no', 'sample nr'), ('description', 'description'),
-                        ('serial', 's/n'),
-                        ('location', 'location'), ('material', 'material'),
-                        ('result', 'result')):
-        out[key], lc = below(substr)
-        if lc:
-            loc[key] = lc
-    return out, loc
+    field_cols = [(key, col_for(substr)) for key, substr in (
+        ('sample_no', 'sample nr'), ('description', 'description'),
+        ('serial', 's/n'), ('location', 'location'),
+        ('material', 'material'), ('result', 'result'))]
+    field_cols = [(key, col) for key, col in field_cols if col is not None]
+    if not field_cols:
+        return [], []
+    primary_col = field_cols[0][1]
+
+    samples, locs = [], []
+    max_row = min(ws.max_row, hrow + 500)
+    for r in range(hrow + 1, max_row + 1):
+        if (r, primary_col) in boundary:
+            break
+        if not _txt(ws.cell(row=r, column=primary_col).value):
+            break
+        row_vals, row_loc = {}, {}
+        for key, col in field_cols:
+            v = _txt(ws.cell(row=r, column=col).value)
+            if v:
+                row_vals[key] = v
+                row_loc[key] = {'label': (hrow, col), 'value': (r, col)}
+        samples.append(row_vals)
+        locs.append(row_loc)
+    return samples, locs
 
 
 def _hardness_unit(raw):
@@ -391,49 +582,54 @@ def _hardness_unit(raw):
     return m.group(1).upper() if m else None
 
 
-def _hardness(ws):
+def _hardness(ws, boundary):
     out, loc = {}, {}
-    for key, pat in (('pre', r'Pre-?\s*Solution'), ('post', r'Post-?\s*Solution')):
+    for key, pat in _HARDNESS_LABELS.items():
         lbl = _find(ws, pat)
         if lbl:
-            raw, vloc = _value_right_loc(ws, *lbl)
+            raw, vloc = _resolve_label_value(ws, lbl[0], lbl[1], boundary, primary='right')
             out[key] = {'raw': raw, 'value': _num(raw), 'unit': _hardness_unit(raw)}
             loc[key] = {'label': lbl, 'value': vloc}
     return out, loc
 
 
-def _coating(ws):
+def _coating(ws, boundary):
     """Coating presence / type as recorded in the structured cells."""
     out = {'present': None, 'type': None, 'received': None, 'outgoing': None}
     loc = {}
-    for key, pat in (('present', r'^Coating\s*$'),
-                     ('type', r'^Type of Coating'),
-                     ('received', r'Received\s*Coating'),
-                     ('outgoing', r'Outgoing\s*Coating')):
+    for key, pat in _COATING_LABELS.items():
         lbl = _find(ws, pat)
         if lbl:
-            out[key], vloc = _value_below_loc(ws, *lbl)
+            out[key], vloc = _resolve_label_value(ws, lbl[0], lbl[1], boundary, primary='below')
             loc[key] = {'label': lbl, 'value': vloc}
     return out, loc
 
 
-def _composition(ws, which):
-    """Extract numeric composition plus the table's raw/header metadata.
+def _find_all(ws, pattern):
+    """(row, col) of every cell whose text matches `pattern` — used where the
+    report legitimately has more than one instance (composition tables, D4)."""
+    rx = re.compile(pattern, re.I)
+    hits = []
+    for row in ws.iter_rows():
+        for cell in row:
+            t = _txt(cell.value)
+            if t and rx.search(t):
+                hits.append((cell.row, cell.column))
+    return hits
+
+
+def _composition_one_table(ws, lbl):
+    """Parse the single composition table anchored at label cell `lbl`.
 
     Handles the two layouts seen in practice: element headers in the
     '(Nominal/Actual)' label row with values below, OR element headers in the
-    row above the label with values in the label row. Tolerates the 'Minimal'
-    typo for 'Nominal'.
+    row above the label with values in the label row. Returns None if the
+    label isn't actually sitting next to an element-header row (a stray
+    mention rather than a real table).
     """
-    pat = r'\(\s*(?:Nominal|Minimal)\s*\)' if which == 'Nominal' else r'\(\s*Actual\s*\)'
-    lbl = _find(ws, pat)
-    comp, loc = {}, {}
-    meta = {'entries': [], 'duplicate_headers': []}
-    if not lbl:
-        return comp, loc, meta
-    lrow = lbl[0]
-    meta['label_text'] = _txt(ws.cell(row=lbl[0], column=lbl[1]).value)
-    meta['label_cell'] = ws.cell(row=lbl[0], column=lbl[1]).coordinate
+    lrow, lcol = lbl
+    label_text = _txt(ws.cell(row=lrow, column=lcol).value)
+    label_cell = ws.cell(row=lrow, column=lcol).coordinate
 
     def elem_cells(r):
         return [c for c in ws[r] if r >= 1 and _txt(c.value).capitalize() in ELEMENTS]
@@ -443,11 +639,12 @@ def _composition(ws, which):
     elif lrow > 1 and len(elem_cells(lrow - 1)) >= 2:   # elements above, values in label row
         ehdr, vrow = lrow - 1, lrow
     else:
-        return comp, loc, meta
+        return None
 
     header_cells = elem_cells(ehdr)
     counts = Counter(_txt(cell.value).capitalize() for cell in header_cells)
-    meta['duplicate_headers'] = sorted(el for el, count in counts.items() if count > 1)
+    duplicate_headers = sorted(el for el, count in counts.items() if count > 1)
+    values, loc, entries = {}, {}, []
     for cell in header_cells:
         raw = ws.cell(row=vrow, column=cell.column).value
         val = _num(raw)
@@ -461,20 +658,43 @@ def _composition(ws, which):
             'row': vrow,
             'col': cell.column,
         }
-        meta['entries'].append(entry)
+        entries.append(entry)
         if val is not None:
-            comp[el] = val
+            values[el] = val
             loc[el] = (vrow, cell.column)
         elif el not in loc:
             loc[el] = (vrow, cell.column)
-    return comp, loc, meta
+    return {
+        'label_cell': label_cell,
+        'label_text': label_text,
+        'header_row': ehdr,
+        'value_row': vrow,
+        'values': values,
+        'loc': loc,
+        'entries': entries,
+        'duplicate_headers': duplicate_headers,
+    }
 
 
-def _comment(ws):
-    lbl = _find(ws, r'^Comments?\s*:')
+def _composition_tables(ws, which):
+    """Every '(Nominal/Actual)' composition table on the sheet, not just the
+    first (D4). Tolerates the 'Minimal' typo for 'Nominal'."""
+    pat = r'\(\s*(?:Nominal|Minimal)\s*\)' if which == 'Nominal' else r'\(\s*Actual\s*\)'
+    tables = []
+    for lbl in _find_all(ws, pat):
+        table = _composition_one_table(ws, lbl)
+        if table is not None:
+            tables.append(table)
+    return tables
+
+
+def _comment(ws, boundary=None):
+    if boundary is None:
+        boundary = _build_boundary_index(ws)
+    lbl = _find_label(ws, _COMMENT_LABEL)
     if not lbl:
         return None, {}
-    val, vloc = _value_below_loc(ws, *lbl)
+    val, vloc = _resolve_label_value(ws, lbl[0], lbl[1], boundary, primary='below')
     return val, {'label': lbl, 'value': vloc}
 
 
@@ -490,35 +710,50 @@ def _pictures(ws):
     return pics, loc
 
 
-def _signoff(ws):
+def _signoff(ws, boundary):
     out, loc = {}, {}
-    for key, pat in (('met_lab', r'Met\.?\s*Lab'),
-                     ('mat_eng', r'(?:Mat|Met)\.?\s*Eng'),
-                     ('date',    r'^Date\s*:')):
+    for key, pat in _SIGNOFF_LABELS.items():
         lbl = _find(ws, pat)
         if lbl:
-            out[key], vloc = _value_right_loc(ws, *lbl)
+            raw, vloc = _resolve_label_value(ws, lbl[0], lbl[1], boundary, primary='right')
+            out[key] = raw
             loc[key] = {'label': lbl, 'value': vloc}
     return out, loc
 
 
 def parse_metallurgical(wb, media=0, micrograph_count=None):
     ws = _met_sheet(wb)
-    header, lh    = _header(ws)
-    sample, ls    = _sample(ws)
-    hardness, lhd = _hardness(ws)
-    nominal, ln, nominal_meta = _composition(ws, 'Nominal')
-    actual, la, actual_meta    = _composition(ws, 'Actual')
-    coating, lc   = _coating(ws)
-    comment, lcm  = _comment(ws)
-    pictures, lp  = _pictures(ws)
-    signoff, lso  = _signoff(ws)
+    boundary = _build_boundary_index(ws)
+
+    fields, header, lh = _header(ws, boundary)
+    samples, ls = _samples(ws, boundary)
+    hardness, lhd = _hardness(ws, boundary)
+    nominal_tables = _composition_tables(ws, 'Nominal')
+    actual_tables = _composition_tables(ws, 'Actual')
+    coating, lc = _coating(ws, boundary)
+    comment, lcm = _comment(ws, boundary)
+    pictures, lp = _pictures(ws)
+    signoff, lso = _signoff(ws, boundary)
+
+    sample = samples[0] if samples else {}
+    empty_meta = {'entries': [], 'duplicate_headers': []}
+    nominal_meta = nominal_tables[0] if nominal_tables else empty_meta
+    actual_meta = actual_tables[0] if actual_tables else empty_meta
+
     return {
+        'samples':   samples,
+        'fields':    fields,
+        'composition': {
+            'nominal_tables': nominal_tables,
+            'actual_tables':  actual_tables,
+        },
+
+        # ── back-compat views, derived from the canonical data above ──────
         'header':    header,
         'sample':    sample,
         'hardness':  hardness,
-        'nominal':   nominal,
-        'actual':    actual,
+        'nominal':   nominal_tables[0]['values'] if nominal_tables else {},
+        'actual':    actual_tables[0]['values'] if actual_tables else {},
         'composition_meta': {
             'nominal': nominal_meta,
             'actual': actual_meta,
@@ -532,10 +767,11 @@ def parse_metallurgical(wb, media=0, micrograph_count=None):
         'loc': {
             'sheet':    ws.title,
             'header':   lh,
-            'sample':   ls,
+            'sample':   ls[0] if ls else {},
+            'samples':  ls,
             'hardness': lhd,
-            'nominal':  ln,
-            'actual':   la,
+            'nominal':  nominal_tables[0]['loc'] if nominal_tables else {},
+            'actual':   actual_tables[0]['loc'] if actual_tables else {},
             'coating':  lc,
             'comment':  lcm,
             'pictures': lp,
@@ -1213,6 +1449,25 @@ def _review_traceability(parsed):
     return findings
 
 
+def _review_samples(parsed):
+    """A rejection (or other disqualifying result) on any sample past the
+    first must not review clean (D3 — release-critical). Every other rule in
+    this module still works off the back-compat `sample` (== samples[0]);
+    this is the one check that looks at the rest of the table, closing the
+    specific gap the defect register calls out: samples 2..N previously never
+    reached any of the 20 checks."""
+    findings = []
+    for sample in (parsed.get('samples') or [])[1:]:
+        result = (sample.get('result') or '').strip()
+        if re.search(r'reject|scrap|non[-\s]?conform|unacceptable', result, re.I):
+            ident = sample.get('serial') or sample.get('sample_no') or '?'
+            findings.append((
+                'critical', 'Disposition',
+                f'Sample {ident}: result is "{result}" and must not be treated '
+                f'as passing because it is not the first row of the table.'))
+    return findings
+
+
 def _review_workbook_integrity(parsed):
     errors = parsed.get('excel_errors') or []
     formulas = parsed.get('formula_issues') or []
@@ -1391,6 +1646,7 @@ def review_metallurgical(parsed):
     findings += _review_workbook_integrity(parsed)
     findings += _review_completeness(parsed)
     findings += _review_traceability(parsed)
+    findings += _review_samples(parsed)
     findings += _review_sampling_basis(parsed)
     findings += _review_acceptance_and_methods(parsed)
     findings += _review_hardness(parsed['hardness'], parsed['sample'].get('material'))

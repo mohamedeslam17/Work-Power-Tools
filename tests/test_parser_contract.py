@@ -84,7 +84,6 @@ class ExtractionStatusTests(unittest.TestCase):
     present in the report but was missed by the label scan.
     """
 
-    @unittest.expectedFailure
     def test_found_empty_and_not_located_are_three_distinct_states(self):
         wb, ws = _met_sheet()                       # machine present
         found = L.parse_metallurgical(_load(wb))
@@ -102,7 +101,6 @@ class ExtractionStatusTests(unittest.TestCase):
         self.assertEqual(empty["fields"]["machine"]["status"], "empty")
         self.assertEqual(absent["fields"]["machine"]["status"], "not_located")
 
-    @unittest.expectedFailure
     def test_located_field_records_its_source_cell(self):
         wb, _ = _met_sheet()
         parsed = L.parse_metallurgical(_load(wb))
@@ -112,7 +110,6 @@ class ExtractionStatusTests(unittest.TestCase):
 # ── D2 · prose must not hijack a label ────────────────────────────────────
 class LabelResolutionTests(unittest.TestCase):
 
-    @unittest.expectedFailure
     def test_prose_mentioning_a_label_does_not_erase_the_field(self):
         """D2. One narrative line containing the words 'Machine Type' makes the
         whole-sheet scan match the prose instead of the real field."""
@@ -121,7 +118,6 @@ class LabelResolutionTests(unittest.TestCase):
         parsed = L.parse_metallurgical(_load(wb))
         self.assertEqual(parsed["header"].get("machine"), "V94.3A")
 
-    @unittest.expectedFailure
     def test_prose_decoy_does_not_produce_a_blank_field_finding(self):
         """D2, end to end: the fabricated finding must not reach the reviewer.
 
@@ -138,7 +134,6 @@ class LabelResolutionTests(unittest.TestCase):
         blank_claims = [m for _s, _c, m in findings if "achine type is blank" in m]
         self.assertEqual(blank_claims, [])
 
-    @unittest.expectedFailure
     def test_decoy_does_not_absorb_a_neighbouring_field_value(self):
         """D9, value variant. A decoy label whose row carries another field's
         value adopts that value: machine silently becomes the job number.
@@ -152,7 +147,6 @@ class LabelResolutionTests(unittest.TestCase):
         parsed = L.parse_metallurgical(_load(wb))
         self.assertNotEqual(parsed["header"].get("machine"), "J-1001")
 
-    @unittest.expectedFailure
     def test_blank_field_does_not_absorb_the_next_label(self):
         """D9. A genuinely blank field followed by another label on the same row
         reads that label as its own value — a confidently wrong string that no
@@ -168,7 +162,6 @@ class LabelResolutionTests(unittest.TestCase):
         self.assertIsNone(parsed["header"].get("machine"))
         self.assertEqual(parsed["header"].get("job"), "J-1001")
 
-    @unittest.expectedFailure
     def test_value_stacked_below_its_label_is_read(self):
         """D10. Header fields only ever scan rightward, so a template variant
         that stacks the value under the label loses every header field."""
@@ -198,7 +191,6 @@ class MultiSampleTests(unittest.TestCase):
     ever conflict, the corpus wins.
     """
 
-    @unittest.expectedFailure
     def test_every_sample_row_is_parsed(self):
         """D3, synthetic row-based variant. Only the first row under 'Sample nr'
         is read, so a rejection on sample 2 is invisible to all twenty checks."""
@@ -224,7 +216,6 @@ class MultiSampleTests(unittest.TestCase):
         self.assertIn("REJECT", [s.get("result") for s in parsed["samples"]])
         self.assertIn("GTD-111", [s.get("material") for s in parsed["samples"]])
 
-    @unittest.expectedFailure
     def test_a_rejected_later_sample_is_not_silently_passed(self):
         """D3, end to end. A report containing a rejection must not review clean."""
         wb, ws = _met_sheet()
@@ -249,7 +240,6 @@ class MultiSampleTests(unittest.TestCase):
 # ── D4 · every composition table must be parsed ───────────────────────────
 class CompositionTableTests(unittest.TestCase):
 
-    @unittest.expectedFailure
     def test_every_actual_table_is_extracted(self):
         """D4. Only the first '(Actual)' table is read. A second sample with
         grossly off-specification chemistry never reaches the checks."""
@@ -289,7 +279,6 @@ class CompositionTableTests(unittest.TestCase):
 # ── D5 · numeric coercion must not invent measurements ────────────────────
 class NumericCoercionTests(unittest.TestCase):
 
-    @unittest.expectedFailure
     def test_prose_does_not_yield_a_number(self):
         """D5. 'N/A (rev 2)' becomes 2.0 and enters the review as a hardness
         measurement with the same standing as a real reading."""
@@ -297,7 +286,6 @@ class NumericCoercionTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertIsNone(L._num(text))
 
-    @unittest.expectedFailure
     def test_below_detection_limit_is_not_a_plain_zero_point_zero_one(self):
         """D5. '<0.01' currently returns 0.01, losing the below-LOD meaning that
         the composition checks depend on."""
