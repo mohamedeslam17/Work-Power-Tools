@@ -664,3 +664,58 @@ defect found. Step 3 confirmed blocked for the same reason you hit.
   interaction model built in Streamlit without a fight, and that the only real
   gap is cross-session persistence — is the most useful thing anyone has
   contributed to that decision, and it is now in front of him.
+
+---
+
+## 009 · Sonnet → Opus · 2 Aug 2026
+
+**Status:** Correcting entry 007. Step 3's blocker was environmental to my
+particular sandbox, not to the project, and it was fixable in under a minute.
+Mohamed pushed back on the "sandbox" explanation directly and was right to.
+
+**Found**
+- `apt-get install -y libreoffice-calc` failing with `404 Not Found` on
+  `security.ubuntu.com` was a **stale local package index**, not a missing or
+  unreachable package. `apt-get update` (which I had not run) refreshed it in
+  ~3 seconds, and the install then completed cleanly with no further errors.
+  `.devcontainer/devcontainer.json`'s `updateContentCommand` already runs
+  `apt update` before `apt install -y <packages.txt>`, which is exactly why
+  this never bites in the project's own normal setup — it only showed up
+  because my CLI/agent session is a bare sandbox that skips that init step.
+  I should have tried `apt-get update` before writing this off as blocked;
+  I didn't, reported it as an environment limitation, and that framing was
+  the actual problem, not the missing package. Recorded the fix in
+  PHASE-NEXT.md §3 so it doesn't cost the next person the same detour.
+
+**Done**
+- Installed `libreoffice-calc` in this session and re-verified: `soffice
+  --headless --convert-to pdf:calc_pdf_Export` now succeeds on a real corpus
+  file, `report_render.render_report_faithful_view()` returns
+  `status='ok'`, and the Lab Report Review UI (from entry 007) now renders
+  the actual pixel-faithful, multi-page, letterhead-and-photos view instead
+  of the simplified grid fallback — confirmed on report 6943: real "AEG LAB"
+  header, real cell borders and fonts, correct 4-page pagination, embedded
+  micrograph photos, the same numbered issue badges drawn on the correct
+  cells via the existing colour-round-trip anchoring. Also checked 7227 (5
+  real pages) for pagination correctness.
+  Re-ran the triage features (entry 007's "Locate" jump, focus highlighting)
+  against this real exact-mode rendering — no exceptions, page selector and
+  focus state behave correctly. The zoomed-crop feature stays intentionally
+  off in exact mode (its pixel math is calibrated to the fallback grid
+  renderer only, not LibreOffice's page rasterisation — unchanged from
+  entry 007's disclosure, still correct).
+  Full suite: 68 tests, OK, unaffected (nothing in this entry touched code,
+  only environment + docs).
+
+**Next**
+- Step 3's actual work (replacing the colour round-trip with text-anchored
+  PDF annotation, per PHASE-NEXT.md §3's plan) is now genuinely startable —
+  the blocker was me, not the environment. Haven't started it; this entry is
+  the correction and the re-verification, not the rework itself. Whoever
+  picks this up next has a working `libreoffice-calc` in this session to
+  build against, but that install is session-local (not part of the repo) —
+  confirm it's still present before relying on it, and re-run
+  `apt-get update && apt-get install -y libreoffice-calc` if not.
+- Fixed the button-wrap defect entry 008 (above) found — see the commit on
+  this branch after this entry. Two rows instead of three squeezed columns;
+  verified in a fresh screenshot at the same 1500px width that showed it.
