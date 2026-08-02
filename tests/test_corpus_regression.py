@@ -131,7 +131,6 @@ class RealMultiSampleTests(unittest.TestCase):
                     len(L._identifier_tokens(sample.get("serial") or "", "serial")),
                     n_serials)
 
-    @unittest.expectedFailure
     def test_model_exposes_one_record_per_sample(self):
         """D3 against real files. The tokens exist but never become samples, so
         every downstream check reviews a 4-sample report as though it were one."""
@@ -140,7 +139,6 @@ class RealMultiSampleTests(unittest.TestCase):
             with self.subTest(job=job):
                 self.assertEqual(len(review(name)[1]["samples"]), n_samples)
 
-    @unittest.expectedFailure
     def test_shared_material_is_carried_onto_every_sample(self):
         """One material cell covers all samples in the row; each sample record
         must carry it so the hardness and composition checks can run per sample."""
@@ -151,12 +149,11 @@ class RealMultiSampleTests(unittest.TestCase):
 
 # ── D11 · findings have no scope ──────────────────────────────────────────
 class FindingScopeTests(unittest.TestCase):
-    """Measured on the real corpus: 8 of 24 distinct findings fire on all four
-    reports, so a majority of any report's output is identical to every other
-    report's.
+    """Measured on the real corpus: 7 of 25 distinct findings fire on all four
+    reports.
 
     Was 9 of 25 with two constant criticals. The "See comment" disposition
-    check was dropped on Mohamed's instruction (FEEDBACK.md entry 003), which
+    check was dropped on Mohamed's instruction (FEEDBACK.md entry 004), which
     left one constant critical and made report 6943 visibly differ from the
     other three — its duplicated serial is now the only second critical in the
     corpus, which is exactly the signal the constancy was burying.
@@ -175,7 +172,7 @@ class FindingScopeTests(unittest.TestCase):
         """Guard: documents the measured baseline so drift is visible."""
         constant, _ = self._constant_findings()
         self.assertLessEqual(
-            len(constant), 8,
+            len(constant), 7,
             "more findings became report-invariant; the noise floor is rising")
 
     @unittest.expectedFailure
@@ -184,7 +181,7 @@ class FindingScopeTests(unittest.TestCase):
         acceptance specification". It is true of the TEMPLATE, so every report
         starts at one critical before anything about it has been examined.
         (The second, the "See comment" disposition check, was dropped in
-        FEEDBACK.md entry 003.)
+        FEEDBACK.md entry 004.)
 
         The cost is concrete: report 6943 has a genuine third critical, a
         duplicated serial (C1ZP 093046 appears twice in one cell). That is a

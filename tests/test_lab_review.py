@@ -133,7 +133,7 @@ class LabReviewRegressionTests(unittest.TestCase):
         """A descriptive comment under Result = "See comment" is not a defect.
 
         This check previously raised a critical. Removed on Mohamed's
-        instruction (docs/FEEDBACK.md entry 003): at AEG the comment is a
+        instruction (docs/FEEDBACK.md entry 004): at AEG the comment is a
         record of the metallurgical condition, and the release decision does
         not live in it. It fired on 100% of the real corpus, and its constancy
         was hiding genuine criticals — see D11 in docs/REBUILD.md.
