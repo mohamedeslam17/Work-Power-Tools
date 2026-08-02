@@ -23,9 +23,13 @@ Public entry point:
 
 Usage (CLI):  python3 lab_review.py report.xlsx
 """
+import csv
 import io
 import os
 import re
+import shlex
+import shutil
+import subprocess
 import sys
 import zipfile
 from collections import Counter
@@ -41,12 +45,17 @@ try:
 except Exception:
     _PIL_AVAILABLE = False
 
+_TESSERACT_BIN = shutil.which('tesseract')
+pytesseract = None
 try:
     import pytesseract
     pytesseract.get_tesseract_version()
     _OCR_AVAILABLE = _PIL_AVAILABLE
 except Exception:
-    _OCR_AVAILABLE = False
+    # The wrapper is convenient but optional. A direct stdin/stdout invocation
+    # keeps the installed Tesseract binary usable in lean deployments.
+    pytesseract = None
+    _OCR_AVAILABLE = _PIL_AVAILABLE and bool(_TESSERACT_BIN)
 
 # Caption / etch / heat-treatment vocabulary lives in lab_vocab; import (and so
 # re-export) it so external callers can keep doing `from lab_review import …`.
@@ -68,8 +77,8 @@ ELEMENTS = {
 # Composition tolerance bands (relative deviation of Actual vs Nominal). An
 # absolute floor is applied as well so trace elements (e.g. C, B) don't trip
 # the check on tiny absolute differences.
-COMP_WARN_REL, COMP_WARN_ABS = 10.0, 0.10     # → warning
-COMP_CRIT_REL, COMP_CRIT_ABS = 25.0, 0.20     # → critical
+COMP_WARN_REL, COMP_WARN_ABS = 15.0, 0.50     # → verification warning
+COMP_CRIT_REL, COMP_CRIT_ABS = 25.0, 0.50     # UI/reference threshold
 
 # ── Reference hardness ────────────────────────────────────────────────────
 # Typical hardness of common Ni- and Co-based gas-turbine superalloys in the
@@ -271,6 +280,39 @@ def _num(v):
         return None
 
 
+def _workbook_text(wb):
+    """Visible workbook text used by evidence/completeness controls.
+
+    The filename is deliberately excluded: a word such as ``final`` or ``R``
+    in a filename is not controlled document metadata inside the report.
+    """
+    values = []
+    for ws in wb.worksheets:
+        for row in ws.iter_rows():
+            for cell in row:
+                value = _txt(cell.value)
+                if value:
+                    values.append(value)
+    return "\n".join(values)
+
+
+def _page_control(wb):
+    """Printed footer/page-number metadata from every worksheet."""
+    records = []
+    for ws in wb.worksheets:
+        for kind, footer in (
+                ('odd', ws.oddFooter), ('even', ws.evenFooter),
+                ('first', ws.firstFooter)):
+            parts = [
+                _txt(getattr(footer, side).text)
+                for side in ('left', 'center', 'right')
+            ]
+            text = " | ".join(part for part in parts if part)
+            if text:
+                records.append({'sheet': ws.title, 'kind': kind, 'text': text})
+    return records
+
+
 # ── Report-type detection ─────────────────────────────────────────────────
 def detect_type(wb):
     for ws in wb.worksheets:
@@ -390,6 +432,8 @@ def _composition(ws, which):
     if not lbl:
         return comp, loc, meta
     lrow = lbl[0]
+    meta['label_text'] = _txt(ws.cell(row=lbl[0], column=lbl[1]).value)
+    meta['label_cell'] = ws.cell(row=lbl[0], column=lbl[1]).coordinate
 
     def elem_cells(r):
         return [c for c in ws[r] if r >= 1 and _txt(c.value).capitalize() in ELEMENTS]
@@ -501,11 +545,13 @@ def parse_metallurgical(wb, media=0, micrograph_count=None):
 
 
 def _deviation_severity(rel, dev):
-    """Severity of one element's deviation, independent of how many other
-    elements are also off — a single element gutted by 88% is critical on
-    its own, not just when enough *other* elements are also out of spec."""
-    if abs(rel) >= COMP_CRIT_REL and abs(dev) >= COMP_CRIT_ABS:
-        return 'critical'
+    """A nominal-vs-actual deviation is a verification warning by itself.
+
+    These reports do not state controlled limits or method uncertainty, so an
+    ideal/nominal single value cannot by itself prove alloy rejection. Separate
+    checks still fail gross table corruption, impossible totals, duplicate
+    headers, unquantified major elements and unexpected major chemistry.
+    """
     return 'warning'
 
 
@@ -535,6 +581,42 @@ def _composition_deviations(nominal, actual):
     return deviations, systemic
 
 
+def _gross_composition_conflict(deviations, n_common, unexpected_major=None):
+    """High-confidence table corruption, not ordinary service/method scatter."""
+    unexpected_major = unexpected_major or {}
+    severe_count = sum(abs(relative) >= 25 for _el, _nom, _act, relative, _sev in deviations)
+    all_columns_conflict = (
+        n_common >= 8 and len(deviations) == n_common and severe_count >= 3
+    )
+    # In this report family, a multi-percent unexpected vanadium result combined
+    # with several severe nominal conflicts is a high-confidence sign that the
+    # actual row is shifted or copied. This deliberately requires both signals;
+    # ordinary service scatter must remain a verification warning.
+    high_vanadium_conflict = (
+        abs(unexpected_major.get('V', 0)) >= 5
+        and len(deviations) >= 3
+        and severe_count >= 2
+    )
+    return all_columns_conflict or high_vanadium_conflict
+
+
+def _gross_composition_note(deviations, n_common, unexpected_major=None):
+    unexpected_major = unexpected_major or {}
+    worst = sorted(deviations, key=lambda d: -abs(d[3]))[:4]
+    detail = ", ".join(f"{el} {rel:+.0f}%" for el, _, _, rel, _ in worst)
+    extras = ", ".join(
+        f"unexpected {el} {value:g} wt%"
+        for el, value in sorted(unexpected_major.items())
+        if abs(value) >= 0.5
+    )
+    evidence = f'{detail}' + (f'; {extras}' if extras else '')
+    return (
+        f'{len(deviations)} of {n_common} comparable elements conflict materially '
+        f'with the nominal table ({evidence}) — the chemistry table appears '
+        f'corrupted, misaligned or copied from another analysis.'
+    )
+
+
 def _review_composition(nominal, actual, composition_meta=None):
     findings = []
     if not nominal or not actual:
@@ -546,6 +628,10 @@ def _review_composition(nominal, actual, composition_meta=None):
     common = sorted(set(nominal) & set(actual))
     deviations, systemic = _composition_deviations(nominal, actual)
     n_dev, n_common = len(deviations), len(common)
+    unexpected_major = {
+        el: value for el, value in actual.items()
+        if el not in nominal and abs(value) >= 0.5
+    }
     composition_meta = composition_meta or {}
     actual_meta = composition_meta.get('actual') or {}
     entries = actual_meta.get('entries') or []
@@ -573,56 +659,276 @@ def _review_composition(nominal, actual, composition_meta=None):
                              f'{el}: actual result is "{raw}" — verify the analytical method '
                              f'and detection limit.'))
 
+    nominal_meta = composition_meta.get('nominal') or {}
+    nominal_entries = [e['value'] for e in nominal_meta.get('entries') or []
+                       if e.get('value') is not None]
+    nominal_has_balance = any(re.search(r'\b(?:bal(?:ance)?|remainder)\b',
+                                        entry.get('raw') or '', re.I)
+                              for entry in nominal_meta.get('entries') or [])
+    if len(nominal_entries) >= 5 and not nominal_has_balance:
+        nominal_total = sum(nominal_entries)
+        if nominal_total < 99.0 or nominal_total > 101.0:
+            severity = 'critical' if nominal_total > 101.0 else 'warning'
+            findings.append((severity, 'Composition',
+                             f'Nominal composition totals {nominal_total:.2f} wt%, '
+                             f'outside the 99–101 wt% reconciliation band — no balance '
+                             f'or range basis explains the table as written.'))
+
     numeric_entries = [e['value'] for e in entries if e.get('value') is not None]
     if len(numeric_entries) >= 5:
         total = sum(numeric_entries)
-        if total < 95.0 or total > 105.0:
-            findings.append(('critical', 'Composition',
+        if total < 98.0 or total > 102.0:
+            severity = 'critical' if total < 95.0 or total > 102.0 else 'warning'
+            findings.append((severity, 'Composition',
                              f'Actual composition totals {total:.2f} wt%, outside the '
-                             f'95–105 wt% sanity band — check missing/misaligned columns.'))
+                             f'98–102 wt% reconciliation band — check missing/misaligned '
+                             f'columns and analytical completeness.'))
 
-    # A few elements off is normal service depletion / EDS scatter → warnings,
-    # unless a single element is itself far enough outside tolerance to be
-    # critical regardless of how many others are affected. Many elements off
-    # together signals the actual material doesn't match the stated alloy →
-    # one consolidated FAIL ("verify material/grade").
-    if systemic:
-        worst = sorted(deviations, key=lambda d: -abs(d[3]))[:4]
-        detail = ", ".join(f"{el} {rel:+.0f}%" for el, _, _, rel, _ in worst)
+    if re.search(r'\bMinimal\b', nominal_meta.get('label_text') or '', re.I):
+        findings.append(('warning', 'Composition',
+                         'The composition heading says "Minimal" instead of "Nominal"; '
+                         'the declared chemistry basis is ambiguous.'))
+
+    # A few/multiple elements off requires verification against a real
+    # specification. Only an all-column, multi-severe conflict is treated as a
+    # corrupted/misaligned table.
+    gross_conflict = _gross_composition_conflict(
+        deviations, n_common, unexpected_major)
+    if gross_conflict:
         findings.append(('critical', 'Composition',
-                         f'{n_dev} of {n_common} elements out of tolerance ({detail} …) — actual '
-                         f'composition does not match the stated alloy; verify material/grade.'))
+                         _gross_composition_note(
+                             deviations, n_common, unexpected_major)))
     else:
-        for el, nom, act, rel, sev in deviations:
-            extra = ' — far outside tolerance, verify material/grade' if sev == 'critical' else ''
-            findings.append((sev, 'Composition',
-                             f'{el}: actual {act:g} vs nominal {nom:g} wt% ({rel:+.0f}%){extra}.'))
+        if systemic:
+            worst = sorted(deviations, key=lambda d: -abs(d[3]))[:4]
+            detail = ", ".join(f"{el} {rel:+.0f}%" for el, _, _, rel, _ in worst)
+            findings.append(('warning', 'Composition',
+                             f'{n_dev} of {n_common} comparable elements differ materially '
+                             f'from the nominal values ({detail}); verify against the governing '
+                             f'alloy specification and analytical method.'))
+        else:
+            for el, nom, act, rel, sev in deviations:
+                findings.append((sev, 'Composition',
+                                 f'{el}: actual {act:g} vs nominal {nom:g} wt% '
+                                 f'({rel:+.0f}%) — verify.'))
 
     only_nom = sorted(set(nominal) - (actual_headers or set(actual)))
     only_act = sorted((actual_headers or set(actual)) - set(nominal))
     if only_nom:
-        findings.append(('info', 'Composition',
-                         f'In spec but not reported in actual: {", ".join(only_nom)}.'))
+        missing_major = sorted(el for el in only_nom if nominal.get(el, 0) >= 1.0)
+        missing_trace = sorted(set(only_nom) - set(missing_major))
+        if missing_major:
+            findings.append(('warning', 'Composition',
+                             f'Nominal major element(s) not reported in Actual: '
+                             f'{", ".join(missing_major)} — verify analytical completeness.'))
+        if missing_trace:
+            findings.append(('info', 'Composition',
+                             f'Nominal trace element(s) not reported in Actual: '
+                             f'{", ".join(missing_trace)}.'))
     if only_act:
         major = []
         minor = []
         for el in only_act:
             values = [e.get('value') for e in entries
                       if e.get('element') == el and e.get('value') is not None]
-            if values and max(abs(v) for v in values) >= 1.0:
+            if values and max(abs(v) for v in values) >= 0.5:
                 major.append(f'{el} {max(values, key=abs):g} wt%')
             else:
                 minor.append(el)
         if major:
-            findings.append(('critical', 'Composition',
-                             f'Major element(s) reported but absent from the nominal table: '
-                             f'{", ".join(major)} — verify the headers and stated alloy.'))
+            findings.append(('warning', 'Composition',
+                             f'Materially reported element(s) absent from the nominal table: '
+                             f'{", ".join(major)} — verify the headers, method and alloy basis.'))
         if minor:
             findings.append(('info', 'Composition',
                              f'Reported but not in nominal spec: {", ".join(minor)}.'))
     if nominal and actual and not deviations:
         findings.append(('pass', 'Composition',
                          f'All {len(common)} matched elements within ±{COMP_WARN_REL:g}% tolerance.'))
+    return findings
+
+
+_CONTROL_REFERENCE = re.compile(
+    r'\bacceptance\s+(?:criteria|criterion|limits?|requirements?)\b|'
+    r'\b(?:governing|applicable)\s+(?:specification|standard|procedure|drawing)\b|'
+    r'\b(?:specification|standard|procedure|drawing)\s*(?:no\.?|number|:)\s*'
+    r'[A-Z0-9][A-Z0-9./_-]{2,}',
+    re.I,
+)
+
+
+def _review_acceptance_and_methods(parsed):
+    """Release controls that the old template silently omitted.
+
+    The checks are evidence-based: a future report that actually states a
+    governing criterion/method is not flagged merely because it uses this
+    legacy layout.
+    """
+    findings = []
+    text = parsed.get('document_text') or ''
+    if not _CONTROL_REFERENCE.search(text):
+        findings.append(('critical', 'Acceptance criteria',
+                         'No governing acceptance specification, limits or decision '
+                         'rule is stated, so the report cannot support acceptance as issued.'))
+
+    if parsed.get('nominal') or parsed.get('actual'):
+        method_markers = {
+            'test method / instrument': re.compile(
+                r'\b(?:OES|ICP(?:-OES|-MS)?|XRF|EDS|EDX|spectromet\w*|'
+                r'chemical\s+(?:analysis|test)\s+method|ASTM\s+E\d+)\b', re.I),
+            'calibration / traceability': re.compile(r'\bcalibrat\w*|traceab\w*\b', re.I),
+            'measurement uncertainty': re.compile(r'\buncertaint\w*\b', re.I),
+            'governing material specification': _CONTROL_REFERENCE,
+        }
+        missing = [label for label, pattern in method_markers.items()
+                   if not pattern.search(text)]
+        if missing:
+            findings.append(('warning', 'Chemistry method',
+                             'Chemical results lack ' + ', '.join(missing) + '.'))
+
+    hardness = parsed.get('hardness') or {}
+    if any((hardness.get(key) or {}).get('value') is not None
+           for key in ('pre', 'post')):
+        missing = []
+        if not re.search(r'\b(?:ASTM\s+E18|ISO\s+6508|Rockwell\s+(?:tester|method)|'
+                         r'hardness\s+(?:test\s+)?method)\b', text, re.I):
+            missing.append('method/standard and equipment')
+        if not re.search(r'\b(?:number\s+of\s+readings|\d+\s+readings?|n\s*=|'
+                         r'hardness\s+locations?|range|standard\s+deviation)\b', text, re.I):
+            missing.append('reading count, locations and range/statistics')
+        if not _CONTROL_REFERENCE.search(text):
+            missing.append('acceptance limits')
+        if missing:
+            findings.append(('warning', 'Hardness evidence',
+                             'Hardness values lack ' + ', '.join(missing) + '.'))
+    return findings
+
+
+def _review_sampling_basis(parsed):
+    text = parsed.get('document_text') or ''
+    # "Sampling location" identifies where a cut was taken; it is not a plan
+    # that justifies how a few specimens represent the whole set.
+    has_plan = re.search(
+        r'\b(?:sampling\s+(?:plan|basis|procedure)|sample\s+size\s+justification|'
+        r'representative\s+sample|random\s+sampling|inspection\s+level|AQL)\b',
+        text, re.I)
+    if has_plan:
+        return []
+    sample_ids = _identifier_tokens((parsed.get('sample') or {}).get('sample_no'), 'sample')
+    quantity = (parsed.get('header') or {}).get('qty')
+    detail = (f'Set quantity {quantity}; {len(sample_ids)} specimen(s) listed.'
+              if quantity else f'{len(sample_ids)} specimen(s) listed; set quantity is blank.')
+    return [('warning', 'Sampling',
+             'No sampling plan or justification shows how the listed specimen(s) '
+             f'represent the full set. {detail}')]
+
+
+def _review_phase_evidence(parsed):
+    comment = parsed.get('comment') or ''
+    phase_claim = re.search(
+        r'\b(?:MC|M23C6|TCP|sigma|carbides?|brittle\s+phases?)\b|'
+        r'gamma\s*[- ]?prime|γ\s*[\'′-]?', comment, re.I)
+    if not phase_claim:
+        return []
+    support = re.search(
+        r'\b(?:SEM|EDS|EDX|EBSD|quantif\w*|grading\s+method|reference\s+micrograph|'
+        r'controlled\s+reference|acceptance\s+(?:criteria|limit))\b',
+        parsed.get('document_text') or '', re.I)
+    findings = []
+    if not support:
+        findings.append(('warning', 'Metallography evidence',
+                         'Named phase/degradation claims are qualitative and are not '
+                         'supported by a grading method, controlled references, SEM/EDS '
+                         'confirmation or an acceptance criterion.'))
+    gamma = re.search(r'gamma\s*[- ]?prime|γ\s*[\'′-]?', comment, re.I)
+    if gamma and not re.search(r'\bSEM\b|gamma\s*[- ]?prime\s+(?:size|spacing|fraction)|'
+                               r'γ\s*[\'′-]?\s*(?:size|spacing|fraction)',
+                               parsed.get('document_text') or '', re.I):
+        findings.append(('warning', 'Metallography evidence',
+                         'Optical images at the stated magnifications do not substantiate '
+                         'a definitive γ′ morphology, dissolution or re-precipitation conclusion.'))
+    return findings
+
+
+def _review_document_control(parsed):
+    text = parsed.get('document_text') or ''
+    findings = []
+    has_report_no = re.search(r'\b(?:report|document)\s*(?:no\.?|number|id)\s*[:#-]?\s*'
+                              r'[A-Z0-9][A-Z0-9./_-]{2,}', text, re.I)
+    has_revision = re.search(r'\b(?:revision|rev\.?|version|status)\s*[:#-]?\s*'
+                             r'[A-Z0-9][A-Z0-9._/-]*', text, re.I)
+    if not (has_report_no and has_revision):
+        findings.append(('warning', 'Document control',
+                         'The report body has no controlled report number and revision/status; '
+                         'filename labels such as R, final, done or TBU are not approval evidence.'))
+
+    footers = parsed.get('page_control') or []
+    footer_text = [record.get('text') or '' for record in footers]
+    has_dynamic = any('&P' in value or '&[Page]' in value for value in footer_text)
+    static = [value for value in footer_text
+              if re.search(r'\bPage\s*[-:#]?\s*\d+\b', value, re.I)]
+    if static and not has_dynamic:
+        findings.append(('warning', 'Pagination',
+                         'The printed footer uses a hard-coded page label instead of '
+                         f'sequential page numbering: {"; ".join(static)}.'))
+    elif not has_dynamic:
+        findings.append(('warning', 'Pagination',
+                         'No sequential printed page numbering was found in the report footer.'))
+    return findings
+
+
+def _review_alloy_identity(parsed):
+    """High-confidence internal alloy contradictions found in this report family."""
+    material = (parsed.get('sample') or {}).get('material') or ''
+    key = _alloy_key(material)
+    nominal = parsed.get('nominal') or {}
+    actual = parsed.get('actual') or {}
+    text = parsed.get('document_text') or ''
+    findings = []
+
+    nominal_entries = (((parsed.get('composition_meta') or {}).get('nominal') or {})
+                       .get('entries') or [])
+    nominal_values = [entry.get('value') for entry in nominal_entries
+                      if entry.get('value') is not None]
+    nominal_total = sum(nominal_values) if len(nominal_values) >= 5 else None
+
+    if key in {'IN738', 'INCONEL738'} and nominal_total is not None and nominal_total > 101:
+        findings.append(('critical', 'Material identity',
+                         f'The declared IN-738 nominal table totals {nominal_total:.2f} wt%. '
+                         'IN-738 uses Ni as balance; the fixed values in this table are not '
+                         'a valid controlled composition.'))
+
+    if key in {'IN738', 'INCONEL738', 'GTD741'} and actual.get('Re', 0) >= 0.5:
+        findings.append(('critical', 'Material identity',
+                         f'The declared {material} chemistry contains Re {actual["Re"]:g} wt% '
+                         'without a matching nominal requirement; verify the alloy identity '
+                         'and analytical headers.'))
+
+    if key in {'IN738', 'INCONEL738'} and re.search(r'\bAISI\s*[- ]?310\b', text, re.I):
+        findings.append(('critical', 'Material identity',
+                         'The report conflicts internally: the sample is identified as IN-738 '
+                         'while the composition/narrative identifies AISI 310.'))
+
+    if re.search(r'\b(?:update|change|replace|revise)\s+(?:this\s+)?(?:as|to|with|per)\b',
+                 text, re.I):
+        findings.append(('critical', 'Document control',
+                         'An internal editing instruction remains visible in the issued report.'))
+
+    # Udimet 500 has substantially more Co/Mo than the IN-738-like table used
+    # by one legacy workbook. Detect the internal contradiction, not a broad
+    # alloy-library comparison.
+    if key in {'U500', 'UDIMET500'}:
+        looks_in738 = (
+            7 <= nominal.get('Co', -1) <= 10
+            and 14 <= nominal.get('Cr', -1) <= 18
+            and nominal.get('Mo', 99) < 2.5
+            and nominal.get('Ta', 0) >= 1
+            and nominal.get('Ni', 0) >= 60
+        )
+        if looks_in738 and actual.get('Co', 0) >= 14 and actual.get('Mo', 0) >= 3:
+            findings.append(('critical', 'Material identity',
+                             'The U-500 report uses an IN-738-like nominal chemistry table; '
+                             'the nominal alloy basis conflicts with the actual U-500-type chemistry.'))
     return findings
 
 
@@ -820,9 +1126,11 @@ def _review_completeness(parsed):
                        ('machine', 'Machine type')):
         if _is_placeholder(hdr.get(key)):
             findings.append(('warning', 'Completeness', f'{label} is blank or a placeholder.'))
-    for key, label in (('customer_ref', 'Customer Ref No'), ('eoh', 'EOH')):
+    for key, label in (('customer_ref', 'Customer Ref No'), ('qty', 'Quantity per set')):
         if _is_placeholder(hdr.get(key)):
-            findings.append(('info', 'Completeness', f'{label} not provided.'))
+            findings.append(('warning', 'Completeness', f'{label} not provided.'))
+    if _is_placeholder(hdr.get('eoh')):
+        findings.append(('info', 'Completeness', 'EOH not provided.'))
 
     if _is_placeholder(parsed['sample'].get('material')):
         findings.append(('warning', 'Completeness', 'Sample material/alloy not stated.'))
@@ -857,7 +1165,7 @@ def _review_completeness(parsed):
     missing = [lbl for key, lbl in (('met_lab', 'Met. Lab'), ('mat_eng', 'Mat. Eng'),
                                     ('date', 'Date')) if _is_placeholder(so.get(key))]
     if missing:
-        findings.append(('warning', 'Sign-off', f'Missing sign-off field(s): {", ".join(missing)}.'))
+        findings.append(('critical', 'Sign-off', f'Missing sign-off field(s): {", ".join(missing)}.'))
     else:
         findings.append(('pass', 'Sign-off', 'Lab, engineer and date all present.'))
     return findings
@@ -875,7 +1183,8 @@ def _identifier_tokens(text, kind):
     for block in re.split(r'[\n;,]+', raw):
         for part in re.split(r'\s{2,}', block.strip()):
             token = re.sub(r'\s+', '', part)
-            if len(token) >= 4 and re.fullmatch(r'[A-Z0-9-]+', token) and re.search(r'\d', token):
+            if (len(token) >= 4 and re.fullmatch(r'[A-Z0-9/-]+', token)
+                    and re.search(r'\d', token)):
                 tokens.append(token)
     return tokens
 
@@ -886,10 +1195,16 @@ def _review_traceability(parsed):
     sample_ids = _identifier_tokens(sample.get('sample_no'), 'sample')
     serial_ids = _identifier_tokens(sample.get('serial'), 'serial')
 
+    if sample_ids and serial_ids and len(sample_ids) != len(serial_ids):
+        findings.append(('warning', 'Traceability',
+                         f'Sample and serial/part identifiers do not map one-to-one: '
+                         f'{len(sample_ids)} sample identifier(s) versus '
+                         f'{len(serial_ids)} serial/part identifier(s).'))
+
     for label, values in (('sample number', sample_ids), ('serial/part number', serial_ids)):
         duplicates = sorted(value for value, count in Counter(values).items() if count > 1)
         if duplicates:
-            findings.append(('warning', 'Traceability',
+            findings.append(('critical', 'Traceability',
                              f'Duplicate {label}(s): {", ".join(duplicates)}.'))
 
     result = sample.get('result')
@@ -1001,6 +1316,16 @@ def _picture_image_pairs(data, pictures, images):
     return pairs
 
 
+def _requires_etch_status(label, caption):
+    """Etch status is required for microstructure evidence, not every photo.
+
+    Sampling-location photos and coating/thickness measurement images are valid
+    without etching and previously caused false caption warnings.
+    """
+    text = f'{label or ""} {caption or ""}'
+    return bool(re.search(r'\bmicrograph|microstructure\b', text, re.I))
+
+
 def _review_captions(parsed):
     """Caption integrity: numbering, etch status, and comment picture references."""
     findings = []
@@ -1026,12 +1351,14 @@ def _review_captions(parsed):
                              f'Picture numbering gap — missing {", ".join(map(str, missing))}.'))
 
     no_etch = [(label or '?').rstrip(':') for label, cap in pics
-               if not _ETCH_PAT.search(f"{label} {cap or ''}")]
+               if _requires_etch_status(label, cap)
+               and not _ETCH_PAT.search(f"{label} {cap or ''}")]
     if no_etch:
         findings.append(('warning', 'Captions',
                          f'No etch status in caption(s): {", ".join(no_etch)}.'))
     else:
-        findings.append(('pass', 'Captions', 'Every caption states an etch status.'))
+        findings.append(('pass', 'Captions',
+                         'Every microstructure caption states an etch status.'))
 
     # Surface captions that explicitly state unetched / as-polished — legitimate
     # for thickness / crack work, but worth confirming for a microstructure report.
@@ -1043,11 +1370,18 @@ def _review_captions(parsed):
                              f'assessment is normally etched).'))
 
     refs = [int(m.group(1)) for m in
-            re.finditer(r'pic(?:ture)?\.?\s*(?:no\.?\s*)?(\d+)', comment, re.I)]
-    if refs and max(refs) > len(pics):
+            re.finditer(r'pics?(?:ture)?s?\.?\s*(?:no\.?\s*)?(\d+)', comment, re.I)]
+    for match in re.finditer(
+            r'pics?(?:ture)?s?\.?\s*(?:no\.?\s*)?(\d+)\s*(?:-|–|to)\s*(\d+)',
+            comment, re.I):
+        refs.extend((int(match.group(1)), int(match.group(2))))
+    # A duplicated caption number is already reported above. It must not also
+    # make a valid reference to the fourth physical picture look out of range.
+    max_present = max(max(nums) if nums else 0, len(pics))
+    if refs and max(refs) > max_present:
         findings.append(('warning', 'Captions',
-                         f'Comment refers to Picture {max(refs)} but only {len(pics)} '
-                         f'picture(s) are present.'))
+                         f'Comment refers to Picture {max(refs)} but the highest present '
+                         f'caption is Picture {max_present}.'))
 
     return findings
 
@@ -1057,11 +1391,16 @@ def review_metallurgical(parsed):
     findings += _review_workbook_integrity(parsed)
     findings += _review_completeness(parsed)
     findings += _review_traceability(parsed)
+    findings += _review_sampling_basis(parsed)
+    findings += _review_acceptance_and_methods(parsed)
     findings += _review_hardness(parsed['hardness'], parsed['sample'].get('material'))
     findings += _review_composition(
         parsed['nominal'], parsed['actual'], parsed.get('composition_meta'))
+    findings += _review_alloy_identity(parsed)
     findings += _review_comment(parsed)
     findings += _review_evidence_claims(parsed)
+    findings += _review_phase_evidence(parsed)
+    findings += _review_document_control(parsed)
     findings += _review_captions(parsed)
     return findings
 
@@ -1258,7 +1597,37 @@ def _caption_magnification(caption):
 
 def _safe_ocr(im, cfg='--psm 7'):
     try:
-        return pytesseract.image_to_string(im, config=cfg) or ''
+        if pytesseract is not None:
+            return pytesseract.image_to_string(im, config=cfg) or ''
+        if not _TESSERACT_BIN:
+            return ''
+        payload = io.BytesIO()
+        im.save(payload, format='PNG')
+        result = subprocess.run(
+            [_TESSERACT_BIN, 'stdin', 'stdout', *shlex.split(cfg)],
+            input=payload.getvalue(), stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, check=False, timeout=20,
+        )
+        return result.stdout.decode('utf-8', errors='replace') if result.returncode == 0 else ''
+    except Exception:
+        return ''
+
+
+def _safe_ocr_tsv(im, cfg='--psm 11'):
+    """Return Tesseract word boxes as TSV, with or without pytesseract."""
+    try:
+        if pytesseract is not None:
+            return pytesseract.image_to_data(im, config=cfg) or ''
+        if not _TESSERACT_BIN:
+            return ''
+        payload = io.BytesIO()
+        im.save(payload, format='PNG')
+        result = subprocess.run(
+            [_TESSERACT_BIN, 'stdin', 'stdout', *shlex.split(cfg), 'tsv'],
+            input=payload.getvalue(), stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, check=False, timeout=20,
+        )
+        return result.stdout.decode('utf-8', errors='replace') if result.returncode == 0 else ''
     except Exception:
         return ''
 
@@ -1324,16 +1693,102 @@ def _read_legend_im(im):
     return out
 
 
-def _read_measurements_im(im):
-    """Read thickness labels (e.g. '42 µm') burned into the image body."""
+def _measurement_color(image, bbox, pad=80):
+    """Nearest saturated annotation color to one OCR measurement label."""
+    left, top, right, bottom = bbox
+    x0, y0 = max(0, left - pad), max(0, top - pad)
+    x1, y1 = min(image.width, right + pad), min(image.height, bottom + pad)
+    crop = image.crop((x0, y0, x1, y1)).convert('RGB')
+    distances = {name: float('inf') for name in
+                 ('red', 'blue', 'magenta', 'yellow', 'green', 'cyan')}
+    counts = Counter()
+    for y in range(crop.height):
+        for x in range(crop.width):
+            red, green, blue = crop.getpixel((x, y))
+            color = None
+            if red > 120 and blue > 80 and min(red, blue) > green + 40:
+                color = 'magenta'
+            elif red > 130 and red > green + 55 and red > blue + 45:
+                color = 'red'
+            elif blue > 110 and blue > red + 45 and blue > green + 20:
+                color = 'blue'
+            elif red > 140 and green > 110 and blue < 90:
+                color = 'yellow'
+            elif green > 120 and green > red + 40 and green > blue + 30:
+                color = 'green'
+            elif green > 110 and blue > 110 and min(green, blue) > red + 35:
+                color = 'cyan'
+            if color is None:
+                continue
+            counts[color] += 1
+            absolute_x, absolute_y = x0 + x, y0 + y
+            dx = max(left - absolute_x, 0, absolute_x - right)
+            dy = max(top - absolute_y, 0, absolute_y - bottom)
+            distances[color] = min(distances[color], (dx * dx + dy * dy) ** 0.5)
+    plausible = [name for name, distance in distances.items()
+                 if distance <= 60 and counts[name] >= 5]
+    return min(plausible, key=distances.get) if plausible else 'unclassified'
+
+
+def _read_measurement_data_im(im):
+    """Read thickness values and retain their colored annotation series."""
     if not _OCR_AVAILABLE:
-        return []
-    w, h = im.size
-    body = im.crop((0, 0, w, int(h * 0.85)))        # exclude bottom legend + scale bar
-    big = body.resize((body.width * 3, body.height * 3))
-    bright = big.point(lambda p: 255 if p > 200 else 0)
-    txt = _safe_ocr(bright, '--psm 11')
-    return sorted({int(v) for v in re.findall(r'(\d{1,3})\s*[µuμ]m', txt, re.I)})
+        return [], {}
+    source = im.convert('RGB')
+    gray = source.convert('L')
+    scale = 3
+    # Include low-placed callouts while excluding the bottom legend/scale bar.
+    body = gray.crop((0, 0, gray.width, int(gray.height * 0.91)))
+    big = body.resize((body.width * scale, body.height * scale))
+    bright = big.point(lambda pixel: 255 if pixel > 180 else 0)
+    tsv = _safe_ocr_tsv(bright)
+    lines = {}
+    try:
+        rows = csv.DictReader(io.StringIO(tsv), delimiter='\t')
+        for row in rows:
+            if not (row.get('text') or '').strip():
+                continue
+            key = (row.get('block_num'), row.get('par_num'), row.get('line_num'))
+            lines.setdefault(key, []).append(row)
+    except Exception:
+        lines = {}
+
+    values = []
+    groups = {}
+    for words in lines.values():
+        text = ' '.join(row.get('text') or '' for row in words)
+        matches = list(re.finditer(r'(?<!\d)(\d{1,3})\s*[µuμpy]m\b', text, re.I))
+        if len(matches) != 1:
+            continue
+        value = int(matches[0].group(1))
+        try:
+            bbox = (
+                min(int(row['left']) for row in words) // scale,
+                min(int(row['top']) for row in words) // scale,
+                max(int(row['left']) + int(row['width']) for row in words) // scale,
+                max(int(row['top']) + int(row['height']) for row in words) // scale,
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+        color = _measurement_color(source, bbox)
+        values.append(value)
+        groups.setdefault(color, []).append(value)
+
+    if not values:
+        # String-only fallback for unusual TSV output. The accepted p/y glyphs
+        # are common micro-symbol OCR errors and remain constrained to the body.
+        text = _safe_ocr(bright, '--psm 11')
+        values = [int(value) for value in re.findall(
+            r'(\d{1,3})\s*[µuμpy]m\b', text, re.I)]
+        if values:
+            groups['unclassified'] = list(values)
+    return sorted(values), {color: sorted(series) for color, series in groups.items()}
+
+
+def _read_measurements_im(im):
+    """Back-compatible list-only measurement reader."""
+    values, _groups = _read_measurement_data_im(im)
+    return values
 
 
 def analyze_images(data, want_bytes=False, max_images=40):
@@ -1354,17 +1809,20 @@ def analyze_images(data, want_bytes=False, max_images=40):
     for n in names[:max_images]:
         raw = z.read(n)
         try:
-            im = Image.open(io.BytesIO(raw)).convert('L')
+            source_image = Image.open(io.BytesIO(raw)).convert('RGB')
+            im = source_image.convert('L')
         except Exception:
             continue
         w, h = im.size
         if w < 200 or h < 150:           # skip logos / thumbnails
             continue
         strong = _edge_density(im)
+        measurements, measurement_groups = _read_measurement_data_im(source_image)
         entry = {'image': n.split('/')[-1],
                  'strong': strong,
                  'etched': (strong is None) or (strong >= _ETCH_THR),
-                 'measurements': _read_measurements_im(im)}
+                 'measurements': measurements,
+                 'measurement_groups': measurement_groups}
         entry.update(_read_legend_im(im))
         if want_bytes:
             entry['bytes'] = raw
@@ -1383,11 +1841,66 @@ def read_image_legends(data, max_images=40):
 
 def _comment_thickness_um(comment):
     """Thickness values in the comment text, normalised to µm."""
-    out = set()
-    for m in re.finditer(r'(\d+(?:\.\d+)?)\s*(mm|µm|um|μm)\b', comment or '', re.I):
-        v = float(m.group(1))
-        out.add(round(v * 1000) if m.group(2).lower() == 'mm' else round(v))
-    return out
+    return {claim['value_um'] for claim in _comment_thickness_claims(comment)}
+
+
+def _sentence_context(text, position):
+    """Sentence containing a position, without splitting decimal numbers."""
+    boundaries = [0]
+    boundaries.extend(match.end() for match in re.finditer(
+        r'(?<!\d)[.!?]\s+(?=[A-Z])|\n+', text))
+    boundaries.append(len(text))
+    for left, right in zip(boundaries, boundaries[1:]):
+        if left <= position < right:
+            return text[left:right].strip()
+    return text
+
+
+def _picture_references(text):
+    refs = set()
+    pattern = re.compile(
+        r'\bpic(?:ture)?s?\.?\s*(?:no\.?\s*)?'
+        r'(\d+(?:\s*(?:,\s*(?:and\s*)?|&|and|to|-|–)\s*\d+)*)',
+        re.I,
+    )
+    for match in pattern.finditer(text or ''):
+        body = match.group(1)
+        refs.update(int(value) for value in re.findall(r'\d+', body))
+        for range_match in re.finditer(r'(\d+)\s*(?:to|-|–)\s*(\d+)', body, re.I):
+            first, last = map(int, range_match.groups())
+            if 0 < first <= last <= 100:
+                refs.update(range(first, last + 1))
+    return sorted(refs)
+
+
+def _comment_thickness_claims(comment):
+    """Quantitative thickness statements with their local wording/context."""
+    text = comment or ''
+    claims = []
+    for match in re.finditer(
+            r'(?P<qual><\s*|≤\s*|up\s+to\s+|maximum\s+(?:of\s+)?|max\.?\s*)?'
+            r'(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>mm|µm|um|μm)\b',
+            text, re.I):
+        value = float(match.group('value'))
+        value_um = round(value * 1000) if match.group('unit').lower() == 'mm' else round(value)
+        context = _sentence_context(text, match.start())
+        qual = (match.group('qual') or '').strip().lower()
+        refs = _picture_references(context)
+        claims.append({
+            'value_um': value_um,
+            'raw': match.group(0).strip(),
+            'context': context,
+            'picture_refs': refs,
+            'is_limit': qual.startswith('<') or qual.startswith('≤'),
+            'is_max': 'up to' in qual or 'max' in qual,
+        })
+    # The same value is often repeated in a summary sentence. Preserve the
+    # first, most local evidence statement rather than issuing duplicates.
+    unique = {}
+    for claim in claims:
+        key = (claim['value_um'], claim['is_limit'], claim['is_max'])
+        unique.setdefault(key, claim)
+    return list(unique.values())
 
 
 def picture_etch_verdicts(images, pictures, data):
@@ -1505,26 +2018,97 @@ def _review_etch(images, pictures, verdicts):
     return findings
 
 
-def _review_thickness(parsed, images):
-    """A1 — surface comment vs in-photo thickness measurements for comparison."""
+def _review_thickness(parsed, images, ocr_used=True, data=None):
+    """Reconcile reported thickness with burned-in photo measurements.
+
+    A reported average is accepted only when it reproduces an image-group (or
+    cited-image) mean within a practical OCR/rounding tolerance. Merely falling
+    somewhere between the minimum and maximum is not evidence of an average.
+    """
     findings = []
-    comment_um = _comment_thickness_um(parsed.get('comment'))
-    photo_um = sorted({v for im in images for v in im.get('measurements', [])})
-    if not (comment_um or photo_um):
+    claims = _comment_thickness_claims(parsed.get('comment'))
+    if not claims:
         return findings
-    parts = []
-    if comment_um:
-        parts.append('comment ' + ', '.join(f'{v} µm' for v in sorted(comment_um)))
-    if photo_um:
-        parts.append('photos ' + ', '.join(f'{v} µm' for v in photo_um))
-    findings.append(('info', 'Thickness', 'Thickness values — ' + '; '.join(parts) + '.'))
-    if comment_um and photo_um:
-        lo, hi = min(photo_um), max(photo_um)
-        outliers = [v for v in sorted(comment_um) if v < lo * 0.5 or v > hi * 2]
-        if outliers:
-            findings.append(('warning', 'Thickness',
-                             f'Comment thickness {", ".join(f"{v} µm" for v in outliers)} is far '
-                             f'from the photo measurements ({lo}–{hi} µm) — verify.'))
+    if not ocr_used:
+        return findings
+
+    pairs = _picture_image_pairs(data, parsed.get('pictures') or [], images)
+    numbered_images = {}
+    for label, _caption, image in pairs:
+        number = _PICNUM.search(label or '')
+        if number:
+            numbered_images.setdefault(int(number.group(1)), []).append(image)
+
+    for claim in claims:
+        selected_images = [image for number in claim['picture_refs']
+                           for image in numbered_images.get(number, [])]
+        if not selected_images:
+            selected_images = list(images)
+
+        individual_groups = []
+        aggregate_by_color = {}
+        values = []
+        for image in selected_images:
+            image_values = list(image.get('measurements') or [])
+            values.extend(image_values)
+            color_groups = image.get('measurement_groups') or {}
+            if color_groups:
+                for color, series in color_groups.items():
+                    if not series:
+                        continue
+                    individual_groups.append(list(series))
+                    aggregate_by_color.setdefault(color, []).extend(series)
+            elif image_values:
+                individual_groups.append(image_values)
+                aggregate_by_color.setdefault('unclassified', []).extend(image_values)
+
+        # When the report explicitly cites several pictures, one colored series
+        # represents the same feature across those pictures. Compare the claim
+        # with that combined series; otherwise keep image-level series separate.
+        if len(set(claim['picture_refs'])) > 1 and aggregate_by_color:
+            groups = list(aggregate_by_color.values())
+        else:
+            groups = individual_groups
+        if not values:
+            findings.append(('warning', 'Thickness evidence',
+                             f'The report states {claim["raw"]}, but no burned-in '
+                             'measurement was read from the cited micrograph(s); verify the '
+                             'measurement method and source data.'))
+            continue
+
+        target = claim['value_um']
+        tolerance = max(3.0, target * 0.12)
+        means = []
+        for group in groups:
+            if not group:
+                continue
+            ordered = sorted(group)
+            means.append(sum(ordered) / len(ordered))
+            # One bad leading digit is common in tiny callouts (18 → 48). For a
+            # sufficiently populated series, retain a one-at-each-end trimmed
+            # mean as a secondary candidate; the raw range remains disclosed.
+            if len(ordered) >= 5:
+                trimmed = ordered[1:-1]
+                means.append(sum(trimmed) / len(trimmed))
+
+        if claim['is_limit']:
+            supported = max(values) < target + tolerance
+        elif claim['is_max']:
+            supported = abs(max(values) - target) <= tolerance
+        else:
+            supported = any(abs(mean - target) <= tolerance for mean in means)
+        if supported:
+            continue
+
+        evidence = sorted({round(mean, 1) for mean in means})
+        finding = (
+            f'Reported thickness {claim["raw"]} is not reproduced by the burned-in '
+            f'measurements (range {min(values):g}–{max(values):g} µm'
+            + (f'; candidate mean(s) {", ".join(f"{value:g}" for value in evidence)} µm'
+               if evidence else '')
+            + '). Verify the stated calculation and cited image.'
+        )
+        findings.append(('warning', 'Thickness evidence', finding))
     return findings
 
 
@@ -1623,7 +2207,7 @@ _PART_SYNONYMS = [
 
 def _component_identity(text):
     """Return (stage_number, canonical_part) from free report-title text."""
-    raw = text or ''
+    raw = re.sub(r'[_-]+', ' ', text or '')
     lowered = raw.lower()
     part = next((name for pat, name in _PART_SYNONYMS if re.search(pat, lowered)), None)
     stage_match = (
@@ -1659,8 +2243,10 @@ def _canon_machine(text):
         frame, suffix = ms_model.group(1), ms_model.group(2) or ''
         return f'{frame}{suffix}' if suffix else f'MS{frame}001'
 
-    fs_model = re.search(r'(?<![A-Z0-9])FS\s*[.\-]?\s*([679])(?!\d)', raw)
+    fs_model = re.search(r'(?<![A-Z0-9])FS\s*[.\-]?\s*([679])\s*(FA)?(?![A-Z0-9])', raw)
     if fs_model:
+        if fs_model.group(2):
+            return f'{fs_model.group(1)}FA'
         return f'MS{fs_model.group(1)}001'
 
     short_f = re.search(r'(?<![A-Z0-9])([679])\s*F\s*([A-Z]?)(?![A-Z0-9])', raw)
@@ -1803,6 +2389,62 @@ def review_filename(filename, parsed, rtype):
     return findings
 
 
+def _revision_score(name):
+    """Conservative filename revision rank used only for co-uploaded versions."""
+    stem = os.path.splitext(os.path.basename(name or ''))[0].lower().strip()
+    if re.search(r'(?:^|[\s_-])-?r$', stem):
+        return 3
+    if any(token in stem for token in ('updated', 'revised', 'revision')):
+        return 2
+    if any(token in stem for token in ('final', 'done')):
+        return 1
+    return 0
+
+
+def add_version_findings(reports):
+    """Flag persistent blockers in explicit revised versions of one job."""
+    groups = {}
+    for report in reports:
+        if 'error' in report:
+            continue
+        job = ((report.get('parsed') or {}).get('header') or {}).get('job')
+        if job:
+            groups.setdefault(str(job).strip(), []).append(report)
+
+    for job, group in groups.items():
+        if len(group) < 2:
+            continue
+        ranked = sorted(group, key=lambda report: _revision_score(report.get('name')))
+        earlier, revised = ranked[0], ranked[-1]
+        if _revision_score(revised.get('name')) <= _revision_score(earlier.get('name')):
+            continue
+
+        earlier_blockers = {
+            (category, message)
+            for severity, category, message in earlier.get('findings') or []
+            if severity in ('critical', 'warning')
+        }
+        persistent = [
+            (severity, category, message)
+            for severity, category, message in revised.get('findings') or []
+            if severity in ('critical', 'warning')
+            and (category, message) in earlier_blockers
+        ]
+        if not persistent:
+            continue
+        fail_count = sum(severity == 'critical' for severity, _cat, _msg in persistent)
+        warning_count = sum(severity == 'warning' for severity, _cat, _msg in persistent)
+        severity = 'critical' if fail_count else 'warning'
+        message = (
+            f'Revised job {job} workbook still contains {fail_count} fail(s) and '
+            f'{warning_count} warning(s) already present in the earlier uploaded '
+            f'version ({earlier["name"]}); the revision did not close the recorded gaps.'
+        )
+        finding = (severity, 'Revision control', message)
+        revised.setdefault('version_findings', []).append(finding)
+        revised['findings'] = list(revised.get('findings') or []) + [finding]
+
+
 # ════════════════════════════════════════════════════════════════════════
 # PUBLIC ENTRY POINT
 # ════════════════════════════════════════════════════════════════════════
@@ -1839,6 +2481,8 @@ def review_report(filename, data, ocr=True):
         parsed = parse_metallurgical(wb, media, micrograph_count)
         parsed['excel_errors'] = excel_errors
         parsed['formula_issues'] = formula_issues
+        parsed['document_text'] = _workbook_text(wb)
+        parsed['page_control'] = _page_control(wb_formulas)
         findings = review_metallurgical(parsed)
     else:
         parsed = {'excel_errors': excel_errors, 'formula_issues': formula_issues,
@@ -1852,6 +2496,7 @@ def review_report(filename, data, ocr=True):
     findings += title_findings
 
     images = []
+    ocr_used = False
     if ocr:
         images, ocr_used = analyze_images(data)
         mag_verdicts = picture_magnification_verdicts(
@@ -1867,8 +2512,12 @@ def review_report(filename, data, ocr=True):
         findings += _review_legends(legends, ocr_used, cap_mags, report_job)
         etch_verdicts = picture_etch_verdicts(images, parsed.get('pictures', []), data)
         findings += _review_etch(images, parsed.get('pictures', []), etch_verdicts)
-        findings += _review_thickness(parsed, images)
+        thickness_findings = _review_thickness(
+            parsed, images, ocr_used=ocr_used, data=data)
+        findings += thickness_findings
+        parsed['thickness_findings'] = thickness_findings
         parsed['photo_etch'] = etch_verdicts or []
+    parsed['ocr_used'] = ocr_used
     parsed['images'] = images
     parsed['legends'] = [im for im in images
                          if im.get('ocr_mag') or im.get('scale')
@@ -1906,6 +2555,9 @@ def collect_highlights(parsed):
         entry = entry or {}
         return entry.get('value') or entry.get('label')
 
+    def first_cell(mapping):
+        return next((value for value in (mapping or {}).values() if value), None)
+
     # ── Workbook integrity — visible errors / external formula references ──
     for error in parsed.get('excel_errors') or []:
         add((error.get('row'), error.get('col')), 'critical', 'Workbook integrity',
@@ -1939,11 +2591,32 @@ def collect_highlights(parsed):
     # ── Composition — Actual cells out of tolerance vs Nominal ──
     deviations, systemic = _composition_deviations(
         parsed.get('nominal') or {}, parsed.get('actual') or {})
+    nominal_values = parsed.get('nominal') or {}
+    actual_values = parsed.get('actual') or {}
+    common_count = len(set(nominal_values) & set(actual_values))
+    unexpected_major = {
+        el: value for el, value in actual_values.items()
+        if el not in nominal_values and abs(value) >= 0.5
+    }
+    gross_conflict = _gross_composition_conflict(
+        deviations, common_count, unexpected_major)
     aloc = loc.get('actual') or {}
-    for el, nom, act, rel, sev in deviations:
-        sev = 'critical' if systemic else sev
-        add(aloc.get(el), sev, 'Composition', f'{el} {rel:+.0f}%',
-            f'{el}: actual {act:g} vs nominal {nom:g} wt% ({rel:+.0f}%).')
+    if gross_conflict:
+        note = _gross_composition_note(
+            deviations, common_count, unexpected_major)
+        add(first_cell(aloc), 'critical', 'Composition', 'table conflict', note)
+    elif systemic:
+        worst = sorted(deviations, key=lambda item: -abs(item[3]))[:4]
+        detail = ", ".join(f"{el} {rel:+.0f}%" for el, _nom, _act, rel, _sev in worst)
+        note = (f'{len(deviations)} of {common_count} comparable elements differ materially '
+                f'from the nominal values ({detail}); verify against the governing alloy '
+                f'specification and analytical method.')
+        add(first_cell(aloc), 'warning', 'Composition', 'multiple deviations', note)
+    else:
+        for el, nom, act, rel, sev in deviations:
+            add(aloc.get(el), sev, 'Composition', f'{el} {rel:+.0f}%',
+                f'{el}: actual {act:g} vs nominal {nom:g} wt% '
+                f'({rel:+.0f}%) — verify.')
     comp_meta = (parsed.get('composition_meta') or {}).get('actual') or {}
     duplicate_headers = set(comp_meta.get('duplicate_headers') or [])
     for entry in comp_meta.get('entries') or []:
@@ -1983,6 +2656,51 @@ def collect_highlights(parsed):
         add(anchor((loc.get('sample') or {}).get('material')), 'warning',
             'Completeness', 'Material blank', 'Sample material/alloy not stated.')
 
+    for key, label in (('customer_ref', 'Customer Ref No'), ('qty', 'Quantity per set')):
+        if _is_placeholder(hdr.get(key)):
+            add(anchor(hdr_loc.get(key)), 'warning', 'Completeness',
+                f'{label} blank', f'{label} not provided.')
+
+    # ── Release basis — criteria, method evidence and representative sampling ──
+    governance = _review_acceptance_and_methods(parsed)
+    for severity, category, note in governance:
+        if category == 'Acceptance criteria':
+            add(anchor(loc.get('comment')), severity, category, 'no criteria', note)
+        elif category == 'Chemistry method':
+            for cell in (first_cell(loc.get('nominal')), first_cell(loc.get('actual'))):
+                add(cell, severity, category, 'method missing', note)
+        elif category == 'Hardness evidence':
+            for key in ('pre', 'post'):
+                add(anchor((loc.get('hardness') or {}).get(key)), severity,
+                    category, 'evidence missing', note)
+
+    for severity, category, note in _review_sampling_basis(parsed):
+        add(anchor(hdr_loc.get('qty')), severity, category, 'no sampling plan', note)
+        add(anchor((loc.get('sample') or {}).get('sample_no')), severity,
+            category, 'no sampling plan', note)
+
+    for severity, category, note in _review_phase_evidence(parsed):
+        add(anchor(loc.get('comment')), severity, category, 'basis?', note)
+
+    # ── Traceability — one sample must map to one serial/part identifier ──
+    sample_ids = _identifier_tokens(smp.get('sample_no'), 'sample')
+    serial_ids = _identifier_tokens(smp.get('serial'), 'serial')
+    if sample_ids and serial_ids and len(sample_ids) != len(serial_ids):
+        note = (f'Sample and serial/part identifiers do not map one-to-one: '
+                f'{len(sample_ids)} sample identifier(s) versus '
+                f'{len(serial_ids)} serial/part identifier(s).')
+        for key in ('sample_no', 'serial'):
+            add(anchor((loc.get('sample') or {}).get(key)), 'warning',
+                'Traceability', 'count mismatch', note)
+    for label, values, key in (
+            ('sample number', sample_ids, 'sample_no'),
+            ('serial/part number', serial_ids, 'serial')):
+        duplicates = sorted(value for value, count in Counter(values).items() if count > 1)
+        if duplicates:
+            note = f'Duplicate {label}(s): {", ".join(duplicates)}.'
+            add(anchor((loc.get('sample') or {}).get(key)), 'critical',
+                'Traceability', 'duplicate ID', note)
+
     # ── Disposition — "See comment" must lead to an actual verdict ──
     result = smp.get('result') or ''
     comment = parsed.get('comment') or ''
@@ -2017,7 +2735,7 @@ def collect_highlights(parsed):
         for key, label in so_fields:
             if _is_placeholder(so.get(key)):
                 entry = so_loc.get(key) or {}
-                add(entry.get('label') or entry.get('value'), 'warning',
+                add(entry.get('label') or entry.get('value'), 'critical',
                     'Sign-off', f'{label} missing', so_note)
 
     # ── Captions — no etch status, or explicitly unetched ──
@@ -2030,12 +2748,13 @@ def collect_highlights(parsed):
         for entry in ploc[micrographs:]:
             add(anchor(entry), 'critical', 'Micrographs', 'image missing', note)
     no_etch = [(label or '?').rstrip(':') for label, cap in pics
-               if not _ETCH_PAT.search(f"{label} {cap or ''}")]
+               if _requires_etch_status(label, cap)
+               and not _ETCH_PAT.search(f"{label} {cap or ''}")]
     no_etch_note = f'No etch status in caption(s): {", ".join(no_etch)}.'
     for i, (label, cap) in enumerate(pics):
         text = f"{label} {cap or ''}"
         entry = ploc[i] if i < len(ploc) else {}
-        if not _ETCH_PAT.search(text):
+        if _requires_etch_status(label, cap) and not _ETCH_PAT.search(text):
             add(anchor(entry), 'warning', 'Captions', 'No etch status', no_etch_note)
         elif _UNETCHED_PAT.search(text):
             add(anchor(entry), 'info', 'Captions', 'Unetched',
@@ -2055,17 +2774,10 @@ def collect_highlights(parsed):
         entry = ploc[idx] if (idx is not None and 0 <= idx < len(ploc)) else {}
         add(anchor(entry), v.get('severity', 'warning'), 'Photo etch', 'etch?', v['note'])
 
-    # ── Thickness — comment value far from the in-photo measurements ──
-    comment_um = _comment_thickness_um(parsed.get('comment'))
-    photo_um = sorted({u for im in (parsed.get('images') or [])
-                       for u in im.get('measurements', [])})
-    if comment_um and photo_um:
-        lo_p, hi_p = min(photo_um), max(photo_um)
-        outliers = [u for u in sorted(comment_um) if u < lo_p * 0.5 or u > hi_p * 2]
-        if outliers:
-            add(anchor(loc.get('comment')), 'warning', 'Thickness', 'thickness?',
-                f'Comment thickness {", ".join(f"{u} µm" for u in outliers)} is far from '
-                f'the photo measurements ({lo_p}–{hi_p} µm) — verify.')
+    # ── Thickness — calculation must reconcile, not merely fall in the range ──
+    for severity, category, note in parsed.get('thickness_findings') or []:
+        if severity in ('critical', 'warning'):
+            add(anchor(loc.get('comment')), severity, category, 'calculation?', note)
 
     # ── Coating — thickness measurements outside design limits ──
     for entry in parsed.get('rows') or []:

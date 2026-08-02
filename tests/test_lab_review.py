@@ -10,10 +10,16 @@ from lab_review import (
     _review_completeness,
     _review_composition,
     _review_captions,
+    _review_acceptance_and_methods,
+    _review_document_control,
     _review_evidence_claims,
     _review_legends,
+    _review_phase_evidence,
+    _review_sampling_basis,
+    _review_thickness,
     _review_traceability,
     _select_magnification,
+    add_version_findings,
     collect_highlights,
     picture_magnification_verdicts,
     review_filename,
@@ -28,6 +34,27 @@ def messages(findings, severity=None):
 
 
 class LabReviewRegressionTests(unittest.TestCase):
+    def test_revised_upload_is_flagged_when_blockers_persist(self):
+        blocker = ("critical", "Acceptance criteria", "No controlled criterion.")
+        reports = [
+            {
+                "name": "7080 Metallurgical Report.xlsx",
+                "parsed": {"header": {"job": "7080"}},
+                "findings": [blocker],
+            },
+            {
+                "name": "7080 Metallurgical Report - R.xlsx",
+                "parsed": {"header": {"job": "7080"}},
+                "findings": [blocker],
+            },
+        ]
+
+        add_version_findings(reports)
+
+        self.assertNotIn("version_findings", reports[0])
+        self.assertEqual(reports[1]["version_findings"][0][0], "critical")
+        self.assertEqual(reports[1]["version_findings"][0][1], "Revision control")
+
     def test_plural_comments_label_is_parsed(self):
         ws = Workbook().active
         ws["A1"] = "Comments:"
@@ -84,6 +111,24 @@ class LabReviewRegressionTests(unittest.TestCase):
         self.assertTrue(any("major alloying element was not quantified" in message
                             for message in critical))
 
+    def test_multi_percent_unexpected_vanadium_marks_corrupted_actual_table(self):
+        nominal = {
+            "Al": 3.4, "Co": 8.5, "Cr": 16.0, "Mo": 1.75,
+            "Nb": 0.9, "Ni": 68.49, "Ti": 3.4, "W": 2.6,
+        }
+        actual = {
+            "Al": 4.43, "Co": 8.4, "Cr": 12.64, "Fe": 1.99,
+            "Mo": 1.8, "Nb": 0.9, "Ni": 58.7, "Ti": 2.04,
+            "V": 5.75,
+        }
+
+        findings = _review_composition(nominal, actual)
+
+        self.assertTrue(any(
+            "appears corrupted, misaligned or copied" in message
+            for message in messages(findings, "critical")
+        ))
+
     def test_see_comment_requires_a_real_disposition(self):
         parsed = {
             "comment": (
@@ -120,7 +165,7 @@ class LabReviewRegressionTests(unittest.TestCase):
             for message in messages(findings, "warning")
         ))
 
-    def test_sample_and_serial_count_mismatch_is_intentionally_skipped(self):
+    def test_sample_and_serial_count_mismatch_is_flagged(self):
         parsed = {
             "sample": {
                 "sample_no": "MS 7221C    MS 7217C\nMS 7375C\nMS 7441C",
@@ -131,9 +176,9 @@ class LabReviewRegressionTests(unittest.TestCase):
 
         findings = _review_traceability(parsed)
 
-        self.assertFalse(any(
-            "sample-to-part mapping" in message
-            for message in messages(findings)
+        self.assertTrue(any(
+            "do not map one-to-one" in message
+            for message in messages(findings, "warning")
         ))
 
     def test_spaced_serial_prefix_is_one_identifier(self):
@@ -148,6 +193,157 @@ class LabReviewRegressionTests(unittest.TestCase):
         findings = _review_traceability(parsed)
 
         self.assertFalse(any(category == "Traceability" for _sev, category, _msg in findings))
+
+    def test_slash_serial_is_one_identifier(self):
+        parsed = {
+            "sample": {
+                "sample_no": "MS 6827C",
+                "serial": "W007745/1-08",
+                "result": "Acceptable",
+            },
+        }
+
+        findings = _review_traceability(parsed)
+
+        self.assertFalse(any(category == "Traceability" for _sev, category, _msg in findings))
+
+    def test_missing_release_basis_is_explicit(self):
+        parsed = {
+            "document_text": "Material Composition Nominal Actual Pre-Solution 42 HRC",
+            "nominal": {"Ni": 60, "Cr": 16},
+            "actual": {"Ni": 59, "Cr": 16},
+            "hardness": {"pre": {"value": 42}, "post": {"value": 35}},
+        }
+
+        findings = _review_acceptance_and_methods(parsed)
+
+        self.assertTrue(any(category == "Acceptance criteria" and sev == "critical"
+                            for sev, category, _msg in findings))
+        self.assertTrue(any(category == "Chemistry method"
+                            for _sev, category, _msg in findings))
+        self.assertTrue(any(category == "Hardness evidence"
+                            for _sev, category, _msg in findings))
+
+    def test_sampling_location_is_not_a_sampling_plan(self):
+        parsed = {
+            "document_text": "Sampling Location: trailing edge",
+            "header": {"qty": "92"},
+            "sample": {"sample_no": "MS 1C\nMS 2C"},
+        }
+
+        findings = _review_sampling_basis(parsed)
+
+        self.assertTrue(any("No sampling plan" in message
+                            for message in messages(findings, "warning")))
+
+    def test_optical_gamma_prime_claim_requires_stronger_evidence(self):
+        parsed = {
+            "comment": "Gamma prime dissolution and re-precipitation are observed.",
+            "document_text": "Picture 1 Ortho Acid Etched 500x",
+        }
+
+        findings = _review_phase_evidence(parsed)
+
+        self.assertEqual(len(findings), 2)
+        self.assertTrue(all(severity == "warning" for severity, _cat, _msg in findings))
+
+    def test_static_page_ten_footer_is_flagged(self):
+        parsed = {
+            "document_text": "Metallurgical report",
+            "page_control": [{"sheet": "MET", "kind": "odd",
+                              "text": "WBI.9013 | Page 10"}],
+        }
+
+        findings = _review_document_control(parsed)
+
+        self.assertTrue(any(category == "Pagination" and "hard-coded" in message
+                            for _sev, category, message in findings))
+
+    def test_thickness_must_reproduce_a_measurement_or_mean(self):
+        parsed = {
+            "comment": "Average oxidation thickness is 0.022 mm.",
+            "pictures": [],
+        }
+        images = [{"measurements": [18, 43]}]
+
+        findings = _review_thickness(parsed, images, ocr_used=True)
+
+        self.assertTrue(any("not reproduced" in message
+                            for message in messages(findings, "warning")))
+
+    def test_supported_thickness_average_is_not_flagged(self):
+        parsed = {
+            "comment": "Average oxide thickness is 0.041 mm.",
+            "pictures": [],
+        }
+        images = [{"measurements": [41, 37, 44, 40, 42]}]
+
+        findings = _review_thickness(parsed, images, ocr_used=True)
+
+        self.assertEqual(findings, [])
+
+    def test_thickness_color_series_are_reconciled_separately(self):
+        parsed = {
+            "comment": (
+                "As shown in pictures 1 to 2, the chromium deficient layer is "
+                "0.065 mm and the oxidation layer is 0.033 mm."
+            ),
+            "pictures": [
+                ("Picture 1:", "Micrograph etched 100x"),
+                ("Picture 2:", "Micrograph etched 100x"),
+            ],
+        }
+        images = [
+            {
+                "measurements": [78, 89, 93, 22, 22, 25],
+                "measurement_groups": {
+                    "blue": [78, 89, 93], "red": [22, 22, 25],
+                },
+            },
+            {
+                "measurements": [39, 44, 48, 22, 24, 44],
+                "measurement_groups": {
+                    "blue": [39, 44, 48], "red": [22, 24, 44],
+                },
+            },
+        ]
+
+        findings = _review_thickness(parsed, images, ocr_used=True)
+
+        self.assertEqual(len(findings), 1)
+        self.assertIn("0.033 mm", findings[0][2])
+
+    def test_up_to_thickness_uses_highest_burned_in_reading(self):
+        parsed = {
+            "comment": "Oxidation reaches up to 0.062 mm in pics. 2 & 3.",
+            "pictures": [],
+        }
+        images = [{"measurements": [50, 59, 62, 71, 80]}]
+
+        findings = _review_thickness(parsed, images, ocr_used=True)
+
+        self.assertTrue(any("range 50–80" in message
+                            for message in messages(findings, "warning")))
+
+    def test_one_ocr_outlier_does_not_break_supported_color_average(self):
+        parsed = {
+            "comment": "Inter-diffusion is 0.019 mm in pics. 2 & 3.",
+            "pictures": [],
+        }
+        images = [
+            {
+                "measurements": [17, 18, 20],
+                "measurement_groups": {"red": [17, 18, 20]},
+            },
+            {
+                "measurements": [18, 20, 23, 48],
+                "measurement_groups": {"red": [18, 20, 23, 48]},
+            },
+        ]
+
+        findings = _review_thickness(parsed, images, ocr_used=True)
+
+        self.assertEqual(findings, [])
 
     def test_external_formula_reference_is_detected(self):
         wb = Workbook()
@@ -196,6 +392,49 @@ class LabReviewRegressionTests(unittest.TestCase):
             category == "Magnification"
             for _severity, category, _message in findings
         ))
+
+    def test_non_micrograph_photo_does_not_require_etch_status(self):
+        parsed = {
+            "pictures": [
+                ("Picture 1:", "Sampling Location"),
+                ("Picture 2:", "Al slurry coating thickness average 0.041 mm"),
+                ("Picture 3:", "Micrograph Middle Wall Ortho Acid Etched 500x"),
+            ],
+            "comment": "",
+        }
+
+        findings = _review_captions(parsed)
+
+        self.assertFalse(any("No etch status" in message for message in messages(findings)))
+
+    def test_picture_range_overreference_is_detected(self):
+        parsed = {
+            "pictures": [(f"Picture {number}:", "Micrograph Etched 200x")
+                         for number in range(1, 7)],
+            "comment": "Secondary carbides are shown in pics 4-8.",
+        }
+
+        findings = _review_captions(parsed)
+
+        self.assertTrue(any("Picture 8" in message
+                            for message in messages(findings, "warning")))
+
+    def test_duplicate_caption_number_still_allows_fourth_picture_reference(self):
+        parsed = {
+            "comment": "Gamma prime is shown in pic.no.4.",
+            "pictures": [
+                ("Picture 1:", "Micrograph etched 25x"),
+                ("Picture 2:", "Micrograph etched 100x"),
+                ("Picture 3:", "Micrograph etched 100x"),
+                ("Picture 3:", "Micrograph etched 500x"),
+            ],
+        }
+
+        findings = _review_captions(parsed)
+
+        self.assertTrue(any("repeated" in message for message in messages(findings)))
+        self.assertFalse(any("refers to Picture 4" in message
+                             for message in messages(findings)))
 
     def test_one_ocr_number_cannot_be_promoted_to_a_fact(self):
         selected, votes = _select_magnification([
@@ -279,6 +518,14 @@ class LabReviewRegressionTests(unittest.TestCase):
             (
                 "7504 AEN Saudi 7FA 3rd Stage Bucket Metallurgical Report.xlsx",
                 "7504", "MS7001FA", "3rd Stage Bucket",
+            ),
+            (
+                "6579 AEN Saudi FS.7FA 3rd Stage Bucket Metallurgical Report.xlsx",
+                "6579", "MS7001FA", "3rd Stage Bucket",
+            ),
+            (
+                "7068 AEN Saudi 7FA 1st Stage Shroud_Tiles Metallurgical Report.xlsx",
+                "7068", "MS7001FA", "1st Stage Shroud Tiles",
             ),
             (
                 "7646 AEN Saudi V84.2 2nd Stage Vane Metallurgical Report.xlsx",

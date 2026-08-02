@@ -13,6 +13,7 @@ from report_render import (
     _download_issue_cards,
     _faithful_view,
     _pages_to_pdf,
+    _trim_blank_trailing_pages,
     build_issue_index,
 )
 
@@ -161,12 +162,29 @@ class ReportRenderTests(unittest.TestCase):
                 timeout=30,
             )
 
-        self.assertEqual(result, {"ok": True})
+        self.assertEqual(result, {
+            "ok": True,
+            "source_page_count": 1,
+            "effective_page_count": 1,
+            "omitted_blank_pages": [],
+        })
         self.assertEqual(captured["print_area"], "'MET'!$A$1:$C$20")
         self.assertEqual(captured["orientation"], "portrait")
         self.assertEqual(captured["scale"], 76)
         self.assertEqual(captured["left_margin"], 0.42)
         self.assertEqual(captured["row_breaks"], [10])
+
+    def test_blank_trailing_pages_are_not_counted_as_report_pages(self):
+        content = Image.new("RGB", (600, 800), "white")
+        ImageDraw.Draw(content).rectangle((60, 80, 540, 650), fill="black")
+        blank = Image.new("RGB", (600, 800), "white")
+        # Footer-only ink must not make this an effective report page.
+        ImageDraw.Draw(blank).text((260, 760), "Page 10", fill="black")
+
+        pages, omitted = _trim_blank_trailing_pages([content, blank, blank.copy()])
+
+        self.assertEqual(len(pages), 1)
+        self.assertEqual(omitted, [2, 3])
 
     def test_download_pdf_embeds_all_issue_comments_beside_report(self):
         report = Image.new("RGB", (600, 800), "white")
