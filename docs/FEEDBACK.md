@@ -719,3 +719,64 @@ Mohamed pushed back on the "sandbox" explanation directly and was right to.
 - Fixed the button-wrap defect entry 008 (above) found — see the commit on
   this branch after this entry. Two rows instead of three squeezed columns;
   verified in a fresh screenshot at the same 1500px width that showed it.
+
+---
+
+## 010 · Sonnet → Opus · 2 Aug 2026
+
+**Status:** Layout reworked and a real rendering defect fixed, both found by
+Mohamed saying the tool "is not working good" and by then actually looking at
+the screen instead of at the test results.
+
+**Found — the annotated report was clipped, and that is why it looked broken**
+The AEG template's own print setup is narrower than its sheet. A literally
+faithful render therefore splits every wide row across pages: on 6943, page 1
+cut off mid-table (Result, Remarks and Outgoing Coating Type were missing)
+and pages 2–4 were ~95% blank with two stray rows at the top. Same on every
+metallurgical report in the corpus: 6831 4p, 6943 4p, 7227 5p, 7253 2p, all
+clipped. A reviewer cannot check a disposition they cannot see.
+
+Fixed with `fit_width` on `render_report_faithful_view()` (fit-to-one-page-
+wide, height unconstrained, column breaks dropped). Result: 6831 4p→1p,
+6943 4p→1p, 7227 5p→2p, 7253 2p→1p, every column of a row now visible
+together, badges still anchored to the right cells. The coating report stays
+5p, correctly — it is genuinely five pages tall and fit-to-width does not
+touch vertical pagination.
+
+**Deliberate split, so the "faithful" contract is not quietly broken:**
+`report_render`'s own default stays `fit_width=False` — that function's job is
+fidelity to the document as it prints, and
+`test_faithful_render_preserves_workbook_pagination` guards that intent.
+`ui/lab_tool._cached_annotated_report` defaults it **True** and exposes a
+"Fit page width" toggle, because the app's job is readability. Library keeps
+the contract; the product makes the choice, visibly and reversibly.
+
+**Done — the layout, properly this time**
+Entry 007's UI kept the old page shape and added a banner. Mohamed's
+"I asked for a redesign from scratch" was fair. `_render_detail` is now a
+workspace, not a stack of expanders:
+- Uploader and OCR toggle moved to the **sidebar** — they were pushing the
+  report below the fold on every rerun.
+- Compact identity line → verdict → severity strip → **report and findings
+  side by side, on the first screen, no scrolling.**
+- Extracted-field dump, template notes and exports demoted to tabs
+  underneath. They are reference material, not decisions.
+- `.block-container` widened 1100→1500px; at 1100 the report pane was too
+  narrow to read a spreadsheet page in.
+
+**Also fixed**
+- Dark-mode contrast bug: `.aeg-issue-number` fills with `--aeg-ink`, which
+  is *light* in dark mode, while its text stayed `#fff` — the issue numbers
+  were invisible. `--aeg-badge-ink` now flips per theme.
+- The button-wrap defect from entry 008 (two rows, not three columns).
+
+**Verified** on the real corpus with OCR **on** (installed `tesseract-ocr`;
+entry 007's UI work had only ever run with OCR off, which is not the
+deployed default): 6943 and 7253, light and dark, no exceptions. Timing,
+first load, uncached: review 7–12s + render 10–18s ≈ 25s, then cached.
+Full suite 68 tests, OK.
+
+**Next**
+- Step 3 (text-anchored annotation, D6) is still open and still worth doing;
+  fit-width reduces the page count it has to deal with but does not replace it.
+- `iir_tool.py` / `photo_tool.py` still use the old shell.
