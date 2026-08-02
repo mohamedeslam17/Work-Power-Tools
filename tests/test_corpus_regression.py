@@ -131,7 +131,6 @@ class RealMultiSampleTests(unittest.TestCase):
                     len(L._identifier_tokens(sample.get("serial") or "", "serial")),
                     n_serials)
 
-    @unittest.expectedFailure
     def test_model_exposes_one_record_per_sample(self):
         """D3 against real files. The tokens exist but never become samples, so
         every downstream check reviews a 4-sample report as though it were one."""
@@ -140,7 +139,6 @@ class RealMultiSampleTests(unittest.TestCase):
             with self.subTest(job=job):
                 self.assertEqual(len(review(name)[1]["samples"]), n_samples)
 
-    @unittest.expectedFailure
     def test_shared_material_is_carried_onto_every_sample(self):
         """One material cell covers all samples in the row; each sample record
         must carry it so the hardness and composition checks can run per sample."""

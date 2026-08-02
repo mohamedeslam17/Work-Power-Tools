@@ -242,11 +242,11 @@ def _value_below(ws, row, col, max_scan=6):
 #     for this set to occasionally include a false positive.
 _HEADER_LABELS = {
     'customer':     r'Customer',
-    'customer_ref': r'Customer\s*Ref(?:erence)?\.?\s*(?:No\.?|Number)?',
-    'aeg_ref':      r'AEG\s*Ref(?:erence)?\.?\s*(?:No\.?|Number)?',
-    'job':          r'AEG\s*Job\s*(?:No\.?|Number)?',
+    'customer_ref': r'Customer\s*Ref\.?(?:erence)?\s*(?:No\.?|Number)?',
+    'aeg_ref':      r'AEG\.?\s*Ref\.?(?:erence)?\s*(?:No\.?|Number)?',
+    'job':          r'AEG\.?\s*Job\.?\s*(?:No\.?|Number)?',
     'machine':      r'Machine\s*Type',
-    'qty':          r'Quantity(?:\s*per\s*(?:set|batch))?',
+    'qty':          r'Quantity(?:\s*(?:p\.?|per)\s*(?:Set|Batch))?',
     'eoh':          r'EOH',
 }
 _HARDNESS_LABELS = {'pre': r'Pre-?\s*Solution', 'post': r'Post-?\s*Solution'}
@@ -524,14 +524,64 @@ def _header(ws, boundary):
     return fields, out, loc
 
 
-def _samples(ws, boundary):
-    """Every row of the sample table, not just the first (D3).
+def _split_packed(text):
+    """Tokens out of a cell that may pack several values, newline/multi-space
+    separated (the real AEG report shape — see `_fan_out_row`). A single
+    space is kept inside a token (`'2nd Stage Vane'` stays one token); a
+    newline or a run of 2+ spaces is a separator. An unpacked cell returns a
+    single-item list holding the whole text."""
+    t = _txt(text)
+    if not t:
+        return []
+    parts = [p.strip() for p in re.split(r'[\n;]+|\s{2,}', t)]
+    return [p for p in parts if p]
+
+
+def _fan_out_row(row_vals):
+    """One table row may itself pack multiple samples into its cells — not a
+    hypothetical: real AEG reports write every sample into a SINGLE row,
+    whitespace/newline separated within each cell (`'sample nr'` holds
+    `'MS 6369C        MS 6411C\\nMS 6889C         MS 6931C'`, `'S/N'` holds
+    the matching serials the same way, `'material'` holds one value shared by
+    all of them). This is the D3 fix's real shape: tokenize-and-fan-out, not
+    read-more-rows.
+
+    The `sample_no` field sets how many samples the row holds. Any other
+    field that packs into exactly that many tokens is distributed one-to-one
+    (index-paired with `sample_no`); a field that doesn't (a shared material,
+    a single verdict deferred to the comment) is broadcast unchanged onto
+    every fanned sample. A row that isn't packed (`sample_no` has one token,
+    the traditional one-row-per-sample layout) returns exactly the one sample
+    it already was.
+    """
+    primary = row_vals.get('sample_no')
+    tokens = _split_packed(primary)
+    n = len(tokens)
+    if n <= 1:
+        return [row_vals]
+    fanned = [{} for _ in range(n)]
+    for key, value in row_vals.items():
+        parts = _split_packed(value)
+        for i in range(n):
+            fanned[i][key] = parts[i] if len(parts) == n else value
+    return fanned
+
+
+def _sample_rows(ws, boundary):
+    """One record per physical row of the sample table, not just the first
+    (D3, in its row-per-sample shape).
 
     A row belongs to the table as long as its `sample nr` cell (the table's
     primary column) is non-empty and is not itself another label — the first
     blank or label-boundary cell in that column ends the table, so a later
     section that happens to reuse the same column is never mistaken for more
-    sample rows.
+    sample rows. A row's cells may themselves pack more than one sample (the
+    real AEG shape) — that fan-out happens one level up in `_samples`; this
+    function stays at "one record per row" because the back-compat `sample`
+    view (`parsed['sample']`) needs the un-fanned row intact: the existing
+    `_identifier_tokens()`-based counting in `_review_traceability` already
+    tokenizes a packed cell correctly and would be shortchanged by seeing
+    only the first fanned-out sample.
     """
     hdr = _find(ws, r'Sample\s*nr')
     if not hdr:
@@ -558,12 +608,19 @@ def _samples(ws, boundary):
         return [], []
     primary_col = field_cols[0][1]
 
-    samples, locs = [], []
+    rows, locs = [], []
     max_row = min(ws.max_row, hrow + 500)
     for r in range(hrow + 1, max_row + 1):
         if (r, primary_col) in boundary:
             break
-        if not _txt(ws.cell(row=r, column=primary_col).value):
+        primary_text = _txt(ws.cell(row=r, column=primary_col).value)
+        if not primary_text:
+            break
+        # Every label in this report family ends in ':' (including section
+        # markers like 'Hardness Results:' that aren't in any registered
+        # pattern) while no observed sample-number value does — a colon in
+        # the primary column is the table ending, not another sample.
+        if primary_text.rstrip().endswith(':'):
             break
         row_vals, row_loc = {}, {}
         for key, col in field_cols:
@@ -571,9 +628,22 @@ def _samples(ws, boundary):
             if v:
                 row_vals[key] = v
                 row_loc[key] = {'label': (hrow, col), 'value': (r, col)}
-        samples.append(row_vals)
+        rows.append(row_vals)
         locs.append(row_loc)
-    return samples, locs
+    return rows, locs
+
+
+def _samples(rows, locs):
+    """The canonical per-sample list: every row from `_sample_rows` fanned
+    out (`_fan_out_row`) in case it packs more than one sample into its
+    cells — the real AEG shape, not a hypothetical one (see `_fan_out_row`).
+    """
+    samples, fanned_locs = [], []
+    for row_vals, row_loc in zip(rows, locs):
+        for fanned in _fan_out_row(row_vals):
+            samples.append(fanned)
+            fanned_locs.append(row_loc)
+    return samples, fanned_locs
 
 
 def _hardness_unit(raw):
@@ -726,7 +796,8 @@ def parse_metallurgical(wb, media=0, micrograph_count=None):
     boundary = _build_boundary_index(ws)
 
     fields, header, lh = _header(ws, boundary)
-    samples, ls = _samples(ws, boundary)
+    rows, row_locs = _sample_rows(ws, boundary)
+    samples, ls = _samples(rows, row_locs)
     hardness, lhd = _hardness(ws, boundary)
     nominal_tables = _composition_tables(ws, 'Nominal')
     actual_tables = _composition_tables(ws, 'Actual')
@@ -735,7 +806,9 @@ def parse_metallurgical(wb, media=0, micrograph_count=None):
     pictures, lp = _pictures(ws)
     signoff, lso = _signoff(ws, boundary)
 
-    sample = samples[0] if samples else {}
+    # Back-compat `sample` is the un-fanned row, not samples[0] — see
+    # `_sample_rows`'s docstring for why the distinction matters.
+    sample = rows[0] if rows else {}
     empty_meta = {'entries': [], 'duplicate_headers': []}
     nominal_meta = nominal_tables[0] if nominal_tables else empty_meta
     actual_meta = actual_tables[0] if actual_tables else empty_meta
@@ -767,7 +840,7 @@ def parse_metallurgical(wb, media=0, micrograph_count=None):
         'loc': {
             'sheet':    ws.title,
             'header':   lh,
-            'sample':   ls[0] if ls else {},
+            'sample':   row_locs[0] if row_locs else {},
             'samples':  ls,
             'hardness': lhd,
             'nominal':  nominal_tables[0]['loc'] if nominal_tables else {},
