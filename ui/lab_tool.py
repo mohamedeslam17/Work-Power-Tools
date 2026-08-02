@@ -38,7 +38,7 @@ def _cached_review(name, data, ocr):
 
 
 @st.cache_data(show_spinner=False)
-def _cached_annotated_report(name, data, ocr, extra_findings=()):
+def _cached_annotated_report(name, data, ocr, extra_findings=(), fit_width=True):
     """Return a page-oriented report-centric review package.
 
     The exact LibreOffice rendering is preferred. A spreadsheet-style
@@ -46,10 +46,16 @@ def _cached_annotated_report(name, data, ocr, extra_findings=()):
     available in the deployment environment.
 
     Deliberately built from EVERY finding, not just the ones triage state
-    currently wants shown — this stays cached on (name, data, ocr) alone so
+    currently wants shown — this stays cached on the arguments alone so
     dismissing or restoring a finding never re-runs LibreOffice/Pillow. The
     triage state (scope partition, accept/dismiss) is applied afterwards, as
     a cheap filter over the already-rendered issue list; see `_render_detail`.
+
+    fit_width defaults True here even though report_render's own default is
+    False: the AEG template prints narrower than its sheet, so a literally
+    faithful render cuts the sample table off mid-row (Result and Remarks
+    land on later, near-empty pages). A reviewer checking data needs the whole
+    row; someone who wants the true printed pagination can turn it off.
     """
     rtype, parsed, findings = _cached_review(name, data, ocr)
     findings = list(findings) + list(extra_findings or ())
@@ -57,7 +63,8 @@ def _cached_annotated_report(name, data, ocr, extra_findings=()):
     if report_render.libreoffice_available():
         try:
             view, exact_status = report_render.render_report_faithful_view(
-                data, parsed, findings=findings, filename=name)
+                data, parsed, findings=findings, filename=name,
+                fit_width=fit_width)
             if view:
                 return view, 'exact'
         except Exception as e:
@@ -202,19 +209,26 @@ def _findings_csv(findings):
 
 
 def render():
-    files = st.file_uploader(
-        "Upload lab report(s) to check for issues (.xlsx)",
-        type=["xlsx"], accept_multiple_files=True, key="lab_files")
-    if not files:
-        return
-
+    # File picking and settings live in the sidebar, not above the report:
+    # once a report is open the main column is a workspace, and an uploader
+    # parked at the top of it just pushes the thing you came to look at
+    # below the fold on every rerun.
     ocr_ok = _ocr_available()
-    ocr = st.toggle(
-        "Read micrograph identity, legends & etch contrast (slower)", value=ocr_ok,
-        disabled=not ocr_ok,
-        help="Cross-checks every micrograph's burned-in job number, magnification, "
-             "scale and etch contrast via OCR."
-             + ("" if ocr_ok else " Unavailable — Tesseract isn't installed in this environment."))
+    with st.sidebar:
+        st.divider()
+        files = st.file_uploader(
+            "Lab report(s) (.xlsx)",
+            type=["xlsx"], accept_multiple_files=True, key="lab_files")
+        ocr = st.toggle(
+            "Read micrograph legends (slower)", value=ocr_ok,
+            disabled=not ocr_ok,
+            help="Cross-checks every micrograph's burned-in job number, magnification, "
+                 "scale and etch contrast via OCR."
+                 + ("" if ocr_ok else
+                    " Unavailable — Tesseract isn't installed in this environment."))
+    if not files:
+        st.info("Upload one or more AEG lab reports (.xlsx) from the sidebar to review them.")
+        return
 
     reviewed = []
     for f in files:
@@ -260,40 +274,68 @@ def render():
 
 
 def _render_detail(r, ocr):
+    """The triage workspace.
+
+    Deliberately NOT a stack of expanders: the reviewer's job is "is this
+    releasable, and if not where", so the verdict and the report-plus-findings
+    panes own the top of the screen and are reachable without scrolling.
+    Everything that is reference material rather than a decision — the
+    extracted field dump, the template-level notes, the micrograph legends,
+    the exports — sits in tabs underneath, one click away and out of the path.
+    """
     name = r['name']
-    with st.container(border=True):
-        components.report_header(name, tag=_TYPE_LABEL[r['rtype']], facts=r['facts'])
-        if r['rtype'] == 'unknown':
-            st.warning("This workbook didn't match a metallurgical or coating layout, so only "
-                       "a limited review ran. Check it's an AEG lab report `.xlsx`.")
 
-        tier, label, reason = _verdict(r['active'])
-        _verdict_banner(tier, label, reason)
+    _identity_bar(r)
+    if r['rtype'] == 'unknown':
+        st.warning("This workbook didn't match a metallurgical or coating layout, so only "
+                   "a limited review ran. Check it's an AEG lab report `.xlsx`.")
+
+    tier, label, reason = _verdict(r['active'])
+    _verdict_banner(tier, label, reason)
+
+    strip, restore = st.columns([3, 1], vertical_alignment="center")
+    with strip:
         components.severity_readout(r['counts'])
-
+    with restore:
         if r['dismissed']:
-            with st.expander(f"🗑 {len(r['dismissed'])} dismissed — click to restore"):
+            with st.popover(f"🗑 {len(r['dismissed'])} dismissed", width="stretch"):
                 _dismissed_list(name, r['dismissed'])
 
-        with st.popover("Actions"):
-            if r['rtype'] in ('metallurgical', 'coating'):
-                if st.button("📁 Add to photo library", key=f"add_{name}", width="stretch"):
-                    added = add_to_library(name, r['f'].getvalue(), r['parsed'], r['rtype'])
-                    if added:
-                        photo_tool.invalidate()
-                    st.toast(f"Added {added} micrograph(s) to the library." if added
-                             else "No new micrographs (already in library).")
-            st.download_button(
-                "⬇ Findings (.csv)", data=_findings_csv(r['findings']),
-                file_name=f"{Path(name).stem}_findings.csv", mime="text/csv",
-                key=f"labcsv_{name}", width="stretch")
+    # ── the workspace itself ──────────────────────────────────────────────
+    _annotated_report(r, ocr)
 
-        with st.expander("Extracted information", expanded=True):
-            _extracted_view(r['rtype'], r['parsed'])
+    # ── reference material, out of the triage path ────────────────────────
+    labels = ["Extracted data", f"About this template ({len(r['template'])})", "Export"]
+    tab_extracted, tab_template, tab_export = st.tabs(labels)
+    with tab_extracted:
+        _extracted_view(r['rtype'], r['parsed'])
+    with tab_template:
+        _template_body(name, r['template'])
+    with tab_export:
+        if r['rtype'] in ('metallurgical', 'coating'):
+            if st.button("📁 Add micrographs to photo library", key=f"add_{name}"):
+                added = add_to_library(name, r['f'].getvalue(), r['parsed'], r['rtype'])
+                if added:
+                    photo_tool.invalidate()
+                st.toast(f"Added {added} micrograph(s) to the library." if added
+                         else "No new micrographs (already in library).")
+        st.download_button(
+            "⬇ Findings (.csv)", data=_findings_csv(r['findings']),
+            file_name=f"{Path(name).stem}_findings.csv", mime="text/csv",
+            key=f"labcsv_{name}")
 
-        _template_section(name, r['template'])
 
-        _annotated_report(r, ocr)
+def _identity_bar(r):
+    """Filename, type and the key facts on one compact line — the report's
+    identity is context for the verdict, not a section of its own."""
+    st.markdown(
+        f'<div class="aeg-idbar">'
+        f'<span class="aeg-idbar-name">{html.escape(r["name"])}</span>'
+        f'<span class="aeg-idbar-tag">{html.escape(_TYPE_LABEL[r["rtype"]])}</span>'
+        f'</div>',
+        unsafe_allow_html=True)
+    if r['facts']:
+        st.caption(r['facts'])
 
 
 def _dismissed_list(name, dismissed):
@@ -307,19 +349,19 @@ def _dismissed_list(name, dismissed):
             st.rerun()
 
 
-def _template_section(name, template_findings):
-    """D11's other half: template-scoped findings, said once, collapsed."""
+def _template_body(name, template_findings):
+    """D11's other half: template-scoped findings, said once, in their own tab."""
     if not template_findings:
+        st.caption("Nothing template-level to report for this layout.")
         return
-    with st.expander(f"About this template ({len(template_findings)})"):
-        st.markdown(
-            '<div class="aeg-template-note">These describe a gap in the AEG report '
-            'template itself — every report on this template shows the same items — '
-            'not something specific to this report, so they never affect the verdict '
-            'above and are listed once here instead of repeating per report.</div>',
-            unsafe_allow_html=True)
-        components.findings_table(
-            components.normalize_lab(template_findings), key=f"template_{name}")
+    st.markdown(
+        '<div class="aeg-template-note">These describe a gap in the AEG report '
+        'template itself — every report on this template shows the same items — '
+        'not something specific to this report, so they never affect the verdict '
+        'above and are listed once here instead of repeating per report.</div>',
+        unsafe_allow_html=True)
+    components.findings_table(
+        components.normalize_lab(template_findings), key=f"template_{name}")
 
 
 def _shown(value):
@@ -555,9 +597,11 @@ def _annotated_report(r, ocr):
     """
     f = r['f']
     name = f.name
+    fit_width = st.session_state.get(f'lab_fit_{name}', True)
     with st.spinner(f"Building annotated report for {name}…"):
         view, mode = _cached_annotated_report(
-            name, f.getvalue(), ocr, tuple(r.get('version_findings') or ()))
+            name, f.getvalue(), ocr, tuple(r.get('version_findings') or ()),
+            fit_width)
 
     if not view:
         st.error(f"Could not build the annotated report view — {mode}.")
@@ -573,17 +617,10 @@ def _annotated_report(r, ocr):
         st.error("The workbook rendered, but no report pages were produced.")
         return
 
-    st.markdown("### Annotated report")
     omitted = view.get('omitted_blank_pages') or []
-    page_note = (
-        f" {len(omitted)} blank trailing source page(s) were omitted: "
-        f"{', '.join(map(str, omitted))}."
-        if omitted else ""
-    )
-    st.caption(
-        "Open one effective report page at a time. Click a finding to jump the "
-        f"view to it. Dismissed and template-level findings are hidden here — see "
-        f"the sections above.{page_note}")
+    if omitted:
+        st.caption(f"{len(omitted)} blank trailing source page(s) omitted: "
+                   f"{', '.join(map(str, omitted))}.")
 
     active_keys = {(cat, msg) for _sev, cat, msg in r['active']}
     all_issues = [issue for issue in (view.get('issues') or [])
@@ -611,23 +648,33 @@ def _annotated_report(r, ocr):
     if focused and focused.get('pages') and st.session_state.get(f'lab_page_{name}') not in focused['pages']:
         st.session_state[f'lab_page_{name}'] = focused['pages'][0]
 
-    if len(numbers) <= 6:
-        selected_number = st.pills(
-            "Report page",
-            numbers,
-            default=numbers[0],
-            selection_mode="single",
-            format_func=lambda number: labels[number],
-            key=f"lab_page_{name}",
-            label_visibility="collapsed",
-        ) or numbers[0]
-    else:
-        selected_number = st.selectbox(
-            "Report page",
-            numbers,
-            format_func=lambda number: labels[number],
-            key=f"lab_page_{name}",
-        )
+    pager, fitter = st.columns([3, 1], vertical_alignment="center")
+    with pager:
+        if len(numbers) <= 6:
+            selected_number = st.pills(
+                "Report page",
+                numbers,
+                default=numbers[0],
+                selection_mode="single",
+                format_func=lambda number: labels[number],
+                key=f"lab_page_{name}",
+                label_visibility="collapsed",
+            ) or numbers[0]
+        else:
+            selected_number = st.selectbox(
+                "Report page",
+                numbers,
+                format_func=lambda number: labels[number],
+                key=f"lab_page_{name}",
+                label_visibility="collapsed",
+            )
+    with fitter:
+        if mode == 'exact':
+            st.toggle(
+                "Fit page width", key=f'lab_fit_{name}', value=fit_width,
+                help="On: rescale so every column of a row is visible together. "
+                     "Off: the workbook's own print layout, which on this template "
+                     "splits wide rows across pages.")
     page = next(item for item in pages if item['number'] == selected_number)
 
     report_col, issue_col = st.columns([3.25, 1.35], gap="large")

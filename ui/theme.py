@@ -72,10 +72,31 @@ html[data-theme="dark"] {
   --aeg-pass-bg: #16241c;
   --aeg-notlocated-line: #e0c24a;
   --aeg-notlocated-bg: #2a2718;
+  /* The number badge is filled with --aeg-ink, which is LIGHT in dark mode,
+     so its text has to flip to the dark background colour or the number
+     disappears into the pill. */
+  --aeg-badge-ink: #12161a;
   --aeg-shadow: 0 1px 3px rgba(0, 0, 0, .4);
 }
 
-.block-container { padding-top: 2rem; max-width: 1100px; }
+/* Wider than the old 1100px: the Lab screen is a two-pane workspace (report
+   beside findings), and at 1100 the report pane was too narrow to read a
+   spreadsheet page in. */
+.block-container { padding-top: 1.4rem; max-width: 1500px; }
+
+/* ── Report identity — one compact line, not a section ─────────────────── */
+.aeg-idbar {
+  display: flex; align-items: baseline; gap: .6rem; flex-wrap: wrap;
+  margin: 0 0 .15rem;
+}
+.aeg-idbar-name {
+  font-weight: 750; font-size: 1rem; color: var(--aeg-ink); word-break: break-word;
+}
+.aeg-idbar-tag {
+  font-size: .68rem; font-weight: 700; letter-spacing: .06em; text-transform: uppercase;
+  color: var(--aeg-muted); border: 1px solid var(--aeg-card-border);
+  border-radius: 999px; padding: .05rem .45rem; white-space: nowrap;
+}
 [data-testid="stDecoration"] { display: none; }
 [data-testid="stSidebar"] [data-testid="stCaptionContainer"] { padding: 0 0 .5rem .1rem; }
 

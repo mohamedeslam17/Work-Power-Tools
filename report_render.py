@@ -621,12 +621,22 @@ def build_issue_index(parsed, findings=None):
 
 
 def render_report_faithful_view(
-        data, parsed, findings=None, filename=None, dpi=150, timeout=90):
+        data, parsed, findings=None, filename=None, dpi=150, timeout=90,
+        fit_width=False):
     """Return a page-oriented annotated report package and a status string.
 
     The package contains individually annotated page PNGs, unique issue
     records, report-level findings, and PDF/PNG downloads. This is the primary
     UI product; it avoids forcing every page and finding into one tall image.
+
+    fit_width : the AEG template's own print setup is narrower than the sheet,
+        so a faithful render splits columns across pages — page 1 of report
+        6943 cuts off mid-table (Result, Remarks and the outgoing-coating
+        columns land on later, otherwise near-empty pages). Passing True adds
+        fit-to-one-page-wide scaling so a reviewer sees every column of a row
+        together. It is deliberately OFF by default: this function's contract
+        is fidelity to the document as it prints, and the callers that want
+        readability over fidelity opt in.
     """
     if not _PIL:
         return None, 'Pillow unavailable'
@@ -635,7 +645,8 @@ def render_report_faithful_view(
     if not _find_soffice():
         return None, 'LibreOffice not installed'
     try:
-        return _faithful_view(data, parsed, findings, filename, dpi, timeout), 'ok'
+        return _faithful_view(data, parsed, findings, filename, dpi, timeout,
+                              fit_width), 'ok'
     except subprocess.TimeoutExpired:
         return None, 'LibreOffice timed out'
     except Exception as e:
@@ -651,13 +662,25 @@ def render_report_faithful(data, parsed, findings=None, filename=None, dpi=130, 
     return ((view or {}).get('combined_png'), status)
 
 
-def _faithful_view(data, parsed, findings, filename, dpi, timeout):
+def _faithful_view(data, parsed, findings, filename, dpi, timeout, fit_width=False):
     loc = parsed.get('loc') or {}
     issues, extras = build_issue_index(parsed, findings)
 
     wb = openpyxl.load_workbook(io.BytesIO(data))      # keep styles + images
     sheet = loc.get('sheet')
     ws = wb[sheet] if sheet and sheet in wb.sheetnames else wb.active
+
+    if fit_width:
+        # Scale to one page wide, unlimited pages tall, and drop the column
+        # breaks that would otherwise still split the sheet horizontally.
+        # Height is left free so rows are not crushed to fit.
+        ws.sheet_properties.pageSetUpPr.fitToPage = True
+        ws.page_setup.fitToWidth = 1
+        ws.page_setup.fitToHeight = 0
+        try:
+            ws.col_breaks.brk = []
+        except Exception:
+            pass
 
     span = {}
     for rng in ws.merged_cells.ranges:
