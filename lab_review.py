@@ -2863,6 +2863,55 @@ def review_report(filename, data, ocr=True):
     return rtype, parsed, findings
 
 
+# ── D11 · finding scope ────────────────────────────────────────────────────
+# `review_report()` reviews one file and has no cross-report context, so scope
+# cannot be inferred by measuring which findings repeat across a batch — that
+# measurement is how tests/test_corpus_regression.py CHECKS this table, not
+# how the table itself is built. It is declared here, by hand, against what
+# the real corpus showed firing identically on every one of the four real
+# reports (docs/FEEDBACK.md entries 003-006): each of these says the
+# TEMPLATE has no field for something, not that this particular report is
+# missing something. They are genuine gaps worth fixing at the template, so
+# — unlike the two always-true criticals Mohamed had removed outright — they
+# are partitioned out, not deleted.
+#
+# Each pattern is `re.match`-ed (anchored at the start) against the finding's
+# message, so it only needs to cover the fixed lead-in text a rule always
+# emits, never the per-report detail that follows (an element list, a page
+# footer string, a specimen count) — that detail is exactly what makes two
+# template-scoped findings differ in full text while remaining the same
+# underlying observation.
+TEMPLATE_SCOPED = (
+    ('Composition', r'Nominal trace element\(s\) not reported in Actual'),
+    ('Composition', r'Reported but not in nominal spec'),
+    ('Chemistry method', r'Chemical results lack'),
+    ('Document control',
+     r'The report body has no controlled report number and revision/status'),
+    ('Pagination',
+     r'The printed footer uses a hard-coded page label instead of sequential '
+     r'page numbering'),
+    ('Sampling',
+     r'No sampling plan or justification shows how the listed specimen\(s\) '
+     r'represent the full set'),
+)
+_TEMPLATE_SCOPED_RX = tuple(
+    (category, re.compile(pattern)) for category, pattern in TEMPLATE_SCOPED)
+
+
+def partition_by_scope(findings):
+    """Split findings into (report_scoped, template_scoped) using the
+    TEMPLATE_SCOPED table above. Order is preserved within each list."""
+    report, template = [], []
+    for finding in findings:
+        _sev, category, message = finding
+        if any(category == cat and rx.match(message)
+               for cat, rx in _TEMPLATE_SCOPED_RX):
+            template.append(finding)
+        else:
+            report.append(finding)
+    return report, template
+
+
 def summarize(findings):
     """Return counts per severity."""
     out = {'critical': 0, 'warning': 0, 'info': 0, 'pass': 0}

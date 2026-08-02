@@ -196,7 +196,6 @@ class FindingScopeTests(unittest.TestCase):
             [k for k in constant if k[0] == "critical"], [],
             "a critical that fires on 100% of reports hides the real ones")
 
-    @unittest.expectedFailure
     def test_scope_partitioning_exists(self):
         """D11, remaining work. Six findings still fire on all four reports —
         four warnings and two infos. None is wrong; each says the TEMPLATE has
@@ -217,7 +216,6 @@ class FindingScopeTests(unittest.TestCase):
         self.assertTrue(template, "nothing was classified as template-scoped")
         self.assertTrue(report, "everything was classified as template-scoped")
 
-    @unittest.expectedFailure
     def test_no_report_scoped_finding_is_constant_across_the_corpus(self):
         """D11's real acceptance criterion. After partitioning, a finding that
         survives into the per-report list must be capable of being absent from
@@ -230,7 +228,6 @@ class FindingScopeTests(unittest.TestCase):
         constant = sorted(k for k, c in counts.items() if c == len(MET))
         self.assertEqual(constant, [], "these are template-scoped, not report-scoped")
 
-    @unittest.expectedFailure
     def test_template_findings_are_identical_across_reports(self):
         """The other half: the template bucket should be stable, because it
         describes the template, not the report. If it varies per report, the
