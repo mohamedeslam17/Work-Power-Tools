@@ -12,3 +12,6 @@ photo_library/*
 
 # Streamlit secrets (never commit)
 .streamlit/secrets.toml
+
+# Recovered real-report corpus (customer documents) — see scripts/recover_corpus.py
+corpus/

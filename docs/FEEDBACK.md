@@ -58,3 +58,74 @@ it proves the defects exist but not that fixing them is sufficient. Real
 reports, with an engineer recording the findings that *should* be raised, is
 the only thing that will tell us whether the rebuild actually worked. It cannot
 be done by an agent and it is the highest-value action available.
+
+---
+
+## 002 · Opus → Sonnet · 2 Aug 2026
+
+**Status:** Corpus recovered. Spec corrected against real files. Phase 1 still
+not started — but read this before entry 001's plan, it changes the order.
+
+**Done**
+- Found five REAL AEG reports in this repo's own git history — committed early,
+  removed when `*.xlsx` was gitignored, blobs still reachable. Four
+  metallurgical, one coating. `scripts/recover_corpus.py` materialises them
+  into `corpus/` (gitignored; never commit them, never rename them).
+- Ran the live reviewer over all five. Added
+  `tests/test_corpus_regression.py` — 10 tests, 4 expected failures.
+
+**Found**
+
+*I got D3 wrong.* Real reports do not put one sample per row. Every sample is
+packed into a **single cell**, whitespace/newline separated — report 6831 cell
+B9 is `'MS 6369C        MS 6411C\nMS 6889C         MS 6931C'`, with matching
+serials in G9, one shared material, and `Result = 'See comment'` deferring the
+verdict to prose. So the job is tokenize-and-fan-out, not read-more-rows.
+`_identifier_tokens()` already tokenizes these correctly and is only ever used
+for counting. **The row-based fixtures in `test_parser_contract.py` are
+synthetic and unverified — I have marked them so. Where the two files
+disagree, the corpus wins.**
+
+*New defect, D11, and I think it outranks most of the parser work.* Across the
+four real reports: 9 of 25 distinct findings fire on **all four**, so 60–75% of
+any report's output is identical to every other report's. Both criticals are in
+that set. The findings are not wrong — the template really never states an
+acceptance spec — they are criticisms of the *template*, re-emitted per report.
+
+The cost is sharp: report 6943 has a genuine third critical, serial
+`C1ZP 093046` duplicated in one cell. A real find, arriving indistinguishable
+from two that always fire. A critical that cannot be absent carries no
+information and camouflages the ones that can.
+
+*The parser is better than I judged it.* On all four real reports the job,
+machine, customer, material, composition tables and captions extract correctly.
+D2/D9/D10 are latent, not routine — they need a blank field or colliding prose.
+That lowers their urgency. D9 is still easy to trigger on this template because
+header fields sit in label/value pairs on one row, so a blank Customer scans
+straight into `Machine Type:`.
+
+**Revised order — this supersedes entry 001's "start with D9"**
+
+1. **1g (D11, finding scope).** Cheapest, largest perceived win, independent of
+   everything else. Roughly: tag each check `report` or `template`, stop
+   emitting template-scoped ones per report.
+2. **1c (D3), to the corpus shape.** The only release-critical defect that is
+   active on real files today.
+3. **1a/1b (D1, D2, D9, D10).** Still the right foundation, but latent — do it
+   after the two above rather than before.
+4. 1d (D4) and 1e (D5) last; neither is exercised by the current corpus.
+
+**Questions**
+- None blocking.
+- For Mohamed, not for you: the two constant criticals ("no governing
+  acceptance specification", "Result says See comment") are *true* of every
+  report AEG issues. Is that a template problem to fix once at source, or
+  should the tool keep saying it every time? That answer decides whether 1g is
+  a display change or a rules change. Proceed with the display change and flag
+  it — that is reversible either way.
+
+**Next**
+- Corpus caveat worth keeping in view: five reports, one template family, one
+  coating file. It covers the happy path well and says nothing about template
+  drift or revisions. It is enough to stop guessing; it is not enough to
+  declare the rebuild finished.

@@ -184,11 +184,24 @@ class LabelResolutionTests(unittest.TestCase):
 
 # ── D3 · every sample must be parsed ──────────────────────────────────────
 class MultiSampleTests(unittest.TestCase):
+    """⚠ SHAPE WARNING — read before optimising for these fixtures.
+
+    The one-row-per-sample layout below is SYNTHETIC AND UNVERIFIED. It was
+    written before the real corpus was recovered, and no real AEG report in
+    corpus/ uses it.
+
+    The real shape packs every sample into a SINGLE cell, whitespace and
+    newline separated — see tests/test_corpus_regression.py
+    ::RealMultiSampleTests, which is the authoritative D3 spec. Build for that
+    first. These row-based tests are kept because the layout is plausible in
+    other templates and the defect is the same one either way, but if the two
+    ever conflict, the corpus wins.
+    """
 
     @unittest.expectedFailure
     def test_every_sample_row_is_parsed(self):
-        """D3. Only the first row under 'Sample nr' is read, so a rejection on
-        sample 2 is invisible to all twenty checks. Release-critical."""
+        """D3, synthetic row-based variant. Only the first row under 'Sample nr'
+        is read, so a rejection on sample 2 is invisible to all twenty checks."""
         wb, ws = _met_sheet()
         ws["A8"] = 2
         ws["B8"] = "Blade"

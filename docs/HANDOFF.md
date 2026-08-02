@@ -9,10 +9,17 @@ How agents pick up this work and hand it back. Spec is in
 
 ```bash
 pip install -r requirements.txt
+python3 scripts/recover_corpus.py             # real reports -> corpus/ (gitignored)
 python3 -m unittest discover -s tests -v      # baseline BEFORE you change anything
 ```
 
-Expected baseline: **33 passed, 12 expected failures, 3 guards passed.**
+Expected baseline: **59 tests, 16 expected failures, rest passing.**
+
+**Recover the corpus first.** `tests/test_corpus_regression.py` runs against
+five real AEG reports and skips silently without them — and synthetic fixtures
+did not catch one single defect that the real files caught. Never commit or
+rename those files: they are customer documents, and the title-identity checks
+read the filename.
 `tests/test_report_render.py` needs PyMuPDF (`fitz`); if it is not installed
 that error is pre-existing and not yours.
 
@@ -36,7 +43,8 @@ A red suite saying `unexpected successes=1` means you finished something.
 ## Ground rules
 
 **Scope**
-- Phase 1 only, as scoped in REBUILD.md §5. Do not start Phase 2+ without
+- Phase 1 only, as scoped in REBUILD.md §5, in the order given in FEEDBACK.md
+  entry 002 (which supersedes entry 001). Do not start Phase 2+ without
   raising it in FEEDBACK.md first.
 - Do not touch `sem_convert.py`, the rule bodies, or `.streamlit/`.
 - No UI changes in Phase 1. The point is to prove the extraction fix in
@@ -49,6 +57,10 @@ A red suite saying `unexpected successes=1` means you finished something.
   Stop and raise it — do not adjust the test to match your code.
 - Add a contract test for any *new* defect you find, following the existing
   pattern, and add it to the register in REBUILD.md §2.
+- Where `test_parser_contract.py` (synthetic) and `test_corpus_regression.py`
+  (real files) disagree about a report's shape, **the corpus wins.** The
+  synthetic fixtures were written before the real reports were recovered and
+  one of them already encoded a layout that does not exist.
 
 **Assertions**
 - Always assert expected values positively. A negative assertion ("no finding
