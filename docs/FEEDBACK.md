@@ -129,3 +129,123 @@ straight into `Machine Type:`.
   coating file. It covers the happy path well and says nothing about template
   drift or revisions. It is enough to stop guessing; it is not enough to
   declare the rebuild finished.
+
+---
+
+## 003 · Sonnet → Opus · 2 Aug 2026
+
+**Status:** 1a–1f done, plus 1c corrected to the real (corpus) shape. 1g
+(D11) deliberately not started — see Found. `tests/test_parser_contract.py`:
+15/15 pass. `tests/test_lab_review.py`: 33/33 pass unmodified.
+`tests/test_corpus_regression.py`: 8/8 pass, 2 open (both D11). Full local
+suite (`python3 -m unittest discover -s tests`, corpus recovered): 63 tests,
+OK, 2 expected failures.
+
+**Sequencing note, so the two commits on this branch make sense together:**
+I started this session on entry 001's plan (Phase 1, 1a→1f, "start with
+D9") and had 1a–1f fully implemented and passing — including the
+row-per-sample shape of D3 — *before* fetching and discovering entry 002 had
+landed concurrently on this same branch with the corpus-corrected spec. I
+rebased on top of it rather than overwrite it. Net effect: everything in
+entry 002's revised order got done except 1g, just not in that order, since
+1a/1b/1d/1e were already finished by the time I saw the reordering.
+
+**Done**
+- 1a/1b/1d/1e/1f as scoped: merge-aware label→value resolution with a
+  boundary stop-set (D2, D9, D10), `parsed['fields']` with
+  value/raw/cell/status/confidence (D1), every composition table not just
+  the first (D4), `_num()` hardening against cross-reference prose and
+  left-censored numeric forms (D5). Detail in the first commit on this
+  branch and unchanged since.
+- **1c corrected to the real shape.** Real AEG reports don't put one sample
+  per row — every sample is packed into a single cell, whitespace/newline
+  separated, exactly as entry 002 found. `_sample_rows()` still reads every
+  row of the table (closing the row-based D3 shape, which the corpus doesn't
+  use but the synthetic fixtures still check and now pass), and a new
+  `_fan_out_row()`/`_split_packed()` step turns a packed row into N
+  per-sample records: whichever field packs into the same token count as
+  `sample_no` is distributed index-paired with it, anything else (a shared
+  material, a verdict deferred to the comment) is broadcast onto every
+  fanned sample. `parsed['samples']` is the fanned canonical list.
+  `parsed['sample']` (back-compat) stays the **un-fanned row**, not
+  `samples[0]` — `_review_traceability`'s existing `_identifier_tokens()`
+  counting already tokenizes a packed cell correctly by itself, and would be
+  shortchanged by seeing only the first fanned sample. Verified end to end:
+  this is exactly what still produces the corpus's "genuine third critical"
+  (the duplicated serial on report 6943) — recovered the corpus, ran
+  `review_report()` against all four real MET files, and confirmed the
+  duplicate-serial critical, the two constant criticals, and nothing
+  spurious from the new `_review_samples()` rule (which stayed silent on all
+  four, since every real `Result` is "See comment", not a reject/scrap
+  token).
+- **The corpus also caught label patterns I'd guessed wrong.** My first
+  commit's `_HEADER_LABELS` patterns for `job`/`aeg_ref`/`customer_ref`/`qty`
+  didn't tolerate this template's period-abbreviated labels (`'AEG. Job.
+  No:'`, `'AEG. Ref. No:'`, `'Customer Ref. No.:'`, `'Quantity p. Set:'`) —
+  the strict label matcher requires the pattern to consume the whole cell,
+  and mine didn't account for the periods, so all four real reports came
+  back `not_located` for those fields. Recovering the corpus and running
+  `test_corpus_regression.py` caught this immediately; fixed in the second
+  commit. This is exactly the failure mode flagged as a risk in the first
+  commit's message ("no real report to check it against") — worth noting
+  because it argues for recovering the corpus *before* writing any label
+  pattern, not just before/after the whole change.
+- Also needed for the corpus shape: report 7227 has zero blank rows between
+  the sample table and the next section (`'Hardness Results:'` sits directly
+  under the last sample row), so the label-boundary index alone didn't stop
+  the row scan there. Every label in this report family ends in `':'` and no
+  observed sample-number value does, so `_sample_rows()` now also stops at a
+  colon-terminated primary-column cell.
+
+**Found**
+- **1g (D11) is not a display change, it's a rules change, and I didn't
+  implement it.** I worked out why while checking whether it was reachable
+  without touching rule bodies: `test_no_critical_fires_on_every_report` and
+  `test_report_specific_findings_outnumber_constant_ones` call
+  `review_report()` **independently per file** — no batch context, no shared
+  state — and assert that a specific critical (the ones that are always true
+  of this template) doesn't come back in a single file's own findings. There
+  is no way to satisfy that without either (a) `review_report()` gaining
+  cross-report memory it currently has no access to, which isn't what these
+  tests exercise, or (b) actually changing what
+  `_review_acceptance_and_methods()`/`_review_comment()` emit for those two
+  specific checks — a rule-body change. Entry 002's own question to Mohamed
+  ("is that a template problem to fix once at source, or should the tool
+  keep saying it every time... that answer decides whether 1g is a display
+  change or a rules change") is, on inspection, not actually open-ended: it
+  *is* a rules change, full stop, given how the acceptance tests are
+  written. I did not want to guess the answer to a question the log itself
+  flagged as Mohamed's, so I left 1g alone rather than either weaken the
+  rule bodies or bend the tests to fit a display-only implementation that
+  wouldn't satisfy them. The two D11 tests are still `@unittest.
+  expectedFailure`; `test_the_constant_set_is_measured_and_has_not_grown`
+  (the guard) still passes unmodified.
+- Minor spec/test inconsistency, not blocking: REBUILD.md §6's acceptance
+  criterion 1 still reads "every `@unittest.expectedFailure` in
+  `test_parser_contract.py` has been removed and all 15 tests pass," but
+  entry 002 re-decorated two of those 15 (the row-based D3 tests) as
+  intentionally still-open/unverified. Both now pass anyway (see Done), so
+  it isn't live, but the criterion's wording and the file's own docstring
+  disagree about whether that was ever meant to be permanent.
+
+**Questions**
+- None blocking. 1g/D11 is the one open item, and it's genuinely Mohamed's
+  call, not a blocked-on-me item — nothing else in Phase 1 depends on it.
+
+**Next**
+- 1g (D11), once Mohamed answers entry 002's question. Concretely, once it's
+  a "fix at source" decision: downgrade or restructure whichever specific
+  checks in `_review_acceptance_and_methods()`/`_review_comment()` produce
+  the two constant criticals (which is a rule-body change, so flag it as
+  such rather than folding it in quietly), or, if the answer is "keep saying
+  it," close D11 by adding real scope information instead (e.g. a
+  batch-level function alongside the existing `add_version_findings()`
+  pattern that marks — not deletes — the template-constant ones so the UI
+  can eventually display them separately; that's a Phase-2/UI-adjacent
+  follow-up either way, not a Phase 1 one).
+- Phase 2: port the rule bodies onto the canonical `fields`/`samples`/
+  `composition` model, retiring the back-compat views as each rule moves
+  over. `_review_samples()` generalizes naturally once rules read `samples`
+  directly instead of the singular back-compat `sample`.
+- The corpus is thin (five reports, one template family) — broadening it is
+  still valuable but no longer blocking, per entry 002.
