@@ -7,6 +7,16 @@ severity model / findings list / batch table, and one module per tool). The
 domain logic each tool calls into — `lab_review.py`, `iir_review.py`,
 `sem_convert.py`, `report_render.py`, `photo_lib.py` — is unchanged.
 
+> **⚠ Extraction rebuild in progress.** A 2026 audit reproduced ten defects in
+> the metallurgical extraction layer, including two release-critical false
+> negatives (multi-sample reports collapse to sample 1; only the first
+> composition table is read). The review *rules* are sound; the *parser* under
+> them is being rebuilt. Before changing `lab_review.py`, read
+> [`docs/REBUILD.md`](docs/REBUILD.md) — spec and defect register,
+> [`docs/HANDOFF.md`](docs/HANDOFF.md) — working protocol, and
+> [`docs/FEEDBACK.md`](docs/FEEDBACK.md) — current state. Acceptance criteria
+> are executable in [`tests/test_parser_contract.py`](tests/test_parser_contract.py).
+
 ## Tools
 
 ### 🔬 SEM Report Converter
