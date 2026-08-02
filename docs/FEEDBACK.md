@@ -456,3 +456,151 @@ something for the first time.
   the right eventual move. It is deliberately after the UI: Mohamed has waited
   through two rounds of invisible internals work and the UI is what he asked for
   at the start.
+
+---
+
+## 007 · Sonnet → Opus · 2 Aug 2026
+
+**Status:** Steps 1 and 2 done. Step 3 not started — blocked, see Found.
+Full local suite (corpus recovered): 68 tests, OK, 0 expected failures.
+
+**Done**
+
+*Step 1 — D11, finding scope.* `lab_review.TEMPLATE_SCOPED` (a declarative
+`(category, message-prefix-pattern)` table) and `partition_by_scope(findings)
+-> (report, template)`. No rule body touched — pure post-processing over
+finding tuples already produced. All three `expectedFailure` tests in
+`FindingScopeTests` passed on the first implementation against the real
+corpus; decorators removed.
+
+*Step 2 — the Lab Review UI, rebuilt around triage.* `ui/lab_tool.py`,
+`ui/theme.py`, `.streamlit/config.toml`, plus a small additive change to
+`report_render.py` (below). Drove every item on PHASE-NEXT.md's checklist
+against real corpus reports, not synthetic ones — 6943 (the one with the
+duplicated-serial critical) and 7253 (clean). Screenshots aren't part of the
+repo; described below is what I actually saw, not what I intended.
+
+- **Verdict banner.** One line at the top: HOLD / NEEDS CORRECTION / RELEASE
+  plus the single driving reason (the critical's own message, or "N warnings
+  should be resolved or dismissed"). Legible without opening anything —
+  verified: on 6943 it reads "HOLD — do not release · Duplicate serial/part
+  number(s): C1ZP093046." immediately under the report header.
+- **Linked panes.** Clicking a finding's "📍 Locate" button jumps the page
+  selector to the finding's page and, in fallback-render mode, crops a
+  zoomed detail of its cell above the full page image, badge-numbered to
+  match the sidebar card. Verified end to end on 6943: clicking the
+  duplicate-serial card produced a zoomed crop of G9 showing "C1ZP 092923
+  C1ZP 093046 C1ZP ..." boxed in red with a matching "2" badge in both the
+  crop and the card.
+- **Template findings, once.** `partition_by_scope` feeds a collapsed "About
+  this template (N)" section (reusing `components.findings_table`, no new
+  widget). Verified: 6 items, all six matching what entry 006's own table
+  measured, none of them affecting the verdict above.
+- **Accept / dismiss with reason.** `st.session_state`, keyed on `(filename,
+  category, finding_stem(message))` — survives the message's variable
+  detail changing between reviews. Verified the full cycle on 6943:
+  dismissing the duplicate-serial critical (with a typed reason) dropped
+  "1 Fail" from the severity strip, flipped the verdict to "NEEDS
+  CORRECTION," and added a "🗑 1 dismissed — click to restore" expander
+  showing the reason; Restore put the critical and the HOLD verdict back.
+- **Extraction confidence.** `parsed['fields']`'s `status` now reaches the
+  UI: a `not_located` header field shows an amber "⚠ not read" pill, an
+  `empty` one shows a plain dashed "blank in report" pill, visually
+  unmistakable from each other. The real corpus doesn't exercise
+  `not_located` (Phase 1's entry 003 already found job/machine/customer/etc.
+  extract cleanly on all four real files), so I built a one-field synthetic
+  case to verify the badge itself renders and reads correctly — confirmed.
+  Only the seven header fields carry `status` (Phase 1's own scoping
+  decision, entry 003); sample/hardness/coating/signoff fields still render
+  the old plain way. Said so in the UI copy rather than silently.
+- **Both themes.** New palette in `.streamlit/config.toml` (`[theme.light]`/
+  `[theme.dark]`, both populated) — tempered-steel blue on warm graphite,
+  not the inherited Supabase green. Custom CSS (`ui/theme.py`) now reads
+  `--aeg-*` custom properties that flip between a `:root` block and an
+  `html[data-theme="dark"]` block, so the hand-drawn issue cards, verdict
+  banner and field badges repaint correctly, not just Streamlit's own
+  widgets. Verified both emulated color schemes end to end (upload → verdict
+  → extracted info) — legible in both.
+- Confirmed `_cached_review`/`_cached_annotated_report`'s caching is
+  untouched: both still key on `(name, data, ocr[, extra_findings])` alone.
+  Triage state (scope + dismiss) is applied as a cheap list-filter over the
+  already-rendered `view['issues']`/`extras` on every rerun, never by
+  re-rendering. Consequence, disclosed rather than hidden: the annotated
+  PNG's drawn markers don't disappear when you dismiss a finding — only the
+  sidebar list, count and verdict do. Re-rendering per dismiss would have
+  meant re-running LibreOffice/Pillow on every triage click, which is
+  exactly the "re-parsing on every interaction" regression PHASE-NEXT.md
+  warned against.
+
+**Found**
+
+- **A real, pre-existing bug, exposed by building the zoomed-crop feature.**
+  `render_report_image`'s legend numbered findings via its own
+  independently-ordered `highlights` loop; `build_issue_index` (which the
+  sidebar cards use) numbers them via a *different* order (sorted by cell
+  position). For the same finding these two numbers could disagree — e.g.
+  the image's baked-in badge said "7" while the sidebar card for the exact
+  same cell said "2." Nobody had noticed because the old UI never let you
+  correlate the two directly. Fixed by having `_render` get its numbering
+  from `build_issue_index` instead of computing a second one — one
+  canonical numbering, used everywhere. Not part of the assignment, but
+  leaving it would have made the new "Locate" feature actively misleading.
+- **The theme-sync script needed real debugging, noted in case it bites the
+  next person.** Streamlit persists the theme picker's choice (including
+  "System") in `localStorage['stActiveTheme-/-v2']`, not in anything visible
+  to plain CSS — `@media (prefers-color-scheme: dark)` alone would miss a
+  user who manually picked Dark while their OS is Light. `st.markdown(...,
+  unsafe_allow_html=True)` never executes injected `<script>` tags — that's
+  the browser's own innerHTML behavior, not a Streamlit restriction — so the
+  sync needed `st.iframe(html_string, height=1)` (its `st.components.v1.html`
+  predecessor is deprecated in this Streamlit version). `height=0` raises
+  `StreamlitInvalidHeightError`; `height=1` is the practical zero.
+- **Step 3 is blocked in this environment, confirmed, not assumed.** Per
+  PHASE-NEXT.md §3's own diagnostic: `soffice`/`libreoffice` binaries are
+  present but `libreoffice-calc` (the Calc import filter) is not — even a
+  trivial one-cell workbook fails `soffice --headless --convert-to
+  pdf:calc_pdf_Export` with "source file could not be loaded." Tried `apt-get
+  install libreoffice-calc`: the two required packages 404 from
+  `security.ubuntu.com` in this sandbox. Per the instruction ("do steps 1 and
+  2 and stop — do not attempt step 3 blind"), stopped there. The whole UI
+  build above was therefore verified only against fallback-mode rendering;
+  the "exact" LibreOffice-paginated mode (multi-page reports, real
+  pagination) is unverified by me. The page-selector auto-jump logic should
+  work there too (it only depends on `issue['pages']`, which
+  `render_report_faithful_view` already populates), but the zoomed-crop
+  feature is explicitly gated off in that mode (`mode.startswith('fallback')`)
+  since `cell_pixel_rect`'s coordinate space only matches the fallback
+  grid renderer, not LibreOffice's page rasterisation. Whoever has Calc
+  available should verify the real corpus's multi-page reports (7227 has 8
+  pictures across what should be several pages) before trusting exact mode.
+- To get `cell_pixel_rect` (needed for the zoomed-crop feature) I extracted
+  `_render`'s geometry computation into a shared `_grid_layout` helper —
+  pure refactor, no behavior change, `tests/test_report_render.py`'s 5 tests
+  don't exercise `_render` directly and all still pass. Flagging since it
+  touches `report_render.py`, which Step 3 also owns; the extraction should
+  make Step 3's text-anchored rework easier to land alongside this, not
+  harder, but worth knowing it's there.
+
+**Questions**
+- None blocking.
+
+**Next**
+- Step 3, once LibreOffice Calc is available somewhere to verify against —
+  the text-anchor replacement for the colour round-trip, per PHASE-NEXT.md
+  §3's own plan. `cell_pixel_rect`/`_grid_layout` from this session cover the
+  fallback-mode half of "anchor a cell to a pixel rect"; the exact-mode half
+  (replacing `_color_bbox`'s colour matching with `page.search_for()` text
+  anchoring) is still fully open.
+- Step 4 (leave Streamlit or not) — still explicitly Mohamed's call, not
+  mine to start. One data point from building step 2: the interaction model
+  (linked panes, dismiss-with-reason surviving reruns via session_state) was
+  buildable in Streamlit without a fight. The thing Streamlit still cannot
+  do — persist a triage decision across sessions/reviewers — is unchanged
+  and is the actual deciding question, not anything about how the UI feels
+  today.
+- `iir_tool.py`/`photo_tool.py` still use the old shell (PHASE-NEXT.md: prove
+  Lab first, don't do all four at once). Smoke-tested IIR Review loads
+  cleanly under the new theme with no exceptions; it has not been rebuilt
+  around triage.
+- Phase 2 (canonical model, rule-body port) is still queued behind all of
+  this, per entry 006.
