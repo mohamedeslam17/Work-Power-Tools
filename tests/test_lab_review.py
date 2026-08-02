@@ -230,7 +230,18 @@ class LabReviewRegressionTests(unittest.TestCase):
 
         self.assertFalse(any(category == "Traceability" for _sev, category, _msg in findings))
 
-    def test_missing_release_basis_is_explicit(self):
+    def test_missing_release_basis_is_not_a_finding_but_methods_still_are(self):
+        """A report that does not restate its controlling specification is fine.
+
+        The "Acceptance criteria" critical was removed on Mohamed's instruction
+        (docs/FEEDBACK.md entry 005): at AEG the governing specification lives
+        in the work order and customer contract, not in the report. It was the
+        last finding that fired on 100% of the real corpus.
+
+        The analytical-method checks are deliberately kept — how the chemistry
+        and hardness work was performed and recorded does belong in the report.
+        Inverted rather than deleted so the decision is explicit.
+        """
         parsed = {
             "document_text": "Material Composition Nominal Actual Pre-Solution 42 HRC",
             "nominal": {"Ni": 60, "Cr": 16},
@@ -240,12 +251,27 @@ class LabReviewRegressionTests(unittest.TestCase):
 
         findings = _review_acceptance_and_methods(parsed)
 
-        self.assertTrue(any(category == "Acceptance criteria" and sev == "critical"
-                            for sev, category, _msg in findings))
+        self.assertEqual(
+            [f for f in findings if f[1] == "Acceptance criteria"], [])
         self.assertTrue(any(category == "Chemistry method"
                             for _sev, category, _msg in findings))
         self.assertTrue(any(category == "Hardness evidence"
                             for _sev, category, _msg in findings))
+
+    def test_a_report_stating_its_specification_is_still_not_penalised(self):
+        """Guard: the surviving method checks must recognise real evidence."""
+        parsed = {
+            "document_text": (
+                "Chemical analysis by ICP-OES, calibrated against traceable "
+                "standards, measurement uncertainty +/- 0.05 wt%."
+            ),
+            "nominal": {"Ni": 60}, "actual": {"Ni": 59},
+        }
+
+        findings = _review_acceptance_and_methods(parsed)
+
+        self.assertEqual(
+            [f for f in findings if f[1] == "Chemistry method"], [])
 
     def test_sampling_location_is_not_a_sampling_plan(self):
         parsed = {

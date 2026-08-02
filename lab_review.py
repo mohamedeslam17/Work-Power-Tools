@@ -1075,10 +1075,16 @@ def _review_acceptance_and_methods(parsed):
     """
     findings = []
     text = parsed.get('document_text') or ''
-    if not _CONTROL_REFERENCE.search(text):
-        findings.append(('critical', 'Acceptance criteria',
-                         'No governing acceptance specification, limits or decision '
-                         'rule is stated, so the report cannot support acceptance as issued.'))
+
+    # The "no governing acceptance specification" critical was removed on
+    # Mohamed's instruction: at AEG the controlling specification lives in the
+    # work order / customer contract, not in the report, so a report that does
+    # not restate it is not defective. It fired on 100% of real reports and was
+    # the last finding that did. See docs/FEEDBACK.md entry 005.
+    #
+    # The analytical-method checks below are deliberately kept — they are about
+    # how the chemistry and hardness work was performed and recorded, which does
+    # belong in the report.
 
     if parsed.get('nominal') or parsed.get('actual'):
         method_markers = {
@@ -1087,7 +1093,9 @@ def _review_acceptance_and_methods(parsed):
                 r'chemical\s+(?:analysis|test)\s+method|ASTM\s+E\d+)\b', re.I),
             'calibration / traceability': re.compile(r'\bcalibrat\w*|traceab\w*\b', re.I),
             'measurement uncertainty': re.compile(r'\buncertaint\w*\b', re.I),
-            'governing material specification': _CONTROL_REFERENCE,
+            # 'governing material specification' dropped from this list too: it
+            # is the same complaint as the removed critical, worded differently.
+            # Reinstate by re-adding the _CONTROL_REFERENCE entry here.
         }
         missing = [label for label, pattern in method_markers.items()
                    if not pattern.search(text)]

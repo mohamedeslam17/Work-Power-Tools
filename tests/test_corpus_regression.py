@@ -149,8 +149,8 @@ class RealMultiSampleTests(unittest.TestCase):
 
 # ── D11 · findings have no scope ──────────────────────────────────────────
 class FindingScopeTests(unittest.TestCase):
-    """Measured on the real corpus: 7 of 25 distinct findings fire on all four
-    reports.
+    """Measured on the real corpus: 6 of 25 distinct findings fire on all four
+    reports, none of them critical (was 9, two of them critical).
 
     Was 9 of 25 with two constant criticals. The "See comment" disposition
     check was dropped on Mohamed's instruction (FEEDBACK.md entry 004), which
@@ -172,16 +172,18 @@ class FindingScopeTests(unittest.TestCase):
         """Guard: documents the measured baseline so drift is visible."""
         constant, _ = self._constant_findings()
         self.assertLessEqual(
-            len(constant), 7,
+            len(constant), 6,
             "more findings became report-invariant; the noise floor is rising")
 
-    @unittest.expectedFailure
     def test_no_critical_fires_on_every_report(self):
-        """D11. One critical still fires on all four reports — "no governing
-        acceptance specification". It is true of the TEMPLATE, so every report
-        starts at one critical before anything about it has been examined.
-        (The second, the "See comment" disposition check, was dropped in
-        FEEDBACK.md entry 004.)
+        """D11, closed for criticals. Both always-true criticals are gone —
+        the "See comment" disposition check (entry 004) and the "no governing
+        acceptance specification" check (entry 005), each removed on Mohamed's
+        instruction because the information lives outside the report.
+
+        The corpus now reads: three reports with NO criticals, and report 6943
+        with exactly one — its duplicated serial C1ZP 093046. A critical finally
+        means a specific report has a specific problem.
 
         The cost is concrete: report 6943 has a genuine third critical, a
         duplicated serial (C1ZP 093046 appears twice in one cell). That is a
@@ -192,7 +194,7 @@ class FindingScopeTests(unittest.TestCase):
         constant, _ = self._constant_findings()
         self.assertEqual(
             [k for k in constant if k[0] == "critical"], [],
-            "these criticals fire on 100% of reports and hide the real ones")
+            "a critical that fires on 100% of reports hides the real ones")
 
     @unittest.expectedFailure
     def test_report_specific_findings_outnumber_constant_ones(self):

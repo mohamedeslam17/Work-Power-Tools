@@ -322,3 +322,67 @@ Mohamed's call rather than something to guess. That reasoning was right, and
 this entry is that call arriving for one of the two. The other is still open
 above. Measured after both changes: constant findings 9 → 7, constant
 criticals 2 → 1.
+
+---
+
+## 005 · Mohamed's decision, recorded by Opus · 2 Aug 2026
+
+**Status:** Second always-true critical removed. D11 closed for criticals.
+
+**Decision**
+Asked where the controlling specification actually lives, Mohamed answered:
+it lives elsewhere — work order, customer contract — and the report is not
+meant to restate it. So a report that does not cite it is not defective.
+
+**Changed**
+- `_review_acceptance_and_methods()` — the `Acceptance criteria` critical
+  removed. The `Chemistry method` and `Hardness evidence` warnings are
+  deliberately **kept**: how the chemistry and hardness work was performed and
+  recorded does belong in the report.
+- **Extended slightly beyond the literal instruction, flagged here so it can be
+  reversed in one line:** `'governing material specification'` was also dropped
+  from the `Chemistry method` marker list. It is the same complaint as the
+  removed critical, worded differently, and leaving it would have kept the
+  phrase in every report's findings. The other three markers (test method /
+  instrument, calibration / traceability, measurement uncertainty) are
+  untouched and still fire. Reinstate by re-adding the `_CONTROL_REFERENCE`
+  entry to that dict.
+- `tests/test_lab_review.py::test_missing_release_basis_is_explicit` →
+  **inverted** and renamed
+  `test_missing_release_basis_is_not_a_finding_but_methods_still_are`. Added
+  `test_a_report_stating_its_specification_is_still_not_penalised` to guard
+  that the surviving method checks recognise real evidence.
+- `test_no_critical_fires_on_every_report` **passed** — decorator removed.
+- Corpus guard tightened 7 → 6.
+
+**Effect on the real corpus**
+
+| | as audited | now |
+|---|---|---|
+| Constant findings | 9 | 6 |
+| Constant criticals | 2 | **0** |
+| Reports with no critical | 0 | **3** |
+| Reports with a critical | 4 | **1** |
+
+Report 6943 now carries exactly one critical in the whole corpus: its
+duplicated serial `C1ZP 093046`. Three reports are clean. A critical means
+something for the first time.
+
+**Found**
+- Both removals were verified before being made, not after. For entry 004 I
+  read all four real comments to confirm the rule was not simply failing to
+  detect a verdict that was present; it was not. For this one the rule was
+  likewise correct — none of the four reports cites a controlling spec. In
+  both cases the rule was factually right and the *expectation* was wrong,
+  which is not something a test suite can tell you. It needed Mohamed.
+
+**Next**
+- D11 is closed for criticals, open for warnings: six constant warnings remain,
+  and on the shortest report (7253) they still outnumber the report-specific
+  ones. `test_report_specific_findings_outnumber_constant_ones` is the one
+  remaining `expectedFailure` in the corpus file.
+- That residue is the real `scope` work Sonnet described in entry 003 — mark
+  template-constant findings rather than delete them, so the UI can show them
+  once. It is UI-adjacent, so it belongs with the Phase 4 work, not here.
+- Phase 2 (porting rule bodies onto the canonical model) is otherwise the next
+  substantial item.
