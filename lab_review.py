@@ -2863,6 +2863,17 @@ def review_report(filename, data, ocr=True):
     return rtype, parsed, findings
 
 
+def finding_stem(message):
+    """A finding's identity independent of per-report variable detail (an
+    element list, a page footer string, a specimen count) — the same
+    leading-clause heuristic tests/test_corpus_regression.py uses to detect
+    which findings are constant across the corpus. Exposed here so the UI can
+    key persisted triage state (accept/dismiss) on it too: state keyed on the
+    full message would silently reset the moment the variable detail changed
+    from one review to the next."""
+    return re.split(r'[:.] ', message)[0][:58]
+
+
 # ── D11 · finding scope ────────────────────────────────────────────────────
 # `review_report()` reviews one file and has no cross-report context, so scope
 # cannot be inferred by measuring which findings repeat across a batch — that

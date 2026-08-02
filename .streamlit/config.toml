@@ -1,11 +1,29 @@
 [theme]
-# Supabase-inspired palette — the signature green accent, a light neutral
-# (zinc) background with white cards/inputs, and near-black text.
-primaryColor = "#3ecf8e"
-backgroundColor = "#fafafa"
+# Materials-inspection palette, not a borrowed developer-tool green: a
+# tempered-steel blue (the oxide colour steel takes around 460C temper) on a
+# warm graphite neutral, in both light and dark. base= supplies sane
+# defaults for anything not overridden below (chart colors, widget shapes).
+base = "light"
+primaryColor = "#3c6e8f"
+backgroundColor = "#f5f4f0"
 secondaryBackgroundColor = "#ffffff"
-textColor = "#18181b"
+textColor = "#1e2328"
+borderColor = "#dcd8cf"
 font = "sans serif"
+
+[theme.light]
+primaryColor = "#3c6e8f"
+backgroundColor = "#f5f4f0"
+secondaryBackgroundColor = "#ffffff"
+textColor = "#1e2328"
+borderColor = "#dcd8cf"
+
+[theme.dark]
+primaryColor = "#7fb3d1"
+backgroundColor = "#12161a"
+secondaryBackgroundColor = "#1b2126"
+textColor = "#e9e6df"
+borderColor = "#2b3238"
 
 [server]
 runOnSave = false

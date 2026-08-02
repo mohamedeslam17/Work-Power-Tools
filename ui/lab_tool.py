@@ -1,4 +1,4 @@
-"""Lab Report Review — 'Is this .xlsx lab report wrong anywhere, and where?'"""
+"""Lab Report Review — 'Is this report releasable, and if not, where exactly?'"""
 import html
 import io
 from pathlib import Path
@@ -6,7 +6,7 @@ from pathlib import Path
 import streamlit as st
 
 import report_render
-from lab_review import add_version_findings, review_report
+from lab_review import add_version_findings, finding_stem, partition_by_scope, review_report
 from photo_lib import add_to_library
 
 try:
@@ -18,6 +18,11 @@ try:
     import pandas as pd
 except Exception:     # pandas ships with Streamlit; guard just in case
     pd = None
+
+try:
+    from PIL import Image
+except Exception:
+    Image = None
 
 from ui import components
 from ui import photo_tool
@@ -39,6 +44,12 @@ def _cached_annotated_report(name, data, ocr, extra_findings=()):
     The exact LibreOffice rendering is preferred. A spreadsheet-style
     annotated fallback keeps the report visible if exact rendering is not
     available in the deployment environment.
+
+    Deliberately built from EVERY finding, not just the ones triage state
+    currently wants shown — this stays cached on (name, data, ocr) alone so
+    dismissing or restoring a finding never re-runs LibreOffice/Pillow. The
+    triage state (scope partition, accept/dismiss) is applied afterwards, as
+    a cheap filter over the already-rendered issue list; see `_render_detail`.
     """
     rtype, parsed, findings = _cached_review(name, data, ocr)
     findings = list(findings) + list(extra_findings or ())
@@ -81,6 +92,87 @@ def _ocr_available():
         return True
     except Exception:
         return False
+
+
+# ── Triage state — session-local, never cached, keyed on (file, category, stem)
+# so it survives a message's variable detail (an element list, a page label)
+# changing between reviews of the same report family. ─────────────────────
+def _dismissed_store():
+    return st.session_state.setdefault('lab_dismissed', {})   # {key: reason}
+
+
+def _accepted_store():
+    return st.session_state.setdefault('lab_accepted', set())  # {key}
+
+
+def _tri_key(name, category, message):
+    return (name, category, finding_stem(message))
+
+
+def _dismiss(name, category, message, reason):
+    _dismissed_store()[_tri_key(name, category, message)] = reason.strip() or '(no reason given)'
+
+
+def _restore(name, category, message):
+    _dismissed_store().pop(_tri_key(name, category, message), None)
+
+
+def _is_dismissed(name, category, message):
+    return _tri_key(name, category, message) in _dismissed_store()
+
+
+def _toggle_accept(name, category, message):
+    key = _tri_key(name, category, message)
+    store = _accepted_store()
+    (store.discard if key in store else store.add)(key)
+
+
+def _is_accepted(name, category, message):
+    return _tri_key(name, category, message) in _accepted_store()
+
+
+def _triaged_findings(name, findings):
+    """Partition + dismiss-filter one report's raw findings.
+
+    Returns (active, dismissed, template). `active` is what drives the
+    verdict and the severity counts; `dismissed` is restorable and never
+    counted; `template` is said once, in its own section, and — the whole
+    point of D11 — never enters the verdict either.
+    """
+    report, template = partition_by_scope(findings)
+    active, dismissed = [], []
+    for f in report:
+        _sev, cat, msg = f
+        (dismissed if _is_dismissed(name, cat, msg) else active).append(f)
+    return active, dismissed, template
+
+
+def _verdict(active):
+    """(tier, label, reason) — the one line at the top of a report."""
+    criticals = [f for f in active if f[0] == 'critical']
+    warnings = [f for f in active if f[0] == 'warning']
+    if criticals:
+        reason = criticals[0][2]
+        if len(criticals) > 1:
+            more = len(criticals) - 1
+            reason += f' (+{more} more critical finding{"s" if more != 1 else ""}.)'
+        return 'hold', 'HOLD — do not release', reason
+    if warnings:
+        n = len(warnings)
+        return 'correction', 'NEEDS CORRECTION', (
+            f'{n} warning{"s" if n != 1 else ""} should be resolved or dismissed with a '
+            f'reason before release.')
+    return 'release', 'RELEASE', 'No unresolved findings block release.'
+
+
+def _verdict_banner(tier, label, reason):
+    st.markdown(
+        f'<div class="aeg-verdict aeg-verdict-{tier}">'
+        f'<span class="aeg-verdict-label">{html.escape(label)}</span>'
+        f'<span class="aeg-verdict-reason">{html.escape(reason)}</span>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
 
 
 def _key_facts(rtype, parsed):
@@ -141,9 +233,10 @@ def render():
     for report in reviewed:
         if 'error' in report:
             continue
-        rows = components.normalize_lab(report['findings'])
-        report['rows'] = rows
-        report['counts'] = components.count_by_severity(rows)
+        active, dismissed, template = _triaged_findings(report['name'], report['findings'])
+        report['active'], report['dismissed'], report['template'] = active, dismissed, template
+        report['rows'] = components.normalize_lab(report['findings'])
+        report['counts'] = components.count_by_severity(components.normalize_lab(active))
 
     for r in [x for x in reviewed if 'error' in x]:
         st.error(f"Could not read **{r['name']}** — {r['error']}")
@@ -167,34 +260,89 @@ def render():
 
 
 def _render_detail(r, ocr):
+    name = r['name']
     with st.container(border=True):
-        components.report_header(r['name'], tag=_TYPE_LABEL[r['rtype']], facts=r['facts'])
+        components.report_header(name, tag=_TYPE_LABEL[r['rtype']], facts=r['facts'])
         if r['rtype'] == 'unknown':
             st.warning("This workbook didn't match a metallurgical or coating layout, so only "
                        "a limited review ran. Check it's an AEG lab report `.xlsx`.")
+
+        tier, label, reason = _verdict(r['active'])
+        _verdict_banner(tier, label, reason)
         components.severity_readout(r['counts'])
+
+        if r['dismissed']:
+            with st.expander(f"🗑 {len(r['dismissed'])} dismissed — click to restore"):
+                _dismissed_list(name, r['dismissed'])
 
         with st.popover("Actions"):
             if r['rtype'] in ('metallurgical', 'coating'):
-                if st.button("📁 Add to photo library", key=f"add_{r['name']}", width="stretch"):
-                    added = add_to_library(r['name'], r['f'].getvalue(), r['parsed'], r['rtype'])
+                if st.button("📁 Add to photo library", key=f"add_{name}", width="stretch"):
+                    added = add_to_library(name, r['f'].getvalue(), r['parsed'], r['rtype'])
                     if added:
                         photo_tool.invalidate()
                     st.toast(f"Added {added} micrograph(s) to the library." if added
                              else "No new micrographs (already in library).")
             st.download_button(
                 "⬇ Findings (.csv)", data=_findings_csv(r['findings']),
-                file_name=f"{Path(r['name']).stem}_findings.csv", mime="text/csv",
-                key=f"labcsv_{r['name']}", width="stretch")
+                file_name=f"{Path(name).stem}_findings.csv", mime="text/csv",
+                key=f"labcsv_{name}", width="stretch")
 
         with st.expander("Extracted information", expanded=True):
             _extracted_view(r['rtype'], r['parsed'])
 
+        _template_section(name, r['template'])
+
         _annotated_report(r, ocr)
+
+
+def _dismissed_list(name, dismissed):
+    for sev, cat, msg in dismissed:
+        reason = _dismissed_store().get(_tri_key(name, cat, msg), '')
+        cols = st.columns([5, 1], vertical_alignment="center")
+        cols[0].markdown(f"**{cat}** — {msg}  \n*Dismissed: {html.escape(reason)}*")
+        if cols[1].button("Restore", key=f"restore_{name}_{cat}_{finding_stem(msg)}",
+                          width="stretch"):
+            _restore(name, cat, msg)
+            st.rerun()
+
+
+def _template_section(name, template_findings):
+    """D11's other half: template-scoped findings, said once, collapsed."""
+    if not template_findings:
+        return
+    with st.expander(f"About this template ({len(template_findings)})"):
+        st.markdown(
+            '<div class="aeg-template-note">These describe a gap in the AEG report '
+            'template itself — every report on this template shows the same items — '
+            'not something specific to this report, so they never affect the verdict '
+            'above and are listed once here instead of repeating per report.</div>',
+            unsafe_allow_html=True)
+        components.findings_table(
+            components.normalize_lab(template_findings), key=f"template_{name}")
 
 
 def _shown(value):
     return value if value is not None and str(value).strip() else '—'
+
+
+def _field_html(label, field):
+    """One 'Label: value' line, with a status badge distinguishing a field the
+    parser never located from one that is genuinely blank (Phase 1's D1 fix,
+    finally visible) — a `not_located` field looks nothing like an `empty`
+    one, on purpose. Falls back to a plain value where no status is tracked
+    (only the seven header fields carry one so far)."""
+    field = field or {}
+    status = field.get('status')
+    if status == 'found':
+        return f"<b>{html.escape(label)}:</b> {html.escape(str(field.get('value')))}"
+    if status == 'empty':
+        return (f"<b>{html.escape(label)}:</b> —"
+                '<span class="aeg-field-status aeg-field-empty">blank in report</span>')
+    if status == 'not_located':
+        return (f"<b>{html.escape(label)}:</b> "
+                '<span class="aeg-field-status aeg-field-notlocated">⚠ not read</span>')
+    return f"<b>{html.escape(label)}:</b> {html.escape(str(_shown(field.get('value'))))}"
 
 
 def _hardness_text(entry):
@@ -215,20 +363,26 @@ def _extracted_view(rtype, parsed):
         "review view below.")
 
     if rtype == 'metallurgical':
-        hdr = parsed.get('header') or {}
+        fields = parsed.get('fields') or {}
         sample = parsed.get('sample') or {}
         hardness = parsed.get('hardness') or {}
         coating = parsed.get('coating') or {}
         left, right = st.columns(2, gap="large")
         with left:
             st.markdown("**Report identity**")
-            st.write(f"**Job:** {_shown(hdr.get('job'))}")
-            st.write(f"**AEG reference:** {_shown(hdr.get('aeg_ref'))}")
-            st.write(f"**Customer:** {_shown(hdr.get('customer'))}")
-            st.write(f"**Customer reference:** {_shown(hdr.get('customer_ref'))}")
-            st.write(f"**Machine:** {_shown(hdr.get('machine'))}")
-            st.write(f"**Quantity:** {_shown(hdr.get('qty'))}")
-            st.write(f"**EOH:** {_shown(hdr.get('eoh'))}")
+            if fields:
+                st.caption("A ⚠ badge means the field's label wasn't found on the "
+                           "sheet — an extraction gap, not a blank report field.")
+            lines = [
+                _field_html('Job', fields.get('job')),
+                _field_html('AEG reference', fields.get('aeg_ref')),
+                _field_html('Customer', fields.get('customer')),
+                _field_html('Customer reference', fields.get('customer_ref')),
+                _field_html('Machine', fields.get('machine')),
+                _field_html('Quantity', fields.get('qty')),
+                _field_html('EOH', fields.get('eoh')),
+            ]
+            st.markdown("<br>".join(lines), unsafe_allow_html=True)
         with right:
             st.markdown("**Sample identity**")
             st.write(f"**Sample number:** {_shown(sample.get('sample_no'))}")
@@ -237,6 +391,12 @@ def _extracted_view(rtype, parsed):
             st.write(f"**Location:** {_shown(sample.get('location'))}")
             st.write(f"**Material:** {_shown(sample.get('material'))}")
             st.write(f"**Result:** {_shown(sample.get('result'))}")
+
+        samples = parsed.get('samples') or []
+        if len(samples) > 1:
+            st.caption(
+                f"{len(samples)} samples on this report (shown: the first). "
+                f"See the annotated report below for findings on the others.")
 
         coat_text = next(
             (coating.get(key) for key in ('type', 'received', 'outgoing', 'present')
@@ -350,17 +510,54 @@ def _extracted_view(rtype, parsed):
         ], width="stretch", hide_index=True)
 
 
+def _cropped_detail(data, parsed, page_png, cell, pad=44, min_side=280):
+    """A zoomed PNG crop around `cell`, or None if it can't be located.
+
+    Only valid for the 'fallback' annotated view — its coordinate space is
+    the custom grid `report_render.render_report_image` draws, which
+    `cell_pixel_rect` mirrors exactly. The 'exact' (LibreOffice) pages are a
+    different rendering pipeline entirely, so this must never be called
+    against them.
+    """
+    if Image is None:
+        return None
+    rect = report_render.cell_pixel_rect(data, parsed, cell)
+    if not rect:
+        return None
+    try:
+        img = Image.open(io.BytesIO(page_png))
+    except Exception:
+        return None
+    x0, y0, x1, y1 = rect
+    cx0, cy0 = max(0, x0 - pad), max(0, y0 - pad)
+    cx1, cy1 = min(img.width, x1 + pad), min(img.height, y1 + pad)
+    if cx1 - cx0 < min_side:
+        extra = (min_side - (cx1 - cx0)) // 2
+        cx0, cx1 = max(0, cx0 - extra), min(img.width, cx1 + extra)
+    if cy1 - cy0 < min_side:
+        extra = (min_side - (cy1 - cy0)) // 2
+        cy0, cy1 = max(0, cy0 - extra), min(img.height, cy1 + extra)
+    if cx1 <= cx0 or cy1 <= cy0:
+        return None
+    buf = io.BytesIO()
+    img.crop((cx0, cy0, cx1, cy1)).save(buf, format='PNG')
+    return buf.getvalue()
+
+
 def _annotated_report(r, ocr):
     """Make the report itself the review UI.
 
     The image contains the original sheet, highlighted issue locations,
-    numbered markers and the matching explanations. No separate findings
-    table or evidence-mode selection is required.
+    numbered markers and the matching explanations. Findings and the report
+    picture are linked both ways: opening a finding jumps the view to its
+    page and (in fallback mode) zooms its cell; the list itself only ever
+    shows findings the active triage state (scope + dismiss) still counts.
     """
     f = r['f']
-    with st.spinner(f"Building annotated report for {f.name}…"):
+    name = f.name
+    with st.spinner(f"Building annotated report for {name}…"):
         view, mode = _cached_annotated_report(
-            f.name, f.getvalue(), ocr, tuple(r.get('version_findings') or ()))
+            name, f.getvalue(), ocr, tuple(r.get('version_findings') or ()))
 
     if not view:
         st.error(f"Could not build the annotated report view — {mode}.")
@@ -384,20 +581,36 @@ def _annotated_report(r, ocr):
         if omitted else ""
     )
     st.caption(
-        "Open one effective report page at a time. Matching numbers can appear "
-        "in more than one location when a single issue affects several report "
-        f"fields.{page_note}")
+        "Open one effective report page at a time. Click a finding to jump the "
+        f"view to it. Dismissed and template-level findings are hidden here — see "
+        f"the sections above.{page_note}")
+
+    active_keys = {(cat, msg) for _sev, cat, msg in r['active']}
+    all_issues = [issue for issue in (view.get('issues') or [])
+                  if (issue['category'], issue['note']) in active_keys]
+    all_extras = [extra for extra in (view.get('extras') or [])
+                  if (extra['category'], extra['note']) in active_keys]
+    visible_nums = {issue['num'] for issue in all_issues}
+
+    def _count_on(page):
+        return len([n for n in (page.get('issue_nums') or []) if n in visible_nums])
 
     labels = {
         page['number']: (
             f"Page {page['number']}"
-            + (f" · {len(page.get('issue_nums') or [])} issue"
-               f"{'s' if len(page.get('issue_nums') or []) != 1 else ''}"
-               if page.get('issue_nums') else " · clear")
+            + (f" · {_count_on(page)} issue{'s' if _count_on(page) != 1 else ''}"
+               if _count_on(page) else " · clear")
         )
         for page in pages
     }
     numbers = [page['number'] for page in pages]
+
+    focus_key = f'lab_focus_{name}'
+    focus_num = st.session_state.get(focus_key)
+    focused = next((i for i in all_issues if i['num'] == focus_num), None)
+    if focused and focused.get('pages') and st.session_state.get(f'lab_page_{name}') not in focused['pages']:
+        st.session_state[f'lab_page_{name}'] = focused['pages'][0]
+
     if len(numbers) <= 6:
         selected_number = st.pills(
             "Report page",
@@ -405,7 +618,7 @@ def _annotated_report(r, ocr):
             default=numbers[0],
             selection_mode="single",
             format_func=lambda number: labels[number],
-            key=f"lab_page_{f.name}",
+            key=f"lab_page_{name}",
             label_visibility="collapsed",
         ) or numbers[0]
     else:
@@ -413,7 +626,7 @@ def _annotated_report(r, ocr):
             "Report page",
             numbers,
             format_func=lambda number: labels[number],
-            key=f"lab_page_{f.name}",
+            key=f"lab_page_{name}",
         )
     page = next(item for item in pages if item['number'] == selected_number)
 
@@ -423,9 +636,18 @@ def _annotated_report(r, ocr):
             f'<div class="aeg-page-kicker">PAGE {page["number"]} OF {len(pages)}</div>',
             unsafe_allow_html=True,
         )
+        if mode.startswith('fallback') and focused and focused.get('cells'):
+            crop = _cropped_detail(f.getvalue(), r['parsed'], page['png'], focused['cells'][0])
+            if crop:
+                refs = ", ".join(focused.get('refs') or [])
+                st.caption(f"🔍 Zoomed to issue #{focused['num']}" + (f" · {refs}" if refs else ""))
+                st.image(crop, width="stretch")
         st.image(page['png'], width="stretch")
     with issue_col:
-        _page_findings(view, page)
+        page_numbers = set(page.get('issue_nums') or [])
+        page_issues = [i for i in all_issues if i['num'] in page_numbers]
+        unplaced = [i for i in all_issues if not i.get('pages')]
+        _page_findings(name, focus_key, page_issues, unplaced + all_extras)
 
     download_col, _ = st.columns([1.7, 3.3])
     with download_col:
@@ -433,33 +655,28 @@ def _annotated_report(r, ocr):
             st.download_button(
                 "⬇ Download annotated report (.pdf)",
                 data=view['annotated_pdf'],
-                file_name=f"{Path(f.name).stem}_annotated.pdf",
+                file_name=f"{Path(name).stem}_annotated.pdf",
                 mime="application/pdf",
-                key=f"fpdf_{f.name}",
+                key=f"fpdf_{name}",
                 width="stretch",
             )
         else:
             st.download_button(
                 "⬇ Download annotated report (.png)",
                 data=view['combined_png'],
-                file_name=f"{Path(f.name).stem}_annotated.png",
+                file_name=f"{Path(name).stem}_annotated.png",
                 mime="image/png",
-                key=f"fpng_{f.name}",
+                key=f"fpng_{name}",
                 width="stretch",
             )
 
 
-def _page_findings(view, page):
+def _page_findings(name, focus_key, page_issues, report_level):
     """Render concise issue cards beside the selected report page."""
-    page_numbers = set(page.get('issue_nums') or [])
-    page_issues = [
-        issue for issue in view.get('issues') or []
-        if issue['num'] in page_numbers
-    ]
     st.markdown("#### Issues on this page")
     if page_issues:
         for issue in page_issues:
-            _issue_card(issue)
+            _issue_card(name, focus_key, issue)
     else:
         st.markdown(
             '<div class="aeg-clear-card">'
@@ -469,20 +686,13 @@ def _page_findings(view, page):
             unsafe_allow_html=True,
         )
 
-    unplaced = [
-        issue for issue in view.get('issues') or []
-        if not issue.get('pages')
-    ]
-    extras = list(view.get('extras') or [])
-    if unplaced or extras:
+    if report_level:
         st.markdown("#### Report-level checks")
-        for issue in unplaced:
-            _issue_card(issue, show_number=False)
-        for extra in extras:
-            _issue_card(extra, show_number=False)
+        for issue in report_level:
+            _issue_card(name, focus_key, issue, show_number=False)
 
 
-def _issue_card(issue, show_number=True):
+def _issue_card(name, focus_key, issue, show_number=True):
     severity = issue.get('severity', 'warning')
     label = {
         'critical': 'Fail',
@@ -490,20 +700,56 @@ def _issue_card(issue, show_number=True):
         'info': 'Note',
         'pass': 'Pass',
     }.get(severity, 'Review')
+    category = issue.get('category') or 'Review'
+    note = issue.get('note') or ''
+    is_focused = focus_key and st.session_state.get(focus_key) == issue.get('num')
+    is_accepted = _is_accepted(name, category, note)
+    classes = ['aeg-issue-card', f'aeg-{severity}']
+    if is_focused:
+        classes.append('aeg-focused')
     number = (
         f'<span class="aeg-issue-number">{issue.get("num")}</span>'
         if show_number and issue.get('num') is not None else ''
     )
     refs = issue.get('refs') or []
-    meta = f"{html.escape(issue.get('category') or 'Review')}"
+    meta = html.escape(category)
     if refs:
         meta += " · " + html.escape(", ".join(refs))
+    ack = ' · ✓ acknowledged' if is_accepted else ''
     st.markdown(
-        f'<div class="aeg-issue-card aeg-{severity}">'
+        f'<div class="{" ".join(classes)}">'
         f'<div class="aeg-issue-head">{number}'
         f'<span class="aeg-issue-label">{html.escape(label)}</span></div>'
-        f'<div class="aeg-issue-meta">{meta}</div>'
-        f'<div class="aeg-issue-copy">{html.escape(issue.get("note") or "")}</div>'
+        f'<div class="aeg-issue-meta">{meta}{ack}</div>'
+        f'<div class="aeg-issue-copy">{html.escape(note)}</div>'
         f'</div>',
         unsafe_allow_html=True,
     )
+
+    if severity not in ('critical', 'warning'):
+        return  # triage actions apply to things that could block release
+
+    stem = finding_stem(note)
+    slug = f"{name}_{category}_{stem}_{issue.get('num')}"
+    can_locate = focus_key and issue.get('cells')
+    cols = st.columns([1, 1, 1] if can_locate else [1, 1])
+    i = 0
+    if can_locate:
+        if cols[i].button("📍 Locate", key=f"loc_{slug}", width="stretch",
+                          help="Jump the report view to this finding's cell."):
+            st.session_state[focus_key] = issue.get('num')
+            st.rerun()
+        i += 1
+    if cols[i].button("✓ Un-ack" if is_accepted else "✓ Acknowledge",
+                      key=f"ack_{slug}", width="stretch"):
+        _toggle_accept(name, category, note)
+        st.rerun()
+    i += 1
+    with cols[i].popover("✕ Dismiss", width="stretch"):
+        st.caption("Dismissing removes this from the count and the verdict. "
+                   "It stays restorable above.")
+        reason = st.text_input("Reason", key=f"reason_{slug}",
+                               placeholder="Why doesn't this apply?")
+        if st.button("Confirm dismiss", key=f"dismiss_{slug}", width="stretch"):
+            _dismiss(name, category, note, reason)
+            st.rerun()

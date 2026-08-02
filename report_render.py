@@ -114,15 +114,14 @@ def render_report_image(data, parsed, findings=None, rtype=None, filename=None,
         return None
 
 
-def _render(data, parsed, findings, filename, max_rows, max_cols, scale):
-    loc = parsed.get('loc') or {}
-    wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True)
-    sheet_name = loc.get('sheet')
-    ws = wb[sheet_name] if sheet_name in wb.sheetnames else wb.active
+def _grid_layout(ws, highlights, max_rows, max_cols):
+    """Column/row pixel geometry for the annotated grid `_render` draws.
 
-    highlights = [h for h in collect_highlights(parsed) if h.get('cell')]
-
-    # Merged ranges → covered cells + anchor span lookup.
+    Factored out of `_render` so `cell_pixel_rect` can map a single cell to
+    its pixel rect without redrawing anything — used to crop a zoomed detail
+    around one finding's cell (the UI's "click a finding, see its cell").
+    Returns None if the sheet has no content and no highlight to anchor on.
+    """
     spans = {}            # (r, c) of every covered cell → (r0, c0, r1, c1)
     for rng in ws.merged_cells.ranges:
         box = (rng.min_row, rng.min_col, rng.max_row, rng.max_col)
@@ -204,13 +203,72 @@ def _render(data, parsed, findings, filename, max_rows, max_cols, scale):
         y1 = row_y.get(r2, grid_bottom - RH) + RH
         return x0, y0, x1, y1
 
+    return {
+        'rmin': rmin, 'cmin': cmin, 'r1': r1, 'c1': c1, 'spans': spans,
+        'rows': rows, 'cols': cols, 'cell_text': cell_text, 'rect_for': rect_for,
+        'col_x': col_x, 'cw': cw, 'row_y': row_y, 'RH': RH, 'GUT': GUT, 'TH': TH,
+        'TITLE_H': TITLE_H, 'grid_right': grid_right, 'grid_bottom': grid_bottom,
+    }
+
+
+def cell_pixel_rect(data, parsed, cell, max_rows=48, max_cols=18, scale=2):
+    """Pixel rect (x0, y0, x1, y1) for one spreadsheet `cell` (row, col), in
+    the same coordinate space as `render_report_image`'s PNG when called with
+    matching max_rows/max_cols/scale (the defaults match). None if Pillow is
+    unavailable, the workbook can't be read, or the cell falls outside the
+    rendered window (e.g. beyond max_rows/max_cols from the content origin).
+    """
+    if not _PIL:
+        return None
+    try:
+        loc = parsed.get('loc') or {}
+        wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True)
+        sheet_name = loc.get('sheet')
+        ws = wb[sheet_name] if sheet_name in wb.sheetnames else wb.active
+        highlights = [h for h in collect_highlights(parsed) if h.get('cell')]
+        layout = _grid_layout(ws, highlights, max_rows, max_cols)
+        if not layout:
+            return None
+        r, c = cell
+        if not (layout['rmin'] <= r <= layout['r1']
+                and layout['cmin'] <= c <= layout['c1']):
+            return None
+        x0, y0, x1, y1 = layout['rect_for'](r, c)
+        return tuple(int(v * scale) for v in (x0, y0, x1, y1))
+    except Exception:
+        return None
+
+
+def _render(data, parsed, findings, filename, max_rows, max_cols, scale):
+    loc = parsed.get('loc') or {}
+    wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True)
+    sheet_name = loc.get('sheet')
+    ws = wb[sheet_name] if sheet_name in wb.sheetnames else wb.active
+
+    highlights = [h for h in collect_highlights(parsed) if h.get('cell')]
+
+    layout = _grid_layout(ws, highlights, max_rows, max_cols)
+    if not layout:
+        return None
+    rmin, cmin, r1, c1 = layout['rmin'], layout['cmin'], layout['r1'], layout['c1']
+    rows, cols, spans = layout['rows'], layout['cols'], layout['spans']
+    cell_text = layout['cell_text']
+    rect_for = layout['rect_for']
+    col_x, cw, row_y = layout['col_x'], layout['cw'], layout['row_y']
+    RH, GUT, TH, TITLE_H = layout['RH'], layout['GUT'], layout['TH'], layout['TITLE_H']
+    grid_right, grid_bottom = layout['grid_right'], layout['grid_bottom']
+    PAD = 8
+
     # ── Legend: one entry per distinct finding note (a finding may box >1 cell) ──
-    order, meta = [], {}
-    for h in highlights:
-        if h['note'] not in meta:
-            meta[h['note']] = (h['severity'], h['category'])
-            order.append(h['note'])
-    num = {note: i for i, note in enumerate(order, 1)}
+    # Numbered via build_issue_index, the SAME numbering the UI's issue cards
+    # use — a badge drawn on this image must mean the same finding as the
+    # matching number in the findings list beside it, not a coincidentally
+    # different one from a second, independently-ordered numbering scheme.
+    canonical_issues, _canonical_extras = build_issue_index(parsed, findings)
+    order = [issue['note'] for issue in canonical_issues]
+    meta = {issue['note']: (issue['severity'], issue['category'])
+            for issue in canonical_issues}
+    num = {issue['note']: issue['num'] for issue in canonical_issues}
 
     content_w = max(grid_right, 760)
     wrap_chars = max(40, int((content_w - 70) / 8))
