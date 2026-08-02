@@ -731,21 +731,28 @@ def _issue_card(name, focus_key, issue, show_number=True):
 
     stem = finding_stem(note)
     slug = f"{name}_{category}_{stem}_{issue.get('num')}"
+    # Two rows, not three squeezed columns: this sidebar column is narrow
+    # enough that even short labels ("Drop") wrapped mid-word there —
+    # confirmed both by independent verification (FEEDBACK.md entry 008) and
+    # by re-screenshotting after the first, still-too-narrow fix. Dismiss
+    # gets the full row since its popover needs to anchor to something wide
+    # enough not to feel cramped.
     can_locate = focus_key and issue.get('cells')
-    cols = st.columns([1, 1, 1] if can_locate else [1, 1])
+    top = st.columns([1, 1] if can_locate else [1])
     i = 0
     if can_locate:
-        if cols[i].button("📍 Locate", key=f"loc_{slug}", width="stretch",
-                          help="Jump the report view to this finding's cell."):
+        if top[i].button("📍 Locate", key=f"loc_{slug}", width="stretch",
+                         help="Jump the report view to this finding's cell."):
             st.session_state[focus_key] = issue.get('num')
             st.rerun()
         i += 1
-    if cols[i].button("✓ Un-ack" if is_accepted else "✓ Acknowledge",
-                      key=f"ack_{slug}", width="stretch"):
+    if top[i].button("↺ Ack" if is_accepted else "✓ Ack",
+                     key=f"ack_{slug}", width="stretch",
+                     help="Click to un-acknowledge." if is_accepted
+                     else "Acknowledge — mark reviewed; does not affect the verdict."):
         _toggle_accept(name, category, note)
         st.rerun()
-    i += 1
-    with cols[i].popover("✕ Dismiss", width="stretch"):
+    with st.popover("✕ Dismiss", width="stretch"):
         st.caption("Dismissing removes this from the count and the verdict. "
                    "It stays restorable above.")
         reason = st.text_input("Reason", key=f"reason_{slug}",

@@ -150,15 +150,29 @@ filter was not, so `render_report_faithful_view()` returned
 `RuntimeError: LibreOffice conversion failed` on a real report — and it fails
 the same way on a trivial one-cell workbook, which is how it was diagnosed as
 environmental rather than a code defect. `packages.txt` installs
-`libreoffice-calc`, so a correct deployment has it.
+`libreoffice-calc`, so a correct deployment has it, and
+`.devcontainer/devcontainer.json`'s `updateContentCommand` already runs
+`apt update` before installing `packages.txt` there, which avoids the failure
+mode below.
 
 ```bash
 python3 -c "import report_render as r; print(r.libreoffice_available())"
 soffice --headless --convert-to pdf:calc_pdf_Export --outdir /tmp <any>.xlsx
 ```
 
-If the filter is missing and you cannot install it, **do steps 1 and 2 and stop**
-— do not attempt step 3 blind. Say so in FEEDBACK.md.
+**Before concluding it's missing, try fixing it — a bare CLI/agent sandbox
+(not the full devcontainer) will not have run that `apt update`.** A first
+`apt-get install -y libreoffice-calc` in that kind of environment can 404 on
+specific `.deb` files from a stale local package index (the mirror has since
+rotated to a newer point release than what's cached); that is not the same
+thing as the package being genuinely unavailable. Run `apt-get update` first,
+then retry the install — this fixed it in one session (2 Aug 2026 entry) after
+the same 404 first looked like a hard blocker. Only treat step 3 as blocked if
+`apt-get update && apt-get install -y libreoffice-calc` itself fails, e.g. no
+route to the package mirror at all.
+
+If the filter is truly missing and you cannot install it, **do steps 1 and 2
+and stop** — do not attempt step 3 blind. Say so in FEEDBACK.md.
 
 **Worth stating plainly:** the colour-probe approach is a reasonable answer to a
 genuinely hard problem. Mapping a spreadsheet cell to a coordinate on a rendered
