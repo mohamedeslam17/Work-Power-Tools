@@ -151,10 +151,15 @@ class RealMultiSampleTests(unittest.TestCase):
 
 # ── D11 · findings have no scope ──────────────────────────────────────────
 class FindingScopeTests(unittest.TestCase):
-    """Measured on the real corpus: 9 of 25 distinct findings fire on all four
-    reports, so 60-75% of any report's output is identical to every other
-    report's. Both criticals are in that constant set, which means the
-    'critical' severity discriminates nothing at all.
+    """Measured on the real corpus: 8 of 24 distinct findings fire on all four
+    reports, so a majority of any report's output is identical to every other
+    report's.
+
+    Was 9 of 25 with two constant criticals. The "See comment" disposition
+    check was dropped on Mohamed's instruction (FEEDBACK.md entry 003), which
+    left one constant critical and made report 6943 visibly differ from the
+    other three — its duplicated serial is now the only second critical in the
+    corpus, which is exactly the signal the constancy was burying.
 
     These are not wrong — the template genuinely never states an acceptance
     specification — but they are criticisms of the TEMPLATE, re-emitted per
@@ -170,15 +175,16 @@ class FindingScopeTests(unittest.TestCase):
         """Guard: documents the measured baseline so drift is visible."""
         constant, _ = self._constant_findings()
         self.assertLessEqual(
-            len(constant), 9,
+            len(constant), 8,
             "more findings became report-invariant; the noise floor is rising")
 
     @unittest.expectedFailure
     def test_no_critical_fires_on_every_report(self):
-        """D11. Two criticals fire on all four reports — "no governing
-        acceptance specification" and "Result says 'See comment'". Both are true
-        of the TEMPLATE, so every report starts at two criticals before anything
-        about it has been examined.
+        """D11. One critical still fires on all four reports — "no governing
+        acceptance specification". It is true of the TEMPLATE, so every report
+        starts at one critical before anything about it has been examined.
+        (The second, the "See comment" disposition check, was dropped in
+        FEEDBACK.md entry 003.)
 
         The cost is concrete: report 6943 has a genuine third critical, a
         duplicated serial (C1ZP 093046 appears twice in one cell). That is a

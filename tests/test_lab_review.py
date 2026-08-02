@@ -129,7 +129,18 @@ class LabReviewRegressionTests(unittest.TestCase):
             for message in messages(findings, "critical")
         ))
 
-    def test_see_comment_requires_a_real_disposition(self):
+    def test_see_comment_without_a_verdict_is_not_a_finding(self):
+        """A descriptive comment under Result = "See comment" is not a defect.
+
+        This check previously raised a critical. Removed on Mohamed's
+        instruction (docs/FEEDBACK.md entry 003): at AEG the comment is a
+        record of the metallurgical condition, and the release decision does
+        not live in it. It fired on 100% of the real corpus, and its constancy
+        was hiding genuine criticals — see D11 in docs/REBUILD.md.
+
+        Inverted rather than deleted so the decision is explicit and the check
+        cannot be reintroduced by accident.
+        """
         parsed = {
             "comment": (
                 "The microstructure contains primary carbides and gamma-prime. "
@@ -141,10 +152,22 @@ class LabReviewRegressionTests(unittest.TestCase):
 
         findings = _review_comment(parsed)
 
+        self.assertEqual(
+            [m for m in messages(findings) if "disposition" in m.lower()], [])
+
+    def test_comment_contradicting_the_result_is_still_flagged(self):
+        """Guard: dropping the disposition check must not weaken the
+        contradiction checks, which remain the useful part of this rule."""
+        parsed = {
+            "comment": "The part is not suitable for further service.",
+            "coating": {},
+            "sample": {"material": "Rene80", "result": "Acceptable"},
+        }
+
+        findings = _review_comment(parsed)
+
         self.assertTrue(any(
-            "no clear accept / reject / repair disposition" in message
-            for message in messages(findings, "critical")
-        ))
+            "NOT suitable" in message for message in messages(findings, "warning")))
 
     def test_microstructure_does_not_prove_restored_mechanical_properties(self):
         parsed = {

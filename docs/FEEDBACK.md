@@ -129,3 +129,68 @@ straight into `Machine Type:`.
   coating file. It covers the happy path well and says nothing about template
   drift or revisions. It is enough to stop guessing; it is not enough to
   declare the rebuild finished.
+
+---
+
+## 003 · Mohamed's decision, recorded by Opus · 2 Aug 2026
+
+**Status:** Disposition check removed. Entry 002's question is answered.
+
+**Decision**
+Mohamed: *"if you mean that the comment is not conclusive you can drop it."*
+
+Dropped. The check raised a **critical** whenever `Result = "See comment"` and
+the comment stated no accept / reject / repair verdict.
+
+**Verified before removing.** I read all four real comments first, in case the
+rule was firing because the *detector* missed a verdict that was present. It
+was not — every comment is a descriptive record of the metallurgical condition
+(heat-treatment sequence, oxidation and coating thicknesses, carbide
+morphology) and none states a disposition. The rule was factually correct. It
+was applying a QA expectation that does not match how AEG reports work: the
+comment records condition, and the release decision does not live in it.
+
+**Changed**
+- `lab_review._review_comment()` — the final `elif` branch removed. The
+  contradiction branches above it are untouched and remain the useful part of
+  that rule.
+- `lab_review.collect_highlights()` — the paired cell highlight removed.
+- `tests/test_lab_review.py::test_see_comment_requires_a_real_disposition` →
+  **inverted**, not deleted, and renamed
+  `test_see_comment_without_a_verdict_is_not_a_finding`, so the decision is
+  explicit and the check cannot come back by accident. Added
+  `test_comment_contradicting_the_result_is_still_flagged` to guard the
+  branches that survive.
+- Corpus baseline tightened: constant set 9 → 8.
+
+**Effect on the real corpus**
+
+| | before | after |
+|---|---|---|
+| Distinct findings | 25 | 24 |
+| Constant across all four | 9 | 8 |
+| Constant criticals | 2 | 1 |
+| Reports whose critical count differs | 0 | **1** |
+
+That last row is the point. Report 6943 now stands alone at two criticals
+because of its duplicated serial `C1ZP 093046`. One always-true check was
+enough to camouflage it. D11 is real and this is the cheapest possible
+demonstration.
+
+**Question for Mohamed — same shape, still open**
+One constant critical remains: **"No governing acceptance specification, limits
+or decision rule is stated, so the report cannot support acceptance as issued."**
+It fires on all four real reports for the same reason the dropped one did — the
+template does not carry it.
+
+If the acceptance spec genuinely lives outside the report (in the work order,
+the customer contract, or the Mat. Eng's sign-off), then this is the same call
+and it should go too, and the corpus would be left with **zero** constant
+criticals — meaning a critical would finally mean something. Say the word and
+I will drop it the same way.
+
+If instead the report *should* cite its controlling spec and simply never does,
+then it is a genuine finding about a template gap, and the right fix is D11's
+`scope` field — say it once, not on every report.
+
+I have not touched it either way.

@@ -51,7 +51,7 @@ before building: the real reports corrected the shape of D3 and added D11.
 | **D8** | `detect_type()` is three regex probes; no template registry, fingerprinting or versioning. | Template drift shows up as mysterious wrong findings rather than an actionable "unrecognised template". |
 | **D9** | The rightward scan does not stop at the next label, so a blank field adopts whatever is next on the row — an adjacent label, or worse, an adjacent field's **value**. | Most insidious shape of D1. `machine` silently becomes `'J-1001'`. Non-empty, so no completeness check fires, and the wrong value flows into title-identity and traceability as though correctly read. |
 | **D10** | Header fields only ever scan rightward (`_value_right`). | A template variant that stacks the value beneath its label loses every header field at once. |
-| **D11** | Findings have no scope. Template-level criticisms are re-emitted per report. | Measured on real files: 60–75% of a report's findings are identical on every report, including **both** criticals. The one genuine critical in the corpus (a duplicated serial) is camouflaged by two that always fire. |
+| **D11** | Findings have no scope. Template-level criticisms are re-emitted per report. | Measured on real files: a majority of a report's findings are identical on every report. Partially addressed — one always-true critical was dropped in FEEDBACK.md entry 003, which surfaced a genuine one. One constant critical remains ("no governing acceptance specification"). |
 
 > D9 was found while writing the test for D2: the first version of that test
 > *passed* because the field absorbed a neighbouring value instead of going
@@ -97,12 +97,15 @@ value), so a blank Customer scans straight into `Machine Type:`.
 
 **New — D11: findings have no scope.** Measured across the four real reports:
 
-| | |
-|---|---|
-| Distinct findings across the corpus | 25 |
-| Findings that fire on **all four** reports | **9** |
-| Share of any one report's output that is report-invariant | **60–75%** |
-| Criticals that fire on all four reports | **2 of 2** |
+| | as audited | after entry 003 |
+|---|---|---|
+| Distinct findings across the corpus | 25 | 24 |
+| Findings that fire on **all four** reports | **9** | **8** |
+| Criticals that fire on all four reports | **2 of 2** | **1** |
+| Reports whose critical count differs from the others | 0 | 1 |
+
+The last row is the one that matters: dropping a single always-true check made
+report 6943 visibly different from its peers for the first time.
 
 The constant findings are not wrong — the template genuinely never states an
 acceptance specification, and `Result` genuinely says "See comment" every time.

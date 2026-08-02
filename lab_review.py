@@ -1026,10 +1026,11 @@ def _review_comment(parsed):
         findings.append(('info', 'Comment',
                          f'Result defers to the comment; the comment verdict reads '
                          f'{"not suitable / negative" if neg else "suitable / positive"}.'))
-    elif 'see comment' in rlow and not neg and not pos:
-        findings.append(('critical', 'Disposition',
-                         'Result says "See comment", but the comment gives no clear '
-                         'accept / reject / repair disposition.'))
+    # A "See comment" result whose comment states no accept/reject/repair verdict
+    # was previously a critical finding. Removed on Mohamed's instruction: the
+    # comment is a descriptive record of the metallurgical condition, and the
+    # release decision does not live in it. It fired on 100% of real reports.
+    # See docs/FEEDBACK.md entry 003.
     return findings
 
 
@@ -2701,22 +2702,8 @@ def collect_highlights(parsed):
             add(anchor((loc.get('sample') or {}).get(key)), 'critical',
                 'Traceability', 'duplicate ID', note)
 
-    # ── Disposition — "See comment" must lead to an actual verdict ──
-    result = smp.get('result') or ''
-    comment = parsed.get('comment') or ''
-    if 'see comment' in result.lower():
-        has_negative = bool(re.search(
-            r'not\s+suitable|unsuitable|not\s+recommend|\breject|\bscrap|'
-            r'beyond\s+repair|non[-\s]?conform|unacceptable', comment, re.I))
-        has_positive = bool(re.search(
-            r'(?<!not )(?:\bsuitable for|\bacceptable|recommended for|'
-            r'reconditi|fit for service|return to service)', comment, re.I))
-        if not has_negative and not has_positive:
-            note = ('Result says "See comment", but the comment gives no clear '
-                    'accept / reject / repair disposition.')
-            sloc = loc.get('sample') or {}
-            add(anchor(sloc.get('result')), 'critical', 'Disposition', 'no verdict', note)
-            add(anchor(loc.get('comment')), 'critical', 'Disposition', 'no verdict', note)
+    # The "See comment" disposition highlight was removed here together with the
+    # finding in _review_comment(). See docs/FEEDBACK.md entry 003.
 
     # ── Completeness — missing or very short comment ──
     if len((parsed.get('comment') or '').strip()) < 40:
