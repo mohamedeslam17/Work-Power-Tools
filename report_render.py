@@ -660,7 +660,24 @@ def _faithful_view(data, parsed, findings, filename, dpi, timeout):
         pages = _raster_pdf(pdf, dpi)
     if not pages:
         raise RuntimeError('no pages rendered')
-    return _compose_faithful_view(pages, anchors, issues, extras, filename, dpi)
+    source_page_count = len(pages)
+    pages, omitted_blank_pages = _trim_blank_trailing_pages(pages)
+    if omitted_blank_pages:
+        extras.append({
+            'severity': 'warning',
+            'category': 'Pagination',
+            'note': (
+                f'The workbook print setup produced {source_page_count} pages, but '
+                f'{len(omitted_blank_pages)} trailing page(s) contained no report content '
+                f'and were omitted from the effective report view: '
+                f'{", ".join(map(str, omitted_blank_pages))}.'
+            ),
+        })
+    view = _compose_faithful_view(pages, anchors, issues, extras, filename, dpi)
+    view['source_page_count'] = source_page_count
+    view['effective_page_count'] = len(pages)
+    view['omitted_blank_pages'] = omitted_blank_pages
+    return view
 
 
 def _xlsx_to_pdf(xlsx_path, outdir, timeout):
@@ -700,6 +717,33 @@ def _raster_pdf(pdf, dpi):
         pages.append(Image.frombytes('RGB', (pix.width, pix.height), pix.samples).copy())
     doc.close()
     return pages
+
+
+def _visually_blank_report_page(page):
+    """True for a page containing only margins/footer furniture.
+
+    Trailing pages in the legacy workbooks often contain only the hard-coded
+    footer. A low whole-page ink ratio distinguishes that footer furniture
+    from a short but valid sign-off/remarks page.
+    """
+    gray = page.convert('L')
+    width, height = gray.size
+    central = gray.crop((int(width * 0.03), 0, int(width * 0.97), height))
+    histogram = central.histogram()
+    dark = sum(histogram[:245])
+    pixels = max(1, central.width * central.height)
+    return dark / pixels < 0.004
+
+
+def _trim_blank_trailing_pages(pages):
+    """Return (effective pages, omitted 1-based source page numbers)."""
+    kept = list(pages)
+    omitted = []
+    while len(kept) > 1 and _visually_blank_report_page(kept[-1]):
+        omitted.append(len(kept))
+        kept.pop()
+    omitted.reverse()
+    return kept, omitted
 
 
 def _color_bbox(img, rgb, tol=2):

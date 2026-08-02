@@ -6,7 +6,7 @@ from pathlib import Path
 import streamlit as st
 
 import report_render
-from lab_review import review_report
+from lab_review import add_version_findings, review_report
 from photo_lib import add_to_library
 
 try:
@@ -33,7 +33,7 @@ def _cached_review(name, data, ocr):
 
 
 @st.cache_data(show_spinner=False)
-def _cached_annotated_report(name, data, ocr):
+def _cached_annotated_report(name, data, ocr, extra_findings=()):
     """Return a page-oriented report-centric review package.
 
     The exact LibreOffice rendering is preferred. A spreadsheet-style
@@ -41,6 +41,7 @@ def _cached_annotated_report(name, data, ocr):
     available in the deployment environment.
     """
     rtype, parsed, findings = _cached_review(name, data, ocr)
+    findings = list(findings) + list(extra_findings or ())
     exact_status = 'LibreOffice not installed'
     if report_render.libreoffice_available():
         try:
@@ -131,12 +132,18 @@ def render():
         except Exception as e:
             reviewed.append({'name': f.name, 'error': str(e)})
             continue
-        rows = components.normalize_lab(findings)
         reviewed.append({
             'f': f, 'name': f.name, 'rtype': rtype, 'parsed': parsed, 'findings': findings,
-            'rows': rows, 'counts': components.count_by_severity(rows),
             'facts': _key_facts(rtype, parsed),
         })
+
+    add_version_findings(reviewed)
+    for report in reviewed:
+        if 'error' in report:
+            continue
+        rows = components.normalize_lab(report['findings'])
+        report['rows'] = rows
+        report['counts'] = components.count_by_severity(rows)
 
     for r in [x for x in reviewed if 'error' in x]:
         st.error(f"Could not read **{r['name']}** — {r['error']}")
@@ -180,7 +187,7 @@ def _render_detail(r, ocr):
                 file_name=f"{Path(r['name']).stem}_findings.csv", mime="text/csv",
                 key=f"labcsv_{r['name']}", width="stretch")
 
-        with st.expander("Extracted information", expanded=False):
+        with st.expander("Extracted information", expanded=True):
             _extracted_view(r['rtype'], r['parsed'])
 
         _annotated_report(r, ocr)
@@ -352,7 +359,8 @@ def _annotated_report(r, ocr):
     """
     f = r['f']
     with st.spinner(f"Building annotated report for {f.name}…"):
-        view, mode = _cached_annotated_report(f.name, f.getvalue(), ocr)
+        view, mode = _cached_annotated_report(
+            f.name, f.getvalue(), ocr, tuple(r.get('version_findings') or ()))
 
     if not view:
         st.error(f"Could not build the annotated report view — {mode}.")
@@ -369,9 +377,16 @@ def _annotated_report(r, ocr):
         return
 
     st.markdown("### Annotated report")
+    omitted = view.get('omitted_blank_pages') or []
+    page_note = (
+        f" {len(omitted)} blank trailing source page(s) were omitted: "
+        f"{', '.join(map(str, omitted))}."
+        if omitted else ""
+    )
     st.caption(
-        "Open one page at a time. Matching numbers can appear in more than one "
-        "location when a single issue affects several report fields.")
+        "Open one effective report page at a time. Matching numbers can appear "
+        "in more than one location when a single issue affects several report "
+        f"fields.{page_note}")
 
     labels = {
         page['number']: (
