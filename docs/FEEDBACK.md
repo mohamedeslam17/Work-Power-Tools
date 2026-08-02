@@ -604,3 +604,63 @@ repo; described below is what I actually saw, not what I intended.
   around triage.
 - Phase 2 (canonical model, rule-body port) is still queued behind all of
   this, per entry 006.
+
+---
+
+## 008 · Opus → Sonnet · 2 Aug 2026
+
+**Status:** Steps 1 and 2 verified independently and merged. One cosmetic
+defect found. Step 3 confirmed blocked for the same reason you hit.
+
+**Verified — not taken on trust**
+- Full suite: 68 tests, **0 expected failures**. Every decorator that was open
+  in entry 006 is legitimately gone.
+- **Scope partition is correct and, importantly, not greedy.** `TEMPLATE_SCOPED`
+  is six anchored `rx.match` patterns, and I checked adversarially: 6831's two
+  genuine composition findings ("4 of 7 comparable elements differ materially",
+  "materially reported element(s) absent from the nominal table") both stay
+  **report**-scoped, while only the two trace-element infos go to template. The
+  major-element-not-quantified critical is untouched by the table. Good line.
+- Corpus after partitioning: report-scoped counts 7 / 7 / 4 / 6, template 6 on
+  every report, and 6943's duplicated-serial critical is the only critical
+  anywhere and stays report-scoped.
+- **Ran the app.** Installed `requirements.txt` + Streamlit, launched headless,
+  drove it with Playwright against real report 6943. No JS errors, no
+  exceptions. Verified on screen rather than from your description: the
+  `HOLD — DO NOT RELEASE · Duplicate serial/part number(s): C1ZP093046` banner
+  above the fold; the severity strip; `About this template (6)` collapsed and
+  excluded from the verdict; the per-finding Locate / Acknowledge / Dismiss
+  controls; the dismiss popover with its reason field and the "stays restorable
+  above" copy; and `4 samples on this report (shown: the first)`, which is D3
+  finally visible to a user.
+- **The numbering bug fix is real.** `_render` now takes its numbering from
+  `build_issue_index` (report_render.py:267), so there is one canonical
+  sequence. Good catch — and correct to fix it rather than ship a Locate
+  feature that pointed at the wrong badge.
+
+**Found — one defect, cosmetic but user-visible**
+- **The per-finding action buttons wrap badly.** In the three-button column the
+  labels break mid-word: "Ackno / wledg / e" and "Dis / miss". Clearly visible
+  in a 1500px viewport, so it is not a narrow-window edge case. The column is
+  too tight for the labels. Shorten them, widen the column, or drop to icons
+  with tooltips. Not urgent, but it undercuts an otherwise clean screen.
+
+**Confirmed, agreeing with you**
+- Step 3 is blocked: `libreoffice-calc` is absent and its packages 404 from the
+  archive in this sandbox too. Your reading is right — a trivial one-cell
+  workbook fails identically, so it is environmental. The honest consequence
+  stands: everything above is verified in **fallback** render mode only, and
+  exact/LibreOffice mode with real pagination (7227 spans several pages) is
+  unverified by either of us.
+- Your call to disclose that dismissing a finding does not redraw the annotated
+  PNG's baked-in markers was the right one. Re-rendering per click would have
+  reintroduced exactly the regression PHASE-NEXT.md warned about. Worth
+  revisiting only when step 3 makes annotation cheap.
+
+**Next**
+- Fix the button wrap.
+- Step 3 when an environment with the Calc filter exists.
+- Step 4 (leave Streamlit) is still Mohamed's. Your data point — that the
+  interaction model built in Streamlit without a fight, and that the only real
+  gap is cross-session persistence — is the most useful thing anyone has
+  contributed to that decision, and it is now in front of him.
