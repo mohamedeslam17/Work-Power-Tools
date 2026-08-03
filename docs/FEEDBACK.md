@@ -834,3 +834,72 @@ fragile.
 
 **Next**
 - Steps as before: Step 3 (text-anchored annotation) still open.
+
+---
+
+## 012 · Sonnet → Opus · 3 Aug 2026
+
+**Status:** Legend OCR rebuilt. Measured on 24 real micrographs across 5 real
+reports (the 4-report corpus plus job 5739, supplied by Mohamed).
+
+| | before | after |
+|---|---|---|
+| Job number read **correctly** | 7 | **11** |
+| Job number read **WRONG** | 3 | **0** |
+| Legend unreadable | 14 | 13 |
+| Magnification read | 5 | **14** |
+| Time, all 5 reports | 38s | 56s |
+
+**Found — three separate defects, two of which fabricated data**
+
+1. *The crop was blind to where the legend actually is.* The old reader took
+   a fixed bottom strip (`h*0.90..h`, left 55%). Legends that sit slightly
+   higher were missed entirely, and on report 5739's image2 — a **screen
+   capture of the acquisition software** rather than an exported micrograph —
+   the strip grabbed the application's status bar. Replaced with a scan of
+   the whole frame for runs of rows carrying a little bright text.
+
+2. *The magnification was being harvested as the job number.* `_JOB_PAT` is
+   any 4-digit run, so `6831_E_1000x-7` offers both `6831` and the `1000` of
+   `1000x`. The magnification is the easier read, so it won, and report
+   6831's micrograph was reported as **job 1000**. `_vote_job` now blanks
+   magnification tokens before looking for a job.
+
+3. *A single bad pass could invent a job number.* The old code did
+   `_JOB_PAT.search(' '.join(reads))` — first hit across all passes
+   concatenated. On 5739 one pass produced `£5003` and the micrographs were
+   reported as **job 5003** against a report numbered 5739, which is exactly
+   the "micrograph from the wrong job" finding the check exists to raise.
+   Now voted, mirroring `_select_magnification`, and accepted only on 3+
+   agreeing passes or unanimity across 2. On the corpus every correctly-read
+   legend carried 4 votes while the one misread (`7207` for 7227) had 2 with
+   a competitor — so the threshold cleanly separates them, at the cost of one
+   correct-but-contested read going unreported. **Unreadable is the right
+   failure here; a wrong job number accuses a micrograph of belonging to
+   another report.**
+
+**Preprocessing, for whoever tunes this next**
+- Upscale with LANCZOS *before* thresholding, not after — the old
+  `_binarize` thresholded then resized, throwing away the only sub-pixel
+  information a 9px glyph has.
+- **Pad the crop with a black border.** Tesseract will not segment a line
+  that runs to the edge of its input; tight crops returned *nothing at all*.
+  This single change is what took image1 from silence to `5739_E_500x-2`.
+- Crop columns by *cluster*, not min..max. The ID caption is bottom-left and
+  the scale bar bottom-right on the same rows, so one span swallows the whole
+  micrograph between them and OCR reads grain.
+- Scale to a target band height (~90 and ~150px), not a fixed multiplier: a
+  fixed x12 on a wide band produced a 9000px-wide image and took 60s+ for one
+  four-micrograph report.
+
+**Not fixed, recorded**
+- `image2` of 5739 still reads nothing: it is a screenshot of the microscope
+  software, and its legend is inside the software's image panel. Worth a rule
+  of its own — "picture N is a screen capture, not an exported micrograph" is
+  a genuine report defect — but severity is Mohamed's call, so not added.
+- Scale-bar (`µm`) reading is still weak; the cluster split now yields the
+  scale bar as its own candidate crop, so this is mostly a pattern-tuning job.
+
+**Tests** `_vote_job` is covered by three new tests in `test_lab_review.py`
+pinning both fabrication modes (magnification-as-job, contested read) plus a
+guard that consensus still reports. Suite 71 tests, OK.

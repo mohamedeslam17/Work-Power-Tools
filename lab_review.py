@@ -41,7 +41,7 @@ from openpyxl.utils import get_column_letter
 # and thickness reading from micrographs are skipped gracefully when Pillow /
 # pytesseract / the Tesseract binary are not present.
 try:
-    from PIL import Image, ImageFilter
+    from PIL import Image, ImageFilter, ImageOps
     _PIL_AVAILABLE = True
 except Exception:
     _PIL_AVAILABLE = False
@@ -1992,40 +1992,185 @@ def _edge_density(im):
     return sum(1 for p in px if p > 40) / len(px) if px else None
 
 
+# Legend OCR is a constrained problem — the burned-in caption is always a short
+# run of ASCII like '5739_E_500x-12' or '10 µm' — so a whitelist keeps Tesseract
+# from inventing punctuation out of micrograph grain.
+_LEGEND_WL = ('-c tessedit_char_whitelist='
+              '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_-.x ')
+
+
+def _legend_bands(im, max_bands=3):
+    """Crops that look like a burned-in legend, best first.
+
+    The legend is bright text on a dark bar. Rows are scored by how many
+    bright pixels they carry, keeping only runs that are short (a caption, not
+    the micrograph itself) and narrow enough to be text. Scanning the WHOLE
+    frame rather than a fixed bottom strip matters: when someone pastes a
+    screen capture of the acquisition software instead of an exported
+    micrograph, the legend sits mid-frame inside the software's image panel,
+    and a bottom-strip crop reads the application's status bar instead.
+    """
+    g = im.convert('L')
+    w, h = g.size
+    if w < 40 or h < 20:
+        return []
+    px = g.load()
+    step = max(1, w // 400)                    # subsample wide images for speed
+    xs = list(range(0, w, step))
+    counts = [sum(1 for x in xs if px[x, y] > 175) for y in range(h)]
+
+    runs, cur = [], None
+    for y, c in enumerate(counts):
+        if 2 <= c <= len(xs) * 0.5:
+            cur = (y, y) if cur is None else (cur[0], y)
+        elif cur:
+            runs.append(cur)
+            cur = None
+    if cur:
+        runs.append(cur)
+
+    scored = []
+    for y0, y1 in runs:
+        if not (5 <= (y1 - y0 + 1) <= h * 0.14):
+            continue
+        # Prefer denser text and, on a tie, the lower band — the legend is at
+        # the foot of its frame whether that frame is the image or a panel.
+        scored.append((sum(counts[y0:y1 + 1]) * (1.0 + y0 / h), y0, y1))
+    scored.sort(reverse=True)
+
+    bands = []
+    gap = max(12, int(w * 0.04))
+    for _weight, y0, y1 in scored[:max_bands]:
+        ty0, ty1 = max(0, y0 - 3), min(h, y1 + 4)
+        cols = [x for x in xs if any(px[x, y] > 175 for y in range(ty0, ty1))]
+        if not cols:
+            continue
+        # Split into horizontally separated clusters instead of cropping
+        # min(cols)..max(cols): the ID caption sits bottom-LEFT and the scale
+        # bar bottom-RIGHT on the same rows, so a single span swallows the
+        # whole micrograph between them and OCR reads grain instead of text.
+        clusters, start, prev = [], cols[0], cols[0]
+        for x in cols[1:]:
+            if x - prev > gap:
+                clusters.append((start, prev))
+                start = x
+            prev = x
+        clusters.append((start, prev))
+        for cx0, cx1 in sorted(clusters, key=lambda c: c[1] - c[0], reverse=True)[:2]:
+            x0 = max(0, cx0 - 8)
+            x1 = min(w, cx1 + 9)
+            if (x1 - x0) < 24:
+                continue
+            bands.append(g.crop((x0, ty0, x1, ty1)))
+    return bands
+
+
+def _legend_reads(im):
+    """Every OCR reading of this micrograph's legend, across preprocessings.
+
+    Upscale with LANCZOS (keeping the antialiasing — thresholding first throws
+    away the only sub-pixel information a 9px glyph has), autocontrast, then
+    pad with a black border. The border is not cosmetic: Tesseract will not
+    segment a line that runs to the very edge of its input, which is why the
+    tight crops used to return nothing at all on smaller micrographs.
+    """
+    reads = []
+    for band in _legend_bands(im, max_bands=3):
+        # Two scales, both aiming to put the band around 80-160px tall so the
+        # glyphs land in Tesseract's comfortable range. Scaling by a fixed
+        # multiplier instead blows a wide band up to ~9000px and costs a
+        # minute per report; scaling to a single small target loses the
+        # agreement between passes that the vote depends on.
+        base = max(1, band.height)
+        for target in (90, 150):
+            scale = max(3, min(12, round(target / base)))
+            if band.width * scale > 2600:            # keep OCR input bounded
+                scale = max(3, 2600 // max(1, band.width))
+            big = ImageOps.autocontrast(
+                band.resize((band.width * scale, band.height * scale), Image.LANCZOS))
+            padded = ImageOps.expand(big, border=30, fill=0)
+            for psm in ('--psm 7', '--psm 13'):
+                text = _safe_ocr(padded, psm + ' ' + _LEGEND_WL)
+                if text and text.strip():
+                    reads.append(text.strip())
+        # Stop once a band has yielded something legend-shaped (digits next to
+        # an 'x'). The extra bands exist for awkward layouts — a legend inside
+        # a screen capture's image panel — and searching them anyway costs the
+        # majority of OCR time on exactly the micrographs that are never going
+        # to resolve, while adding noise to the vote on the ones that already did.
+        if any(re.search(r'\d{2,5}\s*[xX]', r) for r in reads):
+            break
+    return reads
+
+
+def _vote_job(reads):
+    """(job, votes) for the 4-digit job number, by consensus across reads.
+
+    Deliberately mirrors _select_magnification: a job number that only one
+    preprocessing pass ever saw is a guess, not a reading. Report 5739's
+    micrographs used to come back as job '5003' because a single bad pass
+    produced '£5003' and the old code took the first regex hit across the
+    concatenated passes — a fabricated job number that then contradicted the
+    report's own and raised a wrong-job finding.
+    """
+    votes = Counter()
+    for read in reads:
+        # Blank out the magnification before looking for a job number: a
+        # legend like '6831_E_1000x-7' otherwise offers BOTH '6831' and the
+        # '1000' of '1000x' as four-digit candidates, and the magnification
+        # is the easier read, so it won the vote and the micrograph was
+        # reported as belonging to job 1000.
+        cleaned = re.sub(r'\d{1,5}\s*[xX]', ' ', read or '')
+        for hit in set(_JOB_PAT.findall(cleaned)):
+            votes[hit] += 1
+    if not votes:
+        return None, {}
+    (best, count), = votes.most_common(1)
+    runner_up = max((n for job, n in votes.items() if job != best), default=0)
+    # Accept only a clearly-read job: three or more agreeing passes, or
+    # unanimity across at least two. A job number that some passes read
+    # differently is a coin-flip on one digit — on the corpus every correctly
+    # read legend carried 4 votes, while the single misread ('7207' for 7227)
+    # had 2 votes against a competitor. Reporting nothing is the honest
+    # outcome there: an unreadable legend says so, whereas a wrong job number
+    # accuses the micrograph of belonging to another report.
+    if count >= 3 or (count >= 2 and runner_up == 0):
+        return best, dict(votes)
+    return None, dict(votes)
+
+
 def _read_legend_im(im):
     """OCR the burned-in legend (ID / magnification / scale-bar) of one micrograph."""
     if not _OCR_AVAILABLE:
         return {}
-    w, h = im.size
-    lc = im.crop((0, int(h * 0.90), int(w * 0.55), h))           # ID + magnification
-    rc = im.crop((int(w * 0.72), int(h * 0.88), w, h))           # scale bar
-    lreads = [_safe_ocr(_binarize(lc, t)) for t in (110, 130, 150)]
+    lreads = _legend_reads(im)
     lblob = ' '.join(lreads)
-    rblob = ' '.join(_safe_ocr(_binarize(rc, t)) for t in (110, 140))
 
     out = {}
-    job_m = _JOB_PAT.search(lblob)
+    job, job_votes = _vote_job(lreads)
     mag_val, votes = _select_magnification(lreads)
     if votes:
         out['mag_votes'] = {f'{value}x': count for value, count in sorted(votes.items())}
         out['mag_read_count'] = len(lreads)
+    if job_votes:
+        out['job_votes'] = job_votes
     if mag_val is not None:
         mag = f'{mag_val}x'
         out['ocr_mag'] = mag
         out['mag'] = mag
         out['mag_source'] = 'ocr'
-        out['mag_confidence'] = votes[mag_val] / len(lreads)
+        out['mag_confidence'] = votes[mag_val] / max(1, len(lreads))
         idx = None
         for read in lreads:
             match = _MAG_PATS[0].search(read or '')
             if match and int(match.group(1)) == mag_val:
                 idx = match.group(2)
                 break
-        out['id'] = (f'{job_m.group(1)}_' if job_m else '') + f'E_{mag_val}x' + \
+        out['id'] = (f'{job}_' if job else '') + f'E_{mag_val}x' + \
                     (f'-{idx}' if idx else '')
-    if job_m:
-        out['job'] = job_m.group(1)
-    s = _SCALE_PAT.search(rblob) or _SCALE_PAT.search(lblob)
+    if job:
+        out['job'] = job
+    s = _SCALE_PAT.search(lblob)
     if s:
         out['scale'] = f'{s.group(1)} µm'
     return out

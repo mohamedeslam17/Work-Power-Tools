@@ -19,6 +19,7 @@ from lab_review import (
     _review_thickness,
     _review_traceability,
     _select_magnification,
+    _vote_job,
     add_version_findings,
     collect_highlights,
     picture_magnification_verdicts,
@@ -484,6 +485,34 @@ class LabReviewRegressionTests(unittest.TestCase):
         self.assertTrue(any("repeated" in message for message in messages(findings)))
         self.assertFalse(any("refers to Picture 4" in message
                              for message in messages(findings)))
+
+    def test_magnification_is_not_harvested_as_the_job_number(self):
+        """Real defect, report 6831: the legend '6831_E_1000x-7' offers two
+        four-digit runs — the job AND the 1000 inside '1000x'. The
+        magnification is the easier read, so it won the vote and the
+        micrograph was reported as belonging to job 1000."""
+        reads = ['6831_E_1000x-7', '6831_E_1000x-7', '6831_E_1000x-7']
+
+        job, votes = _vote_job(reads)
+
+        self.assertEqual(job, '6831')
+        self.assertNotIn('1000', votes)
+
+    def test_a_job_number_some_passes_disagree_on_is_not_reported(self):
+        """Real defect, report 7227 image 2: OCR read '7207' twice and '7297'
+        once for a legend that actually says 7227. A wrong job accuses the
+        micrograph of belonging to another report, so a contested read must
+        come back unreadable rather than confidently wrong."""
+        job, votes = _vote_job(['7207_E_200x-1', '7207_E_200x-1', '7297_E_200x-1'])
+
+        self.assertIsNone(job)
+        self.assertEqual(votes, {'7207': 2, '7297': 1})
+
+    def test_a_unanimously_read_job_number_is_reported(self):
+        """Guard for the above: consensus must still be usable, or the whole
+        legend cross-check goes silent."""
+        self.assertEqual(_vote_job(['5739_E_500x-2', '5739_E_500x-2'])[0], '5739')
+        self.assertEqual(_vote_job(['7227_E_200x-1'] * 4)[0], '7227')
 
     def test_one_ocr_number_cannot_be_promoted_to_a_fact(self):
         selected, votes = _select_magnification([
