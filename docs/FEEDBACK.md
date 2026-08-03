@@ -780,3 +780,57 @@ Full suite 68 tests, OK.
 - Step 3 (text-anchored annotation, D6) is still open and still worth doing;
   fit-width reduces the page count it has to deal with but does not replace it.
 - `iir_tool.py` / `photo_tool.py` still use the old shell.
+
+---
+
+## 011 · Sonnet → Opus · 3 Aug 2026
+
+**Status:** Mohamed supplied a real report outside the corpus (job 5739, U500
+3rd stage bucket). Ran it. One real rendering defect found and fixed;
+extraction and rules checked out.
+
+**Found — badges were painted over the values they point at**
+On 5739 the numbered markers landed *on* the data: badge 4 covered the Co
+nominal so `18.5` rendered as `18.`, badge 5 covered actual Ti `2.32`, badge
+1,2 covered Quantity `92`. Cause: the badge was anchored with its RIGHT edge
+just past the cell (`x1 = bbox[2] + gap; x0 = x1 - label_w`), so on narrow
+composition columns the whole badge fell inside the cell. First fix (park it
+outside the right edge) moved the problem onto the *neighbour* — `17.14`
+became `.7.14`. Final: badges straddle the cell's top-right **corner**, which
+is the one reliably rule-and-whitespace spot given cell text is vertically
+centred and inset from the column border. Added collision nudging so
+adjacent markers stop stacking. This was visible on the corpus too; nobody
+had caught it because we had been reading findings lists, not the picture.
+
+**Checked and found correct on 5739 — recording so it is not re-litigated**
+- 4 samples fanned out of the packed cells, serials paired correctly
+  (C2DM226440 / 224898 / 233560 / 233501), shared material U500 on each.
+- Header: job 5739, machine MS7001, customer AEN-SAUDI, qty 92, EOH "Not
+  Provided", ref B802133 — all correct.
+- Composition: nominal 9 elements, actual 7. "Nominal major element(s) not
+  reported in Actual: Al" is **true** — the actual table's headers are
+  Co/Cr/Mo/Ti/Ni/Fe/Mn, there is no Al column. Same for the B/C/Zr trace note.
+- The `[critical] External-workbook formula MET!L4 =[1]Cover!G44` is real.
+
+**Two genuine defects in that report the tool does NOT currently flag**
+1. **The first serial is invisible when printed.** The S/N cell holds four
+   serials but the row is too short for four lines, so `C2DM226440` is
+   clipped by the header row above it. Confirmed present in a plain
+   LibreOffice conversion of the untouched file, i.e. it is the report's
+   defect, not a render artefact. A "cell content clipped by row height"
+   check would catch a whole class of these.
+2. **The Actual composition table's alloy-name header cell says
+   "Alloy (Nominal)"** — a copy-paste slip in the template. Both tables are
+   labelled Nominal in that sub-header.
+Neither is a rule I should add unprompted (severity is Mohamed's call), so
+they are recorded here rather than implemented.
+
+**Also worth knowing:** a filename whose leading token is a number that is
+not the job number produces a false `Title identity` critical — the sandbox
+upload prefix `6836ef34-5739_...` made it claim "title job 6836 does not
+match internal 5739". Harmless for real uploads (Streamlit passes the user's
+own filename) but the job-number-from-filename match is positional and
+fragile.
+
+**Next**
+- Steps as before: Step 3 (text-anchored annotation) still open.
