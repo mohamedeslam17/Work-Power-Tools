@@ -859,14 +859,15 @@ def _annotate_faithful_pages(pages, anchors, issues, dpi):
         for number in anchor['issue_nums']:
             issue_pages[number].add(page_index + 1)
 
-    radius = max(13, int(dpi * 0.105))
-    font = _font(max(13, int(radius * 1.05)), bold=True)
+    radius = max(11, int(dpi * 0.085))
+    font = _font(max(12, int(radius * 1.05)), bold=True)
     page_entries = []
     annotated_images = []
     for page_index, source in enumerate(pages):
         page = source.copy().convert('RGB')
         draw = ImageDraw.Draw(page)
         page_issue_nums = set()
+        placed = []          # badge rects already drawn on this page
         for anchor, bbox in by_page[page_index]:
             numbers = anchor['issue_nums']
             page_issue_nums.update(numbers)
@@ -882,11 +883,31 @@ def _annotate_faithful_pages(pages, anchors, issues, dpi):
                 width=max(2, int(dpi / 72)),
             )
 
+            # The badge must never sit ON a value — not the flagged one (the
+            # whole point is to read it) and not its neighbour's either. Park
+            # it straddling the cell's top-right CORNER: cell text is
+            # vertically centred in its row and horizontally inset from the
+            # column border, so the corner junction is the one spot that is
+            # reliably rule-and-whitespace. Nudge down when it would land on a
+            # badge already drawn, so markers never stack.
             label_w = max(2 * radius, int(_textw(draw, label, font) + radius))
-            x1 = min(page.width - 3, bbox[2] + max(2, radius // 3))
-            x0 = max(3, x1 - label_w)
-            y0 = max(3, bbox[1] - radius)
-            y1 = y0 + 2 * radius
+            x0 = bbox[2] - label_w / 2
+            x0 = max(3, min(x0, page.width - 3 - label_w))
+            y0 = max(3, min(bbox[1] - radius, page.height - 3 - 2 * radius))
+
+            def _hits(ax0, ay0):
+                return any(not (ax0 + label_w < px0 or ax0 > px1
+                                or ay0 + 2 * radius < py0 or ay0 > py1)
+                           for px0, py0, px1, py1 in placed)
+
+            step = radius
+            for _ in range(6):
+                if not _hits(x0, y0):
+                    break
+                y0 = min(y0 + step, page.height - 3 - 2 * radius)
+            x1, y1 = x0 + label_w, y0 + 2 * radius
+            placed.append((x0, y0, x1, y1))
+
             draw.rounded_rectangle(
                 [x0, y0, x1, y1],
                 radius=radius,
