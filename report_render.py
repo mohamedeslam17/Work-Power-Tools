@@ -2,12 +2,19 @@
 """
 Annotated review images for the Lab Report Reviewer.
 
-Two products, both pure-Pillow (degrade to None / [] when Pillow is absent):
+Four products, all Pillow-based (degrade to None / [] when Pillow is absent):
 
   * render_report_image(...) — draws the report's data region as a
     spreadsheet-like grid, boxes and numbers the cells that triggered findings,
     and bakes a numbered legend underneath. The "issue areas, highlighted and
     annotated" view.
+  * render_report_faithful_view(...) — renders the real workbook through
+    LibreOffice and marks each flagged cell on the resulting page raster,
+    keeping where every marker landed.
+  * compose_shared_report(...) — turns that view into the document that gets
+    sent: each page beside a margin of comment callouts, every callout joined to
+    its own cell by a leader line, including the reviewer's own comments. Pillow
+    only, so a comment or a dismissal never re-renders the workbook.
   * annotate_micrographs(...) — boxes each embedded micrograph's burned-in
     legend / scale-bar regions, flags low contrast and surfaces any thickness
     measurements read from it.
@@ -54,8 +61,13 @@ _SEV_RGB = {
     'warning':  (236, 134, 18),    # orange
     'info':     (24, 110, 214),    # blue
     'pass':     (32, 160, 80),     # green
+    # Not a severity: a reviewer's own comment. Deliberately a colour the
+    # rule engine never produces, so a human remark can't be mistaken for a
+    # machine finding on a page that is going to be sent to someone else.
+    'comment':  (91, 76, 176),     # indigo
 }
 _SEV_RANK = {'critical': 3, 'warning': 2, 'info': 1, 'pass': 0}
+_MUTED_RGB = (128, 136, 148)       # template-scoped / dismissed callouts
 _WHITE   = (255, 255, 255)
 _GRID    = (203, 207, 214)
 _HDR_BG  = (240, 242, 246)
@@ -622,7 +634,7 @@ def build_issue_index(parsed, findings=None):
 
 def render_report_faithful_view(
         data, parsed, findings=None, filename=None, dpi=150, timeout=90,
-        fit_width=False):
+        fit_width=False, with_pdf=True):
     """Return a page-oriented annotated report package and a status string.
 
     The package contains individually annotated page PNGs, unique issue
@@ -637,6 +649,11 @@ def render_report_faithful_view(
         together. It is deliberately OFF by default: this function's contract
         is fidelity to the document as it prints, and the callers that want
         readability over fidelity opt in.
+
+    with_pdf : compose the sendable comment-callout PDF here as well. Callers
+        that build their own — the reviewer adds comments and triages findings,
+        so the UI composes per state via `compose_shared_report` — pass False
+        and skip the duplicate pass.
     """
     if not _PIL:
         return None, 'Pillow unavailable'
@@ -646,7 +663,7 @@ def render_report_faithful_view(
         return None, 'LibreOffice not installed'
     try:
         return _faithful_view(data, parsed, findings, filename, dpi, timeout,
-                              fit_width), 'ok'
+                              fit_width, with_pdf), 'ok'
     except subprocess.TimeoutExpired:
         return None, 'LibreOffice timed out'
     except Exception as e:
@@ -662,7 +679,8 @@ def render_report_faithful(data, parsed, findings=None, filename=None, dpi=130, 
     return ((view or {}).get('combined_png'), status)
 
 
-def _faithful_view(data, parsed, findings, filename, dpi, timeout, fit_width=False):
+def _faithful_view(data, parsed, findings, filename, dpi, timeout,
+                   fit_width=False, with_pdf=True):
     loc = parsed.get('loc') or {}
     issues, extras = build_issue_index(parsed, findings)
 
@@ -754,7 +772,8 @@ def _faithful_view(data, parsed, findings, filename, dpi, timeout, fit_width=Fal
                 f'{", ".join(map(str, omitted_blank_pages))}.'
             ),
         })
-    view = _compose_faithful_view(pages, anchors, issues, extras, filename, dpi)
+    view = _compose_faithful_view(pages, anchors, issues, extras, filename, dpi,
+                                  with_pdf)
     view['source_page_count'] = source_page_count
     view['effective_page_count'] = len(pages)
     view['omitted_blank_pages'] = omitted_blank_pages
@@ -868,6 +887,7 @@ def _annotate_faithful_pages(pages, anchors, issues, dpi):
         draw = ImageDraw.Draw(page)
         page_issue_nums = set()
         placed = []          # badge rects already drawn on this page
+        placements = []      # where each marked cell landed, for the callouts
         for anchor, bbox in by_page[page_index]:
             numbers = anchor['issue_nums']
             page_issue_nums.update(numbers)
@@ -923,18 +943,71 @@ def _annotate_faithful_pages(pages, anchors, issues, dpi):
                 anchor='mm',
             )
 
+            # Kept so a callout can be drawn beside the page later, joined to
+            # this exact cell by a leader line, without re-running LibreOffice
+            # or re-probing the locator colours.
+            placements.append({
+                'issue_nums': list(numbers),
+                'severity': anchor['severity'],
+                'cell_bbox': [int(value) for value in bbox],
+                'badge_bbox': [int(x0), int(y0), int(x1), int(y1)],
+            })
+
         output = io.BytesIO()
         page.save(output, format='PNG', optimize=True)
         page_entries.append({
             'number': page_index + 1,
             'png': output.getvalue(),
             'issue_nums': sorted(page_issue_nums),
+            'placements': placements,
+            'size': list(page.size),
         })
         annotated_images.append(page)
 
     for issue in issues:
         issue['pages'] = sorted(issue_pages.get(issue['num'], set()))
     return page_entries, annotated_images
+
+
+def crop_issue_detail(page_png, placements, issue_num, pad=70, min_side=420,
+                      magnify=2):
+    """A magnified crop of one issue's marked cell on a rendered page, or None.
+
+    Uses where the marker actually landed, so it works on the exact
+    (LibreOffice) pages too — `cell_pixel_rect` only ever knew the drawn-grid
+    fallback's geometry. Several cells for one finding are shown together, since
+    that is the point of them carrying one number.
+    """
+    if not _PIL or not page_png or not placements:
+        return None
+    boxes = [placement.get('cell_bbox') for placement in placements
+             if issue_num in (placement.get('issue_nums') or ())
+             and placement.get('cell_bbox')]
+    if not boxes:
+        return None
+    try:
+        page = Image.open(io.BytesIO(page_png)).convert('RGB')
+    except Exception:
+        return None
+    x0 = max(0, min(box[0] for box in boxes) - pad)
+    y0 = max(0, min(box[1] for box in boxes) - pad)
+    x1 = min(page.width, max(box[2] for box in boxes) + pad)
+    y1 = min(page.height, max(box[3] for box in boxes) + pad)
+    if x1 - x0 < min_side:
+        grow = (min_side - (x1 - x0)) // 2
+        x0, x1 = max(0, x0 - grow), min(page.width, x1 + grow)
+    if y1 - y0 < min_side // 2:
+        grow = (min_side // 2 - (y1 - y0)) // 2
+        y0, y1 = max(0, y0 - grow), min(page.height, y1 + grow)
+    if x1 <= x0 or y1 <= y0:
+        return None
+    crop = page.crop((int(x0), int(y0), int(x1), int(y1)))
+    if magnify > 1 and crop.width * magnify <= 2600:
+        crop = crop.resize((crop.width * magnify, crop.height * magnify),
+                           Image.LANCZOS)
+    output = io.BytesIO()
+    crop.save(output, format='PNG', optimize=True)
+    return output.getvalue()
 
 
 def _pages_to_pdf(pages, dpi):
@@ -982,6 +1055,109 @@ def _wrap_download_text(draw, text, font, max_width):
     return lines or ['']
 
 
+def normalize_comments(comments):
+    """Reviewer-written comments -> numbered callout records (R1, R2, …).
+
+    A comment is free text plus an optional anchor: `issue` ties it to a
+    numbered finding, so it inherits that finding's cell and gets its own
+    leader line; `page` pins it to one report page; neither makes it a
+    report-level comment, carried on page 1. Empty text is dropped rather than
+    drawn as an empty callout.
+    """
+    records = []
+    for entry in comments or ():
+        if isinstance(entry, str):
+            entry = {'text': entry}
+        text = str(entry.get('text') or '').strip()
+        if not text:
+            continue
+        issue = entry.get('issue')
+        page = entry.get('page')
+        records.append({
+            'kind': 'comment',
+            'severity': 'comment',
+            'label': f'R{len(records) + 1}',
+            'note': text,
+            'author': str(entry.get('author') or '').strip(),
+            'page': int(page) if page else None,
+            'issue': int(issue) if issue else None,
+        })
+    return records
+
+
+def _card_style(record):
+    """(accent, background) for one callout.
+
+    Template-scoped and dismissed callouts are deliberately grey: they are on
+    the page because a marker points at them, not because the recipient has to
+    act on them, and colouring them like live findings would overstate the
+    report's problems to whoever it is sent to.
+    """
+    if record.get('state') in ('template', 'dismissed'):
+        return _MUTED_RGB, (247, 248, 250)
+    severity = record.get('severity', 'warning')
+    fill = {
+        'critical': (255, 247, 247),
+        'warning': (255, 250, 243),
+        'info': (247, 250, 255),
+        'pass': (246, 252, 248),
+        'comment': (248, 247, 255),
+    }.get(severity, _WHITE)
+    return _SEV_RGB.get(severity, _SEV_RGB['warning']), fill
+
+
+def _card_title(record):
+    if record.get('kind') == 'comment':
+        return f"{record.get('label') or 'R'}. REVIEWER COMMENT"
+    label = {
+        'critical': 'FAIL',
+        'warning': 'WARNING',
+        'info': 'NOTE',
+        'pass': 'PASS',
+    }.get(record.get('severity', 'warning'), 'REVIEW')
+    state = record.get('state')
+    if state == 'dismissed':
+        label = 'DISMISSED'
+    elif state == 'template':
+        label += ' (TEMPLATE)'
+    number = record.get('num')
+    return f'{number}. {label}' if number is not None else f'REPORT CHECK - {label}'
+
+
+def _card_meta(record):
+    if record.get('kind') == 'comment':
+        bits = [record.get('author') or 'Reviewer']
+        if record.get('issue'):
+            bits.append(f"on finding #{record['issue']}")
+        elif record.get('page'):
+            bits.append(f"page {record['page']}")
+        else:
+            bits.append('whole report')
+        return ' - '.join(bits)
+    meta = record.get('category') or 'Review'
+    refs = record.get('refs') or []
+    if refs:
+        meta += ' - ' + ', '.join(refs)
+    if record.get('state') == 'template':
+        meta += ' - applies to every report on this template'
+    return meta
+
+
+def _card_body(record):
+    note = str(record.get('note') or '')
+    if record.get('state') == 'dismissed':
+        reason = str(record.get('reason') or '').strip() or 'no reason given'
+        note = f'{note}  [Dismissed by the reviewer: {reason}]'
+    return note
+
+
+def _card_anchor_nums(record):
+    """Issue numbers a callout's leader line should point at."""
+    if record.get('kind') == 'comment':
+        return [record['issue']] if record.get('issue') else []
+    return [record['num']] if record.get('num') is not None else []
+
+
 def _download_issue_cards(records, panel_width, panel_height, dpi):
     """Prepare fully wrapped cards and split long comments into continuations."""
     scale = max(0.8, dpi / 150.0)
@@ -995,7 +1171,7 @@ def _download_issue_cards(records, panel_width, panel_height, dpi):
     note_lh = max(18, int(23 * scale))
     card_width = panel_width - 2 * pad
     text_width = card_width - 2 * card_pad
-    usable_height = panel_height - max(94, int(116 * scale)) - pad
+    usable_height = panel_height - _panel_header_height(scale) - 2 * pad
     max_note_lines = max(
         1,
         int((usable_height - 2 * card_pad - title_lh - meta_lh - 12) / note_lh),
@@ -1005,22 +1181,13 @@ def _download_issue_cards(records, panel_width, panel_height, dpi):
     draw = ImageDraw.Draw(probe)
     cards = []
     for record in records:
-        number = record.get('num')
-        severity = record.get('severity', 'warning')
-        label = {
-            'critical': 'FAIL',
-            'warning': 'WARNING',
-            'info': 'NOTE',
-            'pass': 'PASS',
-        }.get(severity, 'REVIEW')
-        title = f'{number}. {label}' if number is not None else f'REPORT CHECK - {label}'
-        refs = record.get('refs') or []
-        meta = record.get('category') or 'Review'
-        if refs:
-            meta += ' - ' + ', '.join(refs)
-        meta_lines = _wrap_download_text(draw, meta, meta_font, text_width)
+        accent, fill = _card_style(record)
+        title = _card_title(record)
+        anchor_nums = _card_anchor_nums(record)
+        meta_lines = _wrap_download_text(
+            draw, _card_meta(record), meta_font, text_width)
         note_lines = _wrap_download_text(
-            draw, record.get('note') or '', note_font, text_width)
+            draw, _card_body(record), note_font, text_width)
 
         # Long comments remain complete by continuing them in another card/page.
         chunk_size = max(1, max_note_lines - max(0, len(meta_lines) - 1))
@@ -1036,7 +1203,12 @@ def _download_issue_cards(records, panel_width, panel_height, dpi):
                 + len(chunk) * note_lh
             )
             cards.append({
-                'severity': severity,
+                'severity': record.get('severity', 'warning'),
+                'accent': accent,
+                'fill': fill,
+                # Only the first chunk carries the leader line: a continuation
+                # card would draw a second line to the same cell.
+                'anchor_nums': anchor_nums if index == 0 else [],
                 'title': chunk_title,
                 'title_font': title_font,
                 'title_lh': title_lh,
@@ -1070,19 +1242,97 @@ def _paginate_download_cards(cards, usable_height, gap):
     return groups
 
 
-def _download_page_records(page_entry, issues, extras, first_page):
+def _anchor_geometry(placements):
+    """(top y per issue number, leader-line target points per issue number).
+
+    The target is the numbered badge's right edge, not the cell's middle: the
+    badge sits on the cell's top-right corner, so a line arriving there runs
+    along a gridline instead of striking through the row's values — and it ends
+    on the marker the callout's number refers to.
+    """
+    tops, points = {}, {}
+    for placement in placements or ():
+        _cx0, cy0, _cx1, _cy1 = placement.get('cell_bbox') or (0, 0, 0, 0)
+        bx0, by0, bx1, by1 = placement.get('badge_bbox') or (0, 0, 0, 0)
+        for number in placement.get('issue_nums') or ():
+            tops[number] = min(tops.get(number, cy0), cy0)
+            points.setdefault(number, []).append(
+                (max(bx1, bx0), (by0 + by1) / 2))
+    return tops, points
+
+
+def _place_callout_cards(cards, tops, card_top, card_bottom, gap):
+    """Give every card a y inside a panel column, beside its own cell.
+
+    Returns [[(card, y), …], …] — one list per panel column. Aligning a card
+    with the row it describes is what makes its leader line short and roughly
+    horizontal; a card stacked in list order would point diagonally across the
+    whole page. Cards that no longer fit continue in a further column rather
+    than being dropped or drawn off the page.
+    """
+    for card in cards:
+        wanted = [tops[number] for number in card['anchor_nums'] if number in tops]
+        card['anchor_y'] = min(wanted) if wanted else None
+
+    columns, current, cursor = [], [], card_top
+    for card in cards:
+        height = card['height']
+        wanted = card['anchor_y']
+        y = cursor if wanted is None else max(cursor, wanted)
+        if y + height > card_bottom and current:
+            columns.append(current)
+            current, cursor = [], card_top
+            y = (card_top if wanted is None
+                 else max(card_top, min(wanted, card_bottom - height)))
+        if y + height > card_bottom:
+            y = max(card_top, card_bottom - height)
+        current.append((card, y))
+        cursor = y + height + gap
+    columns.append(current)
+    return columns
+
+
+def _download_page_records(page_entry, issues, extras, first_page, comments=()):
+    """Everything that gets a callout beside one report page.
+
+    A comment anchored to a finding follows that finding onto its page. Page 1
+    additionally carries what has no cell at all — report-level checks and the
+    reviewer's whole-report comments — so nothing written is left out of the
+    shared document.
+    """
     numbers = set(page_entry.get('issue_nums') or [])
+    page_number = page_entry.get('number')
     records = [issue for issue in issues if issue.get('num') in numbers]
+    for comment in comments or ():
+        if comment.get('issue') in numbers:
+            records.append(comment)
+        elif (comment.get('issue') is None
+                and comment.get('page')
+                and comment['page'] == page_number):
+            records.append(comment)
     if first_page:
         records.extend(issue for issue in issues if not issue.get('pages'))
         records.extend(extras or [])
+        placed = {issue['num'] for issue in issues if issue.get('pages')}
+        for comment in comments or ():
+            anchored_nowhere = (
+                comment.get('issue') is not None and comment['issue'] not in placed)
+            unpinned = comment.get('issue') is None and not comment.get('page')
+            if anchored_nowhere or unpinned:
+                records.append(comment)
     return records
 
 
-def _draw_download_panel(
+def _panel_header_height(scale):
+    """Height of a callout panel's heading block, above the first card."""
+    return (max(31, int(38 * scale)) + max(22, int(27 * scale))
+            + max(30, int(39 * scale)))
+
+
+def _draw_callout_panel(
         canvas, panel_x, panel_width, page_number, report_count, filename,
-        cards, panel_index, panel_count, pad, dpi):
-    """Draw comments beside one annotated report page."""
+        placed_cards, panel_index, panel_count, pad, dpi):
+    """Draw the comment callouts beside one annotated report page."""
     draw = ImageDraw.Draw(canvas)
     scale = max(0.8, dpi / 150.0)
     draw.rectangle(
@@ -1115,7 +1365,7 @@ def _draw_download_panel(
     )
     y += max(30, int(39 * scale))
 
-    if not cards:
+    if not placed_cards:
         clear_font = _font(max(15, int(18 * scale)), bold=True)
         body_font = _font(max(12, int(15 * scale)))
         body_lines = _wrap_download_text(
@@ -1153,31 +1403,25 @@ def _draw_download_panel(
             body_y += body_lh
         return
 
-    gap = max(10, int(13 * scale))
-    for card in cards:
-        color = _SEV_RGB.get(card['severity'], _SEV_RGB['warning'])
-        fill = {
-            'critical': (255, 247, 247),
-            'warning': (255, 250, 243),
-            'info': (247, 250, 255),
-            'pass': (246, 252, 248),
-        }.get(card['severity'], _WHITE)
+    for card, card_y in placed_cards:
+        color = card.get('accent') or _SEV_RGB['warning']
+        fill = card.get('fill') or _WHITE
         x1 = panel_x + panel_width - pad
-        y1 = min(canvas.height - pad, y + card['height'])
+        y1 = min(canvas.height - pad, card_y + card['height'])
         draw.rounded_rectangle(
-            [x, y, x1, y1],
+            [x, card_y, x1, y1],
             radius=max(8, int(10 * scale)),
             fill=fill,
             outline=(213, 219, 228),
             width=max(1, int(1.5 * scale)),
         )
         draw.rounded_rectangle(
-            [x, y, x + max(5, int(6 * scale)), y1],
+            [x, card_y, x + max(5, int(6 * scale)), y1],
             radius=max(2, int(3 * scale)),
             fill=color,
         )
         tx = x + card['padding']
-        ty = y + card['padding']
+        ty = card_y + card['padding']
         draw.text(
             (tx, ty),
             card['title'],
@@ -1192,49 +1436,152 @@ def _draw_download_panel(
         for line in card['note_lines']:
             draw.text((tx, ty), line, font=card['note_font'], fill=(45, 55, 72))
             ty += card['note_lh']
-        y = y1 + gap
+
+
+def _draw_leader_lines(canvas, placed_cards, panel_x, points, pad, dpi):
+    """Join each callout to the cell it is about.
+
+    Drawn last and only across the report area (never into the panel, which is
+    already painted), semi-transparent so it reads as a leader over a dense
+    spreadsheet instead of striking through it. Only the column adjacent to the
+    page gets lines — a line from a further column would have to cross the
+    callouts in between.
+
+    Routed, not straight: a card that could not be placed level with its own
+    row would otherwise draw a diagonal clean across the micrographs. The
+    vertical travel is instead kept in a channel just inside the page's right
+    edge — the sheet's own print margin — so only the short run along the
+    marked cell's row crosses any content.
+    """
+    draw = ImageDraw.Draw(canvas, 'RGBA')
+    width = max(2, int(dpi / 90))
+    step = max(4, int(dpi / 26))
+    margin = max(10, int(panel_x * 0.012))
+    for index, (card, card_y) in enumerate(placed_cards):
+        targets = [point for number in card['anchor_nums']
+                   for point in points.get(number, ())]
+        if not targets:
+            continue
+        color = tuple(card.get('accent') or _SEV_RGB['warning'])
+        # Leave from the card's title row: that is where its number is, so the
+        # eye follows number -> line -> badge. Stagger the vertical run so
+        # several leaders sharing the margin stay separate lines.
+        edge_y = card_y + card['padding'] + card['title_lh'] / 2
+        channel_x = panel_x - margin - (index % 3) * step
+        for x, y in targets:
+            end_x = min(x + width, panel_x - 1)
+            if abs(edge_y - y) <= step or end_x >= channel_x:
+                route = [(panel_x + pad, edge_y), (end_x, y)]
+            else:
+                route = [(panel_x + pad, edge_y), (channel_x, edge_y),
+                         (channel_x, y), (end_x, y)]
+            draw.line(route, fill=color + (150,), width=width, joint='curve')
 
 
 def _compose_download_pages(
-        annotated_pages, page_entries, issues, extras, filename, dpi):
-    """Create PDF-ready pages with every issue comment visibly embedded."""
+        annotated_pages, page_entries, issues, extras, filename, dpi,
+        comments=()):
+    """Create PDF-ready pages with every issue comment visibly called out.
+
+    Each page is the annotated report plus a margin of comment callouts, joined
+    to the cells they describe by leader lines. This is the artefact that gets
+    sent to someone: the comment has to be readable *on* the page, because the
+    recipient has neither the app nor the findings list.
+    """
     download_pages = []
     report_count = len(annotated_pages)
     for index, (report, entry) in enumerate(zip(annotated_pages, page_entries)):
         report = report.convert('RGB')
         scale = max(0.8, dpi / 150.0)
-        panel_width = max(int(report.width * 0.42), int(500 * scale))
-        records = _download_page_records(entry, issues, extras, index == 0)
+        # Proportional to the page, but capped: the fallback grid render can be
+        # several thousand pixels wide, and 42% of that is a comment column with
+        # a line length nobody reads.
+        panel_width = max(int(500 * scale),
+                          min(int(report.width * 0.42), int(920 * scale)))
+        tops, points = _anchor_geometry(entry.get('placements'))
+        records = _download_page_records(
+            entry, issues, extras, index == 0, comments)
+        records.sort(key=lambda record: min(
+            (tops[number] for number in _card_anchor_nums(record) if number in tops),
+            default=float('inf')))
         cards, pad, usable_height = _download_issue_cards(
             records, panel_width, report.height, dpi)
         gap = max(10, int(13 * scale))
-        card_groups = _paginate_download_cards(cards, usable_height, gap)
+        card_top = pad + _panel_header_height(scale)
+        columns = _place_callout_cards(
+            cards, tops, card_top, min(report.height - pad, card_top + usable_height),
+            gap)
         # Overflow comments use additional side columns on the same PDF page.
         # The annotated download therefore keeps exactly the report's source
         # page count while guaranteeing that every comment remains visible.
         canvas = Image.new(
             'RGB',
-            (report.width + panel_width * len(card_groups), report.height),
+            (report.width + panel_width * len(columns), report.height),
             _WHITE,
         )
         canvas.paste(report, (0, 0))
-        for panel_index, group in enumerate(card_groups, start=1):
+        for panel_index, column in enumerate(columns, start=1):
             panel_x = report.width + panel_width * (panel_index - 1)
-            _draw_download_panel(
+            _draw_callout_panel(
                 canvas,
                 panel_x,
                 panel_width,
                 entry.get('number', index + 1),
                 report_count,
                 filename,
-                group,
+                column,
                 panel_index,
-                len(card_groups),
+                len(columns),
                 pad,
                 dpi,
             )
+        if columns and columns[0]:
+            _draw_leader_lines(
+                canvas, columns[0], report.width, points, pad, dpi)
         download_pages.append(canvas)
     return download_pages
+
+
+def compose_shared_report(view, issues=None, extras=None, comments=(),
+                          filename=None, dpi=150):
+    """Rebuild the sendable annotated report from an already-rendered view.
+
+    Pillow only — it reuses the page rasters the expensive LibreOffice pass
+    already produced, so writing a comment, dismissing a finding or changing
+    who the report is for never re-renders the workbook. `issues` / `extras`
+    default to everything the view found; pass filtered lists (optionally
+    carrying a 'state' of 'template' or 'dismissed', and a dismissal 'reason')
+    to change how a finding is presented without changing where its marker is.
+
+    Returns {'pages': [png bytes], 'pdf': bytes or None} — the same pages, once
+    for the screen and once bound into the document that gets sent.
+    """
+    if not _PIL or not view:
+        return {'pages': [], 'pdf': None}
+    entries = list(view.get('pages') or [])
+    if not entries:
+        return {'pages': [], 'pdf': None}
+    pages = []
+    for entry in entries:
+        try:
+            pages.append(Image.open(io.BytesIO(entry['png'])).convert('RGB'))
+        except Exception:
+            return {'pages': [], 'pdf': None}
+    composed = _compose_download_pages(
+        pages,
+        entries,
+        list(view.get('issues') or []) if issues is None else list(issues),
+        list(view.get('extras') or []) if extras is None else list(extras),
+        filename or view.get('filename'),
+        dpi,
+        comments=normalize_comments(comments),
+    )
+    out = []
+    for page in composed:
+        buffer = io.BytesIO()
+        page.save(buffer, format='PNG', optimize=True)
+        out.append(buffer.getvalue())
+    return {'pages': out, 'pdf': _pages_to_pdf(composed, dpi)}
 
 
 def _stack_pages(pages):
@@ -1255,16 +1602,20 @@ def _stack_pages(pages):
     return output.getvalue()
 
 
-def _compose_faithful_view(pages, anchors, issues, extras, filename, dpi):
+def _compose_faithful_view(pages, anchors, issues, extras, filename, dpi,
+                           with_pdf=True):
     page_entries, annotated_images = _annotate_faithful_pages(
         pages, anchors, issues, dpi)
-    download_pages = _compose_download_pages(
-        annotated_images, page_entries, issues, extras, filename, dpi)
+    annotated_pdf = None
+    if with_pdf:
+        annotated_pdf = _pages_to_pdf(_compose_download_pages(
+            annotated_images, page_entries, issues, extras, filename, dpi), dpi)
     return {
         'filename': filename or 'Lab report',
         'pages': page_entries,
         'issues': issues,
         'extras': extras,
-        'annotated_pdf': _pages_to_pdf(download_pages, dpi),
+        'dpi': dpi,
+        'annotated_pdf': annotated_pdf,
         'combined_png': _stack_pages(annotated_images),
     }

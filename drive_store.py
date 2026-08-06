@@ -172,6 +172,43 @@ def load_index():
     return _read_index(svc, _root_id(svc))[1]
 
 
+# ── sharing a reviewed report (used by share.py) ───────────────────────────
+def upload_file(name, data, mimetype='application/pdf', folder=None):
+    """Upload one file into an app-owned folder; return {'id', 'link'}.
+
+    Kept here rather than in share.py so all Drive knowledge — the OAuth
+    credentials, the app-owned folder layout, the `drive.file` scope's limits —
+    stays in one module.
+    """
+    from googleapiclient.http import MediaIoBaseUpload
+    svc = _service()
+    parent = _root_id(svc)
+    if folder:
+        parent = _ensure_folder(svc, folder, parent)
+    media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mimetype, resumable=False)
+    file = svc.files().create(body={'name': name, 'parents': [parent]},
+                              media_body=media,
+                              fields='id, webViewLink').execute()
+    return {'id': file['id'], 'link': file.get('webViewLink')}
+
+
+def grant_reader(file_id, email, notify=True, message=None):
+    """Give one named person read access to a file this app uploaded.
+
+    Per-person, never "anyone with the link": these are customer documents, and
+    the `drive.file` scope only lets the app manage what it created itself.
+    """
+    params = {
+        'fileId': file_id,
+        'body': {'type': 'user', 'role': 'reader', 'emailAddress': email},
+        'sendNotificationEmail': bool(notify),
+        'fields': 'id',
+    }
+    if notify and message:
+        params['emailMessage'] = message
+    return _service().permissions().create(**params).execute()['id']
+
+
 def download(drive_id):
     if not drive_id:
         return None

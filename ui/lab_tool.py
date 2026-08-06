@@ -1,11 +1,14 @@
 """Lab Report Review — 'Is this report releasable, and if not, where exactly?'"""
+import base64
 import html
 import io
+import time
 from pathlib import Path
 
 import streamlit as st
 
 import report_render
+import share
 from lab_review import add_version_findings, finding_stem, partition_by_scope, review_report
 from photo_lib import add_to_library
 
@@ -38,7 +41,8 @@ def _cached_review(name, data, ocr):
 
 
 @st.cache_data(show_spinner=False)
-def _cached_annotated_report(name, data, ocr, extra_findings=(), fit_width=True):
+def _cached_annotated_report(name, data, ocr, extra_findings=(), fit_width=True,
+                             dpi=150):
     """Return a page-oriented report-centric review package.
 
     The exact LibreOffice rendering is preferred. A spreadsheet-style
@@ -56,15 +60,22 @@ def _cached_annotated_report(name, data, ocr, extra_findings=(), fit_width=True)
     faithful render cuts the sample table off mid-row (Result and Remarks
     land on later, near-empty pages). A reviewer checking data needs the whole
     row; someone who wants the true printed pagination can turn it off.
+
+    dpi is the render resolution, raised when the reviewer zooms in: a page
+    rasterised for fit-width viewing has no detail left to magnify, which is
+    what made zooming useless. Each resolution is one more cached render.
     """
     rtype, parsed, findings = _cached_review(name, data, ocr)
     findings = list(findings) + list(extra_findings or ())
     exact_status = 'LibreOffice not installed'
     if report_render.libreoffice_available():
         try:
+            # with_pdf=False: the sendable document is composed per triage
+            # state and per comment by _cached_shared_report, so composing a
+            # second, comment-less one here would be thrown away.
             view, exact_status = report_render.render_report_faithful_view(
                 data, parsed, findings=findings, filename=name,
-                fit_width=fit_width)
+                dpi=dpi, fit_width=fit_width, with_pdf=False)
             if view:
                 return view, 'exact'
         except Exception as e:
@@ -89,6 +100,74 @@ def _cached_annotated_report(name, data, ocr, extra_findings=(), fit_width=True)
         'annotated_pdf': None,
         'combined_png': png,
     }, f'fallback: {exact_status}'
+
+
+@st.cache_data(show_spinner=False)
+def _cached_shared_report(name, data, ocr, extra_findings, fit_width, dpi,
+                          issue_states, extra_states, comments):
+    """The sendable report: pages with comment callouts, plus the PDF.
+
+    Cached on the triage state and the comment list rather than rebuilt on every
+    interaction, and deliberately layered on top of `_cached_annotated_report`
+    so this only ever costs a Pillow pass — writing a comment must not re-run
+    LibreOffice.
+
+    `issue_states` / `extra_states` carry how each finding should be presented
+    (live, template-scoped, or dismissed-with-reason) instead of a filtered
+    list, because every numbered marker already drawn on the page needs a
+    matching callout: a badge with no comment beside it reads as a bug to
+    whoever receives the document.
+    """
+    view, _mode = _cached_annotated_report(
+        name, data, ocr, extra_findings, fit_width, dpi)
+    if not view:
+        return None
+
+    states = {num: (state, reason) for num, state, reason in issue_states}
+    issues = []
+    for issue in view.get('issues') or ():
+        state, reason = states.get(issue['num'], ('active', ''))
+        record = dict(issue)
+        if state != 'active':
+            record['state'], record['reason'] = state, reason
+        issues.append(record)
+
+    extra_lookup = {(cat, note): (state, reason)
+                    for cat, note, state, reason in extra_states}
+    extras = []
+    for extra in view.get('extras') or ():
+        state, reason = extra_lookup.get(
+            (extra['category'], extra['note']), ('active', ''))
+        record = dict(extra)
+        if state != 'active':
+            record['state'], record['reason'] = state, reason
+        extras.append(record)
+
+    return report_render.compose_shared_report(
+        view, issues=issues, extras=extras,
+        comments=[{'text': text, 'author': author, 'page': page, 'issue': issue}
+                  for text, author, page, issue in comments],
+        filename=name, dpi=dpi)
+
+
+@st.cache_data(show_spinner=False)
+def _viewport_image(png):
+    """(bytes, subtype) for inlining one page into the zoom viewport.
+
+    The viewport is an <img> with a data URI — that is what lets the page be
+    scaled and panned — so its bytes cross the websocket on every rerun. A
+    large page render is re-encoded as JPEG for the screen only; the download
+    and the sent PDF always keep the lossless render.
+    """
+    if Image is None or len(png) <= 700_000:
+        return png, 'png'
+    try:
+        buffer = io.BytesIO()
+        Image.open(io.BytesIO(png)).convert('RGB').save(
+            buffer, format='JPEG', quality=84, optimize=True, progressive=True)
+        return buffer.getvalue(), 'jpeg'
+    except Exception:
+        return png, 'png'
 
 
 @st.cache_data(show_spinner=False)
@@ -152,6 +231,77 @@ def _triaged_findings(name, findings):
         _sev, cat, msg = f
         (dismissed if _is_dismissed(name, cat, msg) else active).append(f)
     return active, dismissed, template
+
+
+def _dismissal_reason(name, category, message):
+    return _dismissed_store().get(_tri_key(name, category, message), '')
+
+
+# ── Reviewer comments — the reviewer's own words, not the rule engine's.
+# Session-local like triage state, keyed by filename, and carried onto the
+# report page as callouts so they travel with the document that gets sent. ──
+def _comments_store():
+    return st.session_state.setdefault('lab_comments', {})   # {file: [comment]}
+
+
+def _comments(name):
+    return _comments_store().setdefault(name, [])
+
+
+def _add_comment(name, text, author, page=None, issue=None):
+    text = (text or '').strip()
+    if not text:
+        return False
+    _comments(name).append({
+        'id': f'{int(time.time() * 1000)}-{len(_comments(name))}',
+        'text': text,
+        'author': (author or '').strip(),
+        'page': page,
+        'issue': issue,
+    })
+    return True
+
+
+def _remove_comment(name, comment_id):
+    _comments_store()[name] = [
+        comment for comment in _comments(name) if comment['id'] != comment_id]
+
+
+def _comment_key(name):
+    """The comment list as a hashable value, for the render cache."""
+    return tuple((comment['text'], comment['author'], comment['page'],
+                  comment['issue']) for comment in _comments(name))
+
+
+def _presentation_states(r, view):
+    """How every marked finding should be presented on the sendable report.
+
+    Matched on the finding stem, the same key triage state uses, because an
+    anchored highlight's note can be the leading clause of the longer message
+    the findings list carries — comparing the full strings would classify the
+    same finding differently in the two places.
+    """
+    name = r['name']
+    template = {(cat, finding_stem(msg)) for _sev, cat, msg in r['template']}
+    dismissed = {(cat, finding_stem(msg)): _dismissal_reason(name, cat, msg)
+                 for _sev, cat, msg in r['dismissed']}
+
+    def state_for(category, note):
+        key = (category, finding_stem(note))
+        if key in dismissed:
+            return 'dismissed', dismissed[key]
+        if key in template:
+            return 'template', ''
+        return 'active', ''
+
+    issue_states, extra_states = [], []
+    for issue in view.get('issues') or ():
+        state, reason = state_for(issue['category'], issue['note'])
+        issue_states.append((issue['num'], state, reason))
+    for extra in view.get('extras') or ():
+        state, reason = state_for(extra['category'], extra['note'])
+        extra_states.append((extra['category'], extra['note'], state, reason))
+    return tuple(issue_states), tuple(extra_states)
 
 
 def _verdict(active):
@@ -302,7 +452,9 @@ def _render_detail(r, ocr):
                 _dismissed_list(name, r['dismissed'])
 
     # ── the workspace itself ──────────────────────────────────────────────
-    _annotated_report(r, ocr)
+    package, mode, pages, issues = _annotated_report(r, ocr)
+    if pages:
+        _comments_and_sending(r, pages, issues, package, mode)
 
     # ── reference material, out of the triage path ────────────────────────
     labels = ["Extracted data", f"About this template ({len(r['template'])})", "Export"]
@@ -586,26 +738,67 @@ def _cropped_detail(data, parsed, page_png, cell, pad=44, min_side=280):
     return buf.getvalue()
 
 
-def _annotated_report(r, ocr):
-    """Make the report itself the review UI.
+_ZOOM = {'Fit': 0, '100%': 100, '150%': 150, '200%': 200, '300%': 300}
 
-    The image contains the original sheet, highlighted issue locations,
-    numbered markers and the matching explanations. Findings and the report
-    picture are linked both ways: opening a finding jumps the view to its
-    page and (in fallback mode) zooms its cell; the list itself only ever
-    shows findings the active triage state (scope + dismiss) still counts.
+
+def _zoom_dpi(zoom):
+    """Render resolution for a zoom level.
+
+    Magnifying a fit-width raster only magnifies its pixels, so beyond 150% the
+    page is re-rendered at a higher resolution instead. Two resolutions, not
+    one per level: each is a separate LibreOffice render.
+    """
+    return 240 if _ZOOM.get(zoom, 0) >= 200 else 150
+
+
+def _zoom_pane(png, zoom):
+    """Show a report page in a scrollable, zoomable viewport.
+
+    `st.image` always fits its column, which is why the annotated report could
+    not be zoomed at all: at fit width a spreadsheet page lands in ~900 px and
+    the values in it are a few pixels tall. An <img> inside an overflow:auto box
+    can be drawn at any scale and panned by scrolling — which is what someone
+    checking a number against the sheet actually needs.
+    """
+    data, subtype = _viewport_image(png)
+    percent = _ZOOM.get(zoom, 0)
+    sizing = ('width:100%;' if not percent
+              else f'width:{percent}%;max-width:none;')
+    encoded = base64.b64encode(data).decode('ascii')
+    st.markdown(
+        f'<div class="aeg-zoom-pane"><img alt="Annotated report page" '
+        f'style="{sizing}height:auto;display:block" '
+        f'src="data:image/{subtype};base64,{encoded}"></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def _annotated_report(r, ocr):
+    """Make the report itself the review UI, and the thing that gets sent.
+
+    The page carries the original sheet, the highlighted issue locations, the
+    numbered markers and — in the callout view — every comment written out
+    beside the cell it is about, joined to it by a leader line. That composite
+    is exactly what the PDF download and the e-mail attachment contain, so what
+    the reviewer approves on screen is what the recipient opens.
+
+    Returns (package, mode, pages, live issues) — the composed pages and PDF
+    plus what they contain, so the comment and sending sections below work off
+    the same artefact rather than rebuilding their own.
     """
     f = r['f']
     name = f.name
     fit_width = st.session_state.get(f'lab_fit_{name}', True)
+    zoom = st.session_state.get(f'lab_zoom_{name}', 'Fit')
+    dpi = _zoom_dpi(zoom)
     with st.spinner(f"Building annotated report for {name}…"):
         view, mode = _cached_annotated_report(
             name, f.getvalue(), ocr, tuple(r.get('version_findings') or ()),
-            fit_width)
+            fit_width, dpi)
 
     if not view:
         st.error(f"Could not build the annotated report view — {mode}.")
-        return
+        return None, mode, [], []
 
     if mode != 'exact':
         st.warning(
@@ -615,22 +808,34 @@ def _annotated_report(r, ocr):
     pages = view.get('pages') or []
     if not pages:
         st.error("The workbook rendered, but no report pages were produced.")
-        return
+        return None, mode, [], []
 
     omitted = view.get('omitted_blank_pages') or []
     if omitted:
         st.caption(f"{len(omitted)} blank trailing source page(s) omitted: "
                    f"{', '.join(map(str, omitted))}.")
 
-    active_keys = {(cat, msg) for _sev, cat, msg in r['active']}
+    issue_states, extra_states = _presentation_states(r, view)
+    live = {num for num, state, _reason in issue_states if state == 'active'}
     all_issues = [issue for issue in (view.get('issues') or [])
-                  if (issue['category'], issue['note']) in active_keys]
+                  if issue['num'] in live]
+    live_extras = {(cat, note) for cat, note, state, _reason in extra_states
+                   if state == 'active'}
     all_extras = [extra for extra in (view.get('extras') or [])
-                  if (extra['category'], extra['note']) in active_keys]
-    visible_nums = {issue['num'] for issue in all_issues}
+                  if (extra['category'], extra['note']) in live_extras]
+
+    with st.spinner("Drawing the comment callouts…"):
+        package = _cached_shared_report(
+            name, f.getvalue(), ocr, tuple(r.get('version_findings') or ()),
+            fit_width, dpi, issue_states, extra_states, _comment_key(name))
+    if not (package or {}).get('pages'):
+        # Composition is Pillow-only and should not fail, but the marked pages
+        # themselves already exist — never leave the reviewer with no report and
+        # nothing to take away.
+        package = {'pages': [item['png'] for item in pages], 'pdf': None}
 
     def _count_on(page):
-        return len([n for n in (page.get('issue_nums') or []) if n in visible_nums])
+        return len([n for n in (page.get('issue_nums') or []) if n in live])
 
     labels = {
         page['number']: (
@@ -648,7 +853,8 @@ def _annotated_report(r, ocr):
     if focused and focused.get('pages') and st.session_state.get(f'lab_page_{name}') not in focused['pages']:
         st.session_state[f'lab_page_{name}'] = focused['pages'][0]
 
-    pager, fitter = st.columns([3, 1], vertical_alignment="center")
+    pager, viewer, zoomer, options = st.columns(
+        [2.1, 1.25, 1.5, 0.75], vertical_alignment="center")
     with pager:
         if len(numbers) <= 6:
             selected_number = st.pills(
@@ -668,54 +874,322 @@ def _annotated_report(r, ocr):
                 key=f"lab_page_{name}",
                 label_visibility="collapsed",
             )
-    with fitter:
-        if mode == 'exact':
-            st.toggle(
-                "Fit page width", key=f'lab_fit_{name}', value=fit_width,
-                help="On: rescale so every column of a row is visible together. "
-                     "Off: the workbook's own print layout, which on this template "
-                     "splits wide rows across pages.")
+    with viewer:
+        show_callouts = st.segmented_control(
+            "View", ["Callouts", "Page"], default="Callouts",
+            key=f"lab_view_{name}", label_visibility="collapsed",
+            help="Callouts: the page as it will be sent — every comment written "
+                 "beside the cell it is about. Page: the report and its markers "
+                 "only, at full width.") != "Page"
+    with zoomer:
+        st.segmented_control(
+            "Zoom", list(_ZOOM), default="Fit", key=f"lab_zoom_{name}",
+            label_visibility="collapsed",
+            help="Scroll inside the page to pan. From 200% the page is "
+                 "re-rendered at a higher resolution, which takes a few seconds "
+                 "the first time.")
+    with options:
+        with st.popover("⚙", width="stretch"):
+            if mode == 'exact':
+                st.toggle(
+                    "Fit page width", key=f'lab_fit_{name}', value=fit_width,
+                    help="On: rescale so every column of a row is visible together. "
+                         "Off: the workbook's own print layout, which on this template "
+                         "splits wide rows across pages.")
+            st.caption(f"Rendered at {dpi} dpi.")
     page = next(item for item in pages if item['number'] == selected_number)
+    composed = (package or {}).get('pages') or []
+    shown = page['png']
+    if show_callouts and len(composed) >= selected_number:
+        shown = composed[selected_number - 1]
 
     report_col, issue_col = st.columns([3.25, 1.35], gap="large")
     with report_col:
         st.markdown(
-            f'<div class="aeg-page-kicker">PAGE {page["number"]} OF {len(pages)}</div>',
+            f'<div class="aeg-page-kicker">PAGE {page["number"]} OF {len(pages)}'
+            f'{" · WITH COMMENT CALLOUTS" if show_callouts else ""}</div>',
             unsafe_allow_html=True,
         )
-        if mode.startswith('fallback') and focused and focused.get('cells'):
-            crop = _cropped_detail(f.getvalue(), r['parsed'], page['png'], focused['cells'][0])
+        if focused:
+            crop = _focus_crop(r, f, page, focused, mode)
             if crop:
                 refs = ", ".join(focused.get('refs') or [])
-                st.caption(f"🔍 Zoomed to issue #{focused['num']}" + (f" · {refs}" if refs else ""))
+                st.caption(f"🔍 Zoomed to issue #{focused['num']}"
+                           + (f" · {refs}" if refs else ""))
                 st.image(crop, width="stretch")
-        st.image(page['png'], width="stretch")
+        _zoom_pane(shown, zoom)
     with issue_col:
         page_numbers = set(page.get('issue_nums') or [])
         page_issues = [i for i in all_issues if i['num'] in page_numbers]
         unplaced = [i for i in all_issues if not i.get('pages')]
         _page_findings(name, focus_key, page_issues, unplaced + all_extras)
 
-    download_col, _ = st.columns([1.7, 3.3])
-    with download_col:
-        if view.get('annotated_pdf'):
-            st.download_button(
-                "⬇ Download annotated report (.pdf)",
-                data=view['annotated_pdf'],
-                file_name=f"{Path(name).stem}_annotated.pdf",
-                mime="application/pdf",
-                key=f"fpdf_{name}",
-                width="stretch",
-            )
+    return package, mode, pages, all_issues
+
+
+def _focus_crop(r, f, page, focused, mode):
+    """A zoomed crop of the focused finding's cell, whichever renderer is live.
+
+    The fallback grid is measured from the workbook, while an exact page knows
+    where its markers actually landed — so 'Locate' can now zoom on both,
+    instead of only on the fallback the reviewer is least likely to see.
+    """
+    if mode == 'exact':
+        return report_render.crop_issue_detail(
+            page['png'], page.get('placements'), focused['num'])
+    if focused.get('cells'):
+        return _cropped_detail(
+            f.getvalue(), r['parsed'], page['png'], focused['cells'][0])
+    return None
+
+
+def _comments_and_sending(r, view_pages, issues, package, mode):
+    """Write comments, then send the report — the two halves of one job.
+
+    Side by side on purpose: the reviewer's comments are what makes the document
+    worth sending, and the send panel has to show, at the moment of sending,
+    exactly which comments are going with it.
+    """
+    name = r['name']
+    st.divider()
+    writing, sending = st.columns([1.45, 1], gap="large")
+    with writing:
+        _comment_editor(name, view_pages, issues)
+    with sending:
+        _send_panel(r, package, mode)
+
+
+def _comment_targets(view_pages, issues):
+    """[(label, page, issue)] — what a new comment can be attached to.
+
+    Attaching to a finding is the useful case: the comment inherits that
+    finding's cell, so it is drawn against the value it is about rather than
+    floating at the top of the page.
+    """
+    options = [('The whole report', None, None)]
+    for page in view_pages:
+        options.append((f'Page {page["number"]}', page['number'], None))
+    for issue in issues:
+        note = issue.get('note') or ''
+        summary = note if len(note) <= 46 else note[:45].rstrip() + '…'
+        options.append(
+            (f'Finding #{issue["num"]} · {issue.get("category")} — {summary}',
+             None, issue['num']))
+    return options
+
+
+def _comment_editor(name, view_pages, issues):
+    st.markdown("#### Review comments")
+    st.caption(
+        "Written here, drawn on the report as a callout, and included in the PDF "
+        "you download or send — the recipient reads your comment on the page, "
+        "beside the cell it is about.")
+
+    options = _comment_targets(view_pages, issues)
+    with st.form(f"comment_form_{name}", clear_on_submit=True, border=False):
+        text = st.text_area(
+            "Comment", height=110, label_visibility="collapsed",
+            placeholder="e.g. Confirm with the workshop which bucket was "
+                        "sectioned before this goes to the customer.")
+        fields = st.columns([2.4, 1.4, 1])
+        target = fields[0].selectbox(
+            "Attach to", range(len(options)),
+            format_func=lambda index: options[index][0])
+        author = fields[1].text_input(
+            "Your name", value=st.session_state.get('lab_author', ''),
+            placeholder="Your name")
+        fields[2].markdown('<div class="aeg-form-spacer"></div>',
+                           unsafe_allow_html=True)
+        added = fields[2].form_submit_button("＋ Add comment", width="stretch")
+    if added:
+        st.session_state['lab_author'] = (author or '').strip()
+        _, page, issue = options[target]
+        if _add_comment(name, text, author, page, issue):
+            st.rerun()
+        st.warning("Write something first — an empty comment isn't added.")
+
+    comments = _comments(name)
+    if not comments:
+        st.caption("No comments yet. The report can still be sent without any.")
+        return
+    for index, comment in enumerate(comments, start=1):
+        if comment['issue']:
+            where = f"on finding #{comment['issue']}"
+        elif comment['page']:
+            where = f"page {comment['page']}"
         else:
-            st.download_button(
-                "⬇ Download annotated report (.png)",
-                data=view['combined_png'],
-                file_name=f"{Path(name).stem}_annotated.png",
-                mime="image/png",
-                key=f"fpng_{name}",
-                width="stretch",
-            )
+            where = "whole report"
+        meta = f"{comment['author'] or 'Reviewer'} · {where}"
+        row = st.columns([6, 1], vertical_alignment="center")
+        row[0].markdown(
+            f'<div class="aeg-comment-card">'
+            f'<div class="aeg-comment-head">R{index}'
+            f'<span class="aeg-comment-meta">{html.escape(meta)}</span></div>'
+            f'<div class="aeg-issue-copy">{html.escape(comment["text"])}</div>'
+            f'</div>',
+            unsafe_allow_html=True)
+        if row[1].button("Remove", key=f"delc_{name}_{comment['id']}",
+                         width="stretch"):
+            _remove_comment(name, comment['id'])
+            st.rerun()
+
+
+def _share_body(r, comments):
+    """The message that goes with the attachment.
+
+    Written so the mail is useful on a phone, before the PDF is opened: the
+    verdict, what was found, and the reviewer's own comments in full.
+    """
+    _tier, label, reason = _verdict(r['active'])
+    lines = [f"Report: {r['name']}"]
+    if r['facts']:
+        # Packed workbook cells carry their own line breaks (four serials in one
+        # cell); flattened here so the header stays one line in a mail client.
+        lines.append(" ".join(r['facts'].replace('**', '').split()))
+    lines += [f"Review verdict: {label} — {reason}", ""]
+
+    if comments:
+        lines.append("Reviewer comments")
+        for index, comment in enumerate(comments, start=1):
+            if comment['issue']:
+                where = f" (on finding #{comment['issue']})"
+            elif comment['page']:
+                where = f" (page {comment['page']})"
+            else:
+                where = ""
+            who = f" — {comment['author']}" if comment['author'] else ""
+            lines.append(f"  R{index}{where}{who}: {comment['text']}")
+        lines.append("")
+
+    if r['active']:
+        lines.append("Findings from this review")
+        for severity, category, message in sorted(
+                r['active'], key=lambda finding: components.RANK[
+                    components.normalize_lab([finding])[0]['severity']]):
+            tag = {'critical': 'FAIL', 'warning': 'WARNING',
+                   'info': 'NOTE', 'pass': 'PASS'}.get(severity, 'REVIEW')
+            lines.append(f"  [{tag}] {category}: {message}")
+        lines.append("")
+
+    lines.append(
+        "Attached: the report itself, with every finding marked on the page and "
+        "the comments written beside it.")
+    return "\n".join(lines)
+
+
+def _send_panel(r, package, mode):
+    """Send the annotated report to people, or take it away as a file."""
+    name = r['name']
+    stem = Path(name).stem
+    pdf = (package or {}).get('pdf')
+    comments = _comments(name)
+    transports = share.transports()
+
+    st.markdown("#### Send this report")
+    if pdf:
+        st.caption(
+            f"One PDF, {len(package['pages'])} page(s): the report with "
+            f"{len(comments)} comment(s) called out on it.")
+        st.download_button(
+            "⬇ Download annotated report (.pdf)", data=pdf,
+            file_name=f"{stem}_annotated.pdf", mime="application/pdf",
+            key=f"fpdf_{name}", width="stretch")
+    elif (package or {}).get('pages'):
+        st.caption("The PDF could not be built here, so the marked first page "
+                   "is offered as an image instead.")
+        st.download_button(
+            "⬇ Download annotated page (.png)", data=package['pages'][0],
+            file_name=f"{stem}_annotated.png", mime="image/png",
+            key=f"fpng_{name}", width="stretch")
+
+    if not any(transports.values()):
+        with st.expander("Send it from here instead of attaching it yourself"):
+            st.markdown(
+                "Sending isn't configured for this deployment yet. Add either "
+                "set of secrets and the send button appears here:\n\n"
+                "- **E-mail** — `smtp_host`, `smtp_from`, and usually "
+                "`smtp_user` / `smtp_password`.\n"
+                "- **Google Drive** — the same `drive_client_id`, "
+                "`drive_client_secret` and `drive_refresh_token` the photo "
+                "library uses; recipients get read access to the PDF.\n\n"
+                "See `share.py` for the full list.")
+        return
+    if not pdf:
+        st.info("Nothing to send yet — the annotated PDF could not be built.")
+        return
+
+    recipients_raw = st.text_input(
+        "Recipients", key=f"to_{name}",
+        placeholder="name@company.com, second@company.com",
+        help="Comma or space separated.")
+    recipients, rejected = share.parse_recipients(recipients_raw)
+    if rejected:
+        st.warning("Not an e-mail address: " + ", ".join(rejected))
+
+    subject = st.text_input(
+        "Subject", key=f"subj_{name}", value=f"Lab report review — {stem}")
+
+    # The body is written from the review, so it has to keep up with it: a
+    # comment added after the panel first rendered must appear in the message.
+    # A widget only reads `value` once, so the generated text is pushed into
+    # session state instead — and left alone the moment the reviewer types over
+    # it, since silently discarding what someone wrote is worse than a stale
+    # summary they can rebuild.
+    body_key, generated_key = f"msg_{name}", f"msgauto_{name}"
+    generated = _share_body(r, comments)
+    untouched = st.session_state.get(body_key) == st.session_state.get(generated_key)
+    if body_key not in st.session_state or untouched:
+        st.session_state[body_key] = generated
+    st.session_state[generated_key] = generated
+    edited = st.session_state[body_key] != generated
+    with st.expander("Message" + (" · edited" if edited else ""), expanded=False):
+        if edited:
+            if st.button("↺ Rebuild from the review", key=f"rebuild_{name}"):
+                st.session_state[body_key] = generated
+                st.rerun()
+            st.caption("Your edits are kept, so new comments are not added "
+                       "automatically. Rebuild to pick them up.")
+        message = st.text_area(
+            "Message", key=body_key, height=220, label_visibility="collapsed")
+
+    if mode != 'exact':
+        st.caption("Note: this is the simplified annotated view, not the exact "
+                   "Excel rendering.")
+
+    attachment = (f"{stem}_annotated.pdf", pdf, "application/pdf")
+    buttons = st.columns(2 if all(transports.values()) else 1)
+    index = 0
+    if transports['email']:
+        label = (f"✉ Send to {len(recipients)} recipient(s)" if recipients
+                 else "✉ Send by e-mail")
+        if buttons[index].button(label, key=f"mail_{name}", width="stretch",
+                                 disabled=not recipients, type="primary"):
+            try:
+                sent = share.send_email(
+                    recipients, subject, message, attachments=[attachment])
+                st.success(f"Sent to {', '.join(sent)}.")
+            except Exception as error:
+                st.error(f"Could not send — {type(error).__name__}: {error}")
+        index += 1
+    if transports['drive']:
+        if buttons[index].button("☁ Share via Drive", key=f"drive_{name}",
+                                 width="stretch", disabled=not recipients,
+                                 help="Uploads the PDF and gives each recipient "
+                                      "read access — no public link."):
+            try:
+                result = share.share_via_drive(
+                    f"{stem}_annotated.pdf", pdf, recipients, message=message)
+                if result['granted']:
+                    st.success("Shared with " + ", ".join(result['granted']))
+                if result['failed']:
+                    st.error("Could not share with: " + "; ".join(
+                        f"{address} ({reason})" for address, reason in result['failed']))
+                if result['link']:
+                    st.markdown(f"[Open in Drive]({result['link']})")
+            except Exception as error:
+                st.error(f"Drive upload failed — {type(error).__name__}: {error}")
+    if not recipients:
+        st.caption("Add at least one recipient to enable sending.")
 
 
 def _page_findings(name, focus_key, page_issues, report_level):

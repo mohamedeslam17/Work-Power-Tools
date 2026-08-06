@@ -168,6 +168,36 @@ html[data-theme="dark"] {
 .aeg-template-note {
   color: var(--aeg-muted); font-size: .82rem; margin-bottom: .6rem;
 }
+
+/* ── The zoomable report page ──────────────────────────────────────────────
+   st.image scales an image to fit its column and offers nothing beyond that,
+   which is why the annotated report could not be zoomed. The page is inlined
+   into this box instead: it scrolls in both directions, so the <img> inside can
+   be drawn wider than the column and panned. resize:vertical lets a reviewer
+   give the page more screen without touching the layout. */
+.aeg-zoom-pane {
+  overflow: auto; max-height: 84vh; resize: vertical;
+  border: 1px solid var(--aeg-card-border); border-radius: 10px;
+  background: var(--aeg-card-bg); box-shadow: var(--aeg-shadow);
+  padding: 2px;
+}
+.aeg-zoom-pane img { border-radius: 6px; }
+
+/* ── Reviewer comments — the reviewer's own words, not a finding ─────────── */
+.aeg-comment-card {
+  border: 1px solid var(--aeg-card-border); border-left: 4px solid #5b4cb0;
+  border-radius: 10px; background: var(--aeg-card-bg); box-shadow: var(--aeg-shadow);
+  padding: .7rem .8rem; margin: 0 0 .55rem;
+}
+html[data-theme="dark"] .aeg-comment-card { border-left-color: #9b8ce8; }
+.aeg-comment-head {
+  display: flex; align-items: center; gap: .5rem; margin-bottom: .3rem;
+  font-size: .78rem; font-weight: 800; color: #5b4cb0; letter-spacing: .03em;
+}
+html[data-theme="dark"] .aeg-comment-head { color: #9b8ce8; }
+.aeg-comment-meta { color: var(--aeg-muted); font-size: .72rem; font-weight: 650; }
+/* Lines a form's submit button up with the inputs beside it. */
+.aeg-form-spacer { height: 1.85rem; }
 </style>
 """
 

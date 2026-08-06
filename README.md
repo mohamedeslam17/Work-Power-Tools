@@ -54,6 +54,31 @@ Implemented in
 [`report_render.py`](report_render.py); cell anchoring comes from
 `lab_review.collect_highlights`.
 
+**Comment callouts on the page.** Every finding is written out beside the page it
+marks, in a comment margin, joined to its own cell by a leader line — the same
+composite on screen and in the PDF, so what the reviewer approves is what the
+recipient opens. The vertical run of each leader is kept in the sheet's own right
+print margin, so only the short run along the marked cell's row crosses any
+content. Each callout is placed level with the row it is about; when the comments
+outgrow one page height they continue in a further margin column rather than
+being cut. Every numbered badge has a matching callout: findings the reviewer
+dismissed carry their dismissal reason, and template-scoped ones say so, both in
+grey so they do not read as live problems to whoever receives the report.
+
+**Zoom.** The page sits in a scrollable viewport rather than an `st.image` that
+can only fit its column: **Fit / 100% / 150% / 200% / 300%**, panned by
+scrolling, and from 200% the workbook is re-rendered at a higher resolution so
+there is real detail to magnify. **Locate** on any finding shows a magnified crop
+of its cell, on the exact render as well as the fallback. The **Callouts / Page**
+switch toggles between the sendable composite and the report at full width.
+
+**Review comments, and sending the report.** Comments are written in the app, can
+be attached to a finding (inheriting its cell, so the callout points at the value
+it is about), to one page, or to the whole report, and travel with the document:
+into the callout margin, into the PDF, and into the message body. From the same
+panel the annotated PDF can be downloaded, e-mailed, or shared from Google Drive
+— see [Sending a reviewed report](#sending-a-reviewed-report).
+
 LibreOffice takes a few seconds and is installed by `packages.txt` as
 `libreoffice-calc`; the PDF is rasterised with **PyMuPDF**. If exact rendering is
 unavailable, the reviewer automatically shows a simplified annotated sheet instead
@@ -62,6 +87,36 @@ with a uniquely detectable colour in the workbook, rendering it, then locating t
 colour in the raster — so every numbered badge lands on the actual affected cell.
 When several reports are uploaded, a compact report selector replaces the former
 batch table and keeps the review focused on one annotated report at a time.
+
+#### Sending a reviewed report
+
+The annotated PDF can always be downloaded. Sending it from the app is optional
+and appears only once one of the two transports is configured — implemented in
+[`share.py`](share.py), which adds no dependency (e-mail is stdlib `smtplib`, and
+Drive reuses the photo library's OAuth credentials).
+
+* **E-mail** — the PDF is attached and the review is written into the body
+  (verdict, findings, and the reviewer's comments in full) so the mail says
+  something useful before the attachment is opened. Streamlit secrets or
+  environment variables:
+  ```toml
+  smtp_host     = "smtp.office365.com"
+  smtp_from     = "materials.lab@example.com"   # defaults to smtp_user
+  smtp_user     = "materials.lab@example.com"   # optional on an open relay
+  smtp_password = "...."
+  # smtp_port   = 587      # default 587, or 465 with smtp_ssl
+  # smtp_ssl    = false    # implicit TLS
+  # smtp_starttls = true   # default on unless smtp_ssl
+  ```
+* **Google Drive** — uploads the PDF to an app-owned **"AEG Report Reviews"**
+  folder and grants each named recipient read access, returning a link. Uses the
+  same `drive_client_id` / `drive_client_secret` / `drive_refresh_token` as the
+  photo library. Access is granted **per person, never "anyone with the link"** —
+  these are customer documents.
+
+Recipients are typed as a comma- or space-separated list; anything that isn't an
+address is reported back rather than silently dropped, and sending is only
+possible with at least one valid recipient.
 
 ### 🖼️ Photo Library *(new)*
 Extracts the embedded micrographs from a reviewed report into a **per-alloy**
