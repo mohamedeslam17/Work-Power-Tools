@@ -3,6 +3,7 @@ from unittest.mock import patch
 
 from openpyxl import Workbook
 
+import lab_review
 from lab_review import (
     _canon_machine,
     _comment,
@@ -10,6 +11,7 @@ from lab_review import (
     _review_comment,
     _review_completeness,
     _review_composition,
+    _review_hardness,
     _review_captions,
     _review_acceptance_and_methods,
     _review_document_control,
@@ -906,6 +908,153 @@ class LabReviewRegressionTests(unittest.TestCase):
         self.assertFalse(any(
             severity in ("critical", "warning") and category == "Title identity"
             for severity, category, _message in findings
+        ))
+
+    # ── Second salvage pass, from claude/tool-audit-improvements-v7bj10
+    # (6 Jul 2026). These four were NOT re-fixed by the extraction rebuild —
+    # I had assumed "the file was rewritten" meant "the defect was re-fixed",
+    # which is the same assumption that lost the branches in the first place. ──
+    def test_a_rejected_result_cell_does_not_contradict_a_rejecting_comment(self):
+        # "Not acceptable" contains "accept", so the Result cell graded positive
+        # AND negative at once. A report whose cell and comment agreed on a
+        # rejection was then warned about for contradicting itself.
+        parsed = {
+            "sample": {"result": "Not acceptable"},
+            "comment": "The material is not suitable for further service and is "
+                       "rejected; cracking exceeds the repair limit.",
+            "coating": {},
+        }
+
+        findings = _review_comment(parsed)
+
+        self.assertFalse(any(
+            "but the comment indicates the part is NOT suitable" in message
+            for message in messages(findings)
+        ))
+
+    def test_a_coating_layout_the_parser_missed_is_not_read_as_no_coating(self):
+        # Every coating field None meant "no coating recorded", so a report the
+        # parser simply failed to read was accused of contradicting its own
+        # comment — the tool blaming the report for its own gap.
+        parsed = {
+            "sample": {"result": "See comment"},
+            "comment": "The set of buckets was received with an MCrAlY coating "
+                       "which remains intact over the airfoil.",
+            "coating": {},          # parser found nothing at all
+        }
+
+        findings = _review_comment(parsed)
+
+        self.assertFalse(any(
+            "indicates no coating" in message for message in messages(findings)
+        ))
+
+    def test_a_coating_cell_that_really_says_no_still_contradicts_the_comment(self):
+        parsed = {
+            "sample": {"result": "See comment"},
+            "comment": "The set of buckets was received with an MCrAlY coating.",
+            "coating": {"present": "No", "type": None,
+                        "received": None, "outgoing": None},
+        }
+
+        findings = _review_comment(parsed)
+
+        self.assertTrue(any(
+            "indicates no coating" in message for message in messages(findings)
+        ))
+
+    def test_hardness_in_different_scales_is_not_compared(self):
+        # A 355 HV post-solution reading against a 42 HRC pre-solution reading
+        # is not a comparison; it read as "hardness went up by 313".
+        findings = _review_hardness(
+            {"pre": {"value": 42.0, "unit": "HRC"},
+             "post": {"value": 355.0, "unit": "HV"}},
+            "GTD 111")
+
+        self.assertFalse(any(
+            "exceeds pre-solution" in message for message in messages(findings)
+        ))
+
+    def test_normal_scatter_on_a_vickers_reading_is_not_flagged(self):
+        # The ±2 guard band is right for HRC and far too tight for HV, where a
+        # few points of scatter between two indents is routine.
+        findings = _review_hardness(
+            {"pre": {"value": 350.0, "unit": "HV"},
+             "post": {"value": 356.0, "unit": "HV"}},
+            "GTD 111")
+
+        self.assertFalse(any(
+            "exceeds pre-solution" in message for message in messages(findings)
+        ))
+
+    def test_a_real_rise_in_the_same_scale_is_still_flagged(self):
+        findings = _review_hardness(
+            {"pre": {"value": 41.4, "unit": "HRC"},
+             "post": {"value": 47.0, "unit": "HRC"}},
+            "GTD 111")
+
+        self.assertTrue(any(
+            "exceeds pre-solution" in message for message in messages(findings)
+        ))
+
+    def test_sheet_scans_are_bounded(self):
+        # One stray cell at Excel's last row inflates ws.max_row to ~1,048,576;
+        # every label scan then became a minutes-long, worker-freezing loop.
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet["A1"] = "AEG. Job No:"
+        sheet["B1"] = "6943"
+        sheet.cell(row=1_048_576, column=1, value="stray")
+
+        self.assertGreaterEqual(sheet.max_row, 1_048_576)
+        scanned = sum(1 for _row in lab_review._scan_rows(sheet))
+        self.assertLessEqual(scanned, lab_review._SCAN_ROWS_CAP)
+        # The report's own data is still inside the scanned window.
+        self.assertIsNotNone(lab_review._find_label(sheet, r"AEG\.?\s*Job\s*No"))
+
+    def test_a_measurement_point_index_row_is_not_thickness_data(self):
+        # Real corpus report 6983 carries a '1 2 3 4 5' point-index row in its
+        # coating table. It escaped notice only because it sits above the first
+        # MIN/MAX row; in a multi-block table it inherits the forward-filled
+        # limits and every index is reported as a thickness out of range.
+        self.assertTrue(lab_review._looks_like_point_header([1.0, 2.0, 3.0, 4.0, 5.0]))
+        self.assertTrue(lab_review._looks_like_point_header([0, 1, 2, 3]))
+        # Real thickness readings must never be mistaken for an index row.
+        self.assertFalse(
+            lab_review._looks_like_point_header([0.045, 0.04, 0.041, 0.039]))
+        self.assertFalse(lab_review._looks_like_point_header([1.0, 2.0]))
+        self.assertFalse(lab_review._looks_like_point_header([2.0, 3.0, 4.0]))
+        self.assertFalse(lab_review._looks_like_point_header([1.0, 2.0, 4.0, 5.0]))
+
+    def test_a_point_index_row_below_the_limits_is_not_range_checked(self):
+        # The failure the check above prevents, end to end: a second measurement
+        # block repeats the point header, and by then MIN/MAX are forward-filled.
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet["A1"] = "Coating Coverage Assessment"
+        sheet["A3"] = "Measurements"
+        sheet["F3"] = "Average Values"
+        sheet["G3"] = "MIN"
+        sheet["H3"] = "MAX"
+        sheet["A4"] = "Design limit"
+        for column, value in zip("ABCDE", [0.045, 0.04, 0.041, 0.039, 0.043]):
+            sheet[f"{column}5"] = value
+        sheet["G5"], sheet["H5"] = 0.03, 0.05
+        # Second block: the point header now sits under a limits row.
+        for column, value in zip("ABCDE", [1, 2, 3, 4, 5]):
+            sheet[f"{column}7"] = value
+        for column, value in zip("ABCDE", [0.044, 0.048, 0.043, 0.045, 0.041]):
+            sheet[f"{column}8"] = value
+
+        parsed = lab_review.parse_coating(workbook)
+        findings = lab_review.review_coating(parsed)
+
+        self.assertEqual([row["values"] for row in parsed["rows"]],
+                         [[0.045, 0.04, 0.041, 0.039, 0.043],
+                          [0.044, 0.048, 0.043, 0.045, 0.041]])
+        self.assertFalse(any(
+            "outside" in message or "out of range" in message
+            for message in messages(findings)
         ))
 
 
