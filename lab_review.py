@@ -953,6 +953,20 @@ def _review_composition(nominal, actual, composition_meta=None):
                          f'{", ".join(duplicates)} — at least one column is mislabeled, so the '
                          f'chemistry cannot be accepted as reported.'))
 
+    # The same structural fault on the *spec* side was invisible: _composition()
+    # computes duplicate_headers for the Nominal table too, but nothing
+    # downstream ever read it, so a mislabeled or duplicated nominal column
+    # passed silently while the identical fault on the Actual side above is a
+    # critical. A wrong spec column makes every deviation computed from it
+    # meaningless, so it is graded the same.
+    nominal_duplicates = (composition_meta.get('nominal') or {}).get(
+        'duplicate_headers') or []
+    if nominal_duplicates:
+        findings.append(('critical', 'Composition',
+                         f'Nominal composition table repeats element header(s): '
+                         f'{", ".join(nominal_duplicates)} — at least one column is '
+                         f'mislabeled, so the spec cannot be accepted as reported.'))
+
     for entry in entries:
         raw = entry.get('raw') or ''
         el = entry.get('element')
@@ -2713,7 +2727,15 @@ def _canon_machine(text):
     """Canonical machine/set designation from a filename or report header.
 
     The aliases below reflect the forms used by the supplied reports:
-    FS.7 ≡ MS7001 and 7FA ≡ MS7001FA. V-series names remain explicit.
+    FS.7 ≡ MS7001, FS.7FA ≡ MS7001FA, and 7FA ≡ MS7001FA. V-series names
+    remain explicit.
+
+    Frame sizes include 5 as well as 6/7/9: a real report in a 27-report batch
+    was titled "FS.5", which a [679] digit class silently dropped — the
+    machine/set cross-check then neither matched nor flagged a mismatch for
+    that report. The FS form also carries the variant suffix glued straight on
+    ("FS.7FA"), and recognising only "FA" truncated any other variant to a bare
+    frame, which was then reported as disagreeing with its own content.
     """
     raw = (text or '').upper()
 
@@ -2721,18 +2743,18 @@ def _canon_machine(text):
     if v_model:
         return f'V{v_model.group(1)}.{v_model.group(2)}'
 
-    ms_model = re.search(r'(?<![A-Z0-9])MS\s*([679])\s*001\s*([A-Z]{1,3})?', raw)
+    ms_model = re.search(r'(?<![A-Z0-9])MS\s*([5679])\s*001\s*([A-Z]{1,3})?', raw)
     if ms_model:
         frame, suffix = ms_model.group(1), ms_model.group(2) or ''
         return f'{frame}{suffix}' if suffix else f'MS{frame}001'
 
-    fs_model = re.search(r'(?<![A-Z0-9])FS\s*[.\-]?\s*([679])\s*(FA)?(?![A-Z0-9])', raw)
+    fs_model = re.search(
+        r'(?<![A-Z0-9])FS\s*[.\-]?\s*([5679])\s*([A-Z]{1,3})?(?![A-Z0-9])', raw)
     if fs_model:
-        if fs_model.group(2):
-            return f'{fs_model.group(1)}FA'
-        return f'MS{fs_model.group(1)}001'
+        frame, suffix = fs_model.group(1), fs_model.group(2) or ''
+        return f'{frame}{suffix}' if suffix else f'MS{frame}001'
 
-    short_f = re.search(r'(?<![A-Z0-9])([679])\s*F\s*([A-Z]?)(?![A-Z0-9])', raw)
+    short_f = re.search(r'(?<![A-Z0-9])([5679])\s*F\s*([A-Z]?)(?![A-Z0-9])', raw)
     if short_f:
         return f'{short_f.group(1)}F{short_f.group(2)}'
 
@@ -2882,6 +2904,68 @@ def _revision_score(name):
     if any(token in stem for token in ('final', 'done')):
         return 1
     return 0
+
+
+def find_duplicate_compositions(reports, min_common=5):
+    """Cross-report check: a near-identical Actual composition under two jobs.
+
+    A single-report review can never see this — it only exists across a batch.
+    Independent EDS/ICP analysis of two different physical parts is not expected
+    to agree on every reported element to the exact reported decimal; when it
+    does, the composition table was very likely copied from another report
+    instead of entered from that job's own results. Found on a real 27-report
+    batch: two different AEG job numbers — different customer references,
+    serials, sign-off engineers and dates — carried a byte-identical Actual
+    composition across all nine matched elements.
+
+    `reports` is [(name, parsed), …]. Same-job pairs are skipped: those are
+    revisions or re-uploads of one report, which `add_version_findings` covers.
+    Returns (severity, category, message) findings naming both reports.
+    """
+    findings = []
+    entries = []
+    for name, parsed in reports:
+        actual = (parsed or {}).get('actual')
+        job = _txt(((parsed or {}).get('header') or {}).get('job'))
+        if actual and len(actual) >= min_common:
+            entries.append((name, job, actual))
+
+    for index, (name_a, job_a, actual_a) in enumerate(entries):
+        for name_b, job_b, actual_b in entries[index + 1:]:
+            if job_a and job_b and job_a == job_b:
+                continue
+            common = set(actual_a) & set(actual_b)
+            if len(common) < min_common:
+                continue
+            if all(actual_a[element] == actual_b[element] for element in common):
+                findings.append((
+                    'critical', 'Composition',
+                    f'"{name_a}" (job {job_a or "?"}) and "{name_b}" '
+                    f'(job {job_b or "?"}) report an identical Actual composition on '
+                    f'all {len(common)} matched element(s) — independent lab results '
+                    f'are not expected to match exactly; verify one was not copied '
+                    f'from the other.'))
+    return findings
+
+
+def add_duplicate_composition_findings(reports):
+    """Attach `find_duplicate_compositions` results to a batch of UI reports.
+
+    Shares the `version_findings` key with `add_version_findings`: that key is
+    the batch-level bucket the caller forwards into the annotated view, and both
+    of these findings exist only because more than one report was uploaded.
+    """
+    pairs = [(report.get('name'), report.get('parsed'))
+             for report in reports
+             if 'error' not in report and report.get('rtype') == 'metallurgical']
+    if len(pairs) < 2:
+        return
+    by_name = {report.get('name'): report for report in reports}
+    for finding in find_duplicate_compositions(pairs):
+        for name, report in by_name.items():
+            if name and f'"{name}"' in finding[2]:
+                report.setdefault('version_findings', []).append(finding)
+                report['findings'] = list(report.get('findings') or []) + [finding]
 
 
 def add_version_findings(reports):
@@ -3175,6 +3259,17 @@ def collect_highlights(parsed):
                     + (f' while nominal is {nom:g} wt%.' if nom is not None else '.'))
             add(cell, sev, 'Composition', f'{el} {raw}', note)
 
+    # Mark the mislabeled spec column too, so the nominal-side finding above
+    # lands on a cell rather than arriving as an unanchored report-level note.
+    nominal_meta = (parsed.get('composition_meta') or {}).get('nominal') or {}
+    nominal_duplicates = set(nominal_meta.get('duplicate_headers') or [])
+    for entry in nominal_meta.get('entries') or []:
+        el = entry.get('element')
+        if el in nominal_duplicates:
+            add((entry.get('row'), entry.get('col')), 'critical', 'Composition',
+                f'duplicate nominal {el}',
+                f'Nominal composition table repeats element header {el}.')
+
     # ── Hardness — post-solution should not exceed pre-solution ──
     hd = parsed.get('hardness') or {}
     pre = (hd.get('pre') or {}).get('value')
@@ -3327,10 +3422,13 @@ def main():
     if len(sys.argv) < 2:
         print(__doc__)
         sys.exit(1)
+    reports = []
     for path in sys.argv[1:]:
         with open(path, 'rb') as f:
             data = f.read()
         rtype, parsed, findings = review_report(path, data)
+        if rtype == 'metallurgical':
+            reports.append((path, parsed))
         counts = summarize(findings)
         print('=' * 78)
         print(f'{path}')
@@ -3343,6 +3441,15 @@ def main():
         for lg in parsed.get('legends', []):
             bits = [lg[k] for k in ('id', 'mag', 'scale') if lg.get(k)]
             print(f'     · {lg["image"]}: {"  ".join(bits)}')
+
+    cross = find_duplicate_compositions(reports) if len(reports) > 1 else []
+    if cross:
+        print('=' * 78)
+        print('CROSS-REPORT findings (only visible across a batch):')
+        for sev, cat, msg in cross:
+            tag = {'critical': 'FAIL', 'warning': 'WARN',
+                   'info': 'INFO', 'pass': 'OK  '}[sev]
+            print(f'   [{tag}] {cat}: {msg}')
 
 
 if __name__ == '__main__':

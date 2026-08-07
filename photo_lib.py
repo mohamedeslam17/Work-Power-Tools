@@ -19,6 +19,7 @@ import io
 import os
 import re
 import json
+import hashlib
 import zipfile
 import datetime
 from collections import Counter
@@ -29,9 +30,26 @@ import drive_store
 LIBRARY_DIR = os.environ.get('PHOTO_LIBRARY_DIR', 'photo_library')
 INDEX_NAME = 'index.json'
 
+# Largest embedded image we will decode when storing (decompression-bomb guard).
+_MAX_STORE_PIXELS = 40_000_000
+
 
 def _safe(s):
-    return re.sub(r'[^A-Za-z0-9._-]+', '_', (s or 'Unknown')).strip('_') or 'Unknown'
+    # Also strip leading/trailing dots so a workbook-supplied value like '..'
+    # can't become a path segment that escapes the library directory.
+    s = re.sub(r'[^A-Za-z0-9._-]+', '_', (s or 'Unknown')).strip('_.')
+    return s or 'Unknown'
+
+
+def _stored_filename(r):
+    """Collision-resistant filename for a micrograph: job + image stem + a short
+    hash of the source report, so two reports that share a job number don't map
+    to the same file and overwrite each other."""
+    stem = _safe(os.path.splitext(r.get('image', ''))[0])
+    job = _safe(r.get('job', '') or 'job')
+    src = r.get('source') or ''
+    tag = hashlib.sha1(src.encode('utf-8')).hexdigest()[:6] if src else '000000'
+    return f"{job}_{stem}_{tag}.jpg"
 
 
 # ── backend selection ─────────────────────────────────────────────────────
@@ -143,36 +161,54 @@ def _index_path(library_dir):
 
 def _load_local_index(library_dir=LIBRARY_DIR):
     p = _index_path(library_dir)
-    if os.path.exists(p):
-        try:
-            with open(p, encoding='utf-8') as f:
-                return json.load(f)
-        except Exception:
-            return []
-    return []
+    if not os.path.exists(p):
+        return []                            # absent — safe to start a new index
+    try:
+        with open(p, encoding='utf-8') as f:
+            return json.load(f)
+    except Exception as e:
+        # The index exists but is corrupt/truncated. Do NOT return [] — a caller
+        # would then save a new index over it and orphan the whole library
+        # (matching gh_store / drive_store, which refuse in the same case).
+        raise RuntimeError(
+            f"photo-library index {p} exists but is unreadable "
+            f"({type(e).__name__}: {e}); refusing to overwrite it and lose the library.")
 
 
 def _save_local_index(index, library_dir=LIBRARY_DIR):
     os.makedirs(library_dir, exist_ok=True)
-    with open(_index_path(library_dir), 'w', encoding='utf-8') as f:
+    # Write atomically (temp file + replace) so an interrupted write can't leave a
+    # truncated index that the next load would treat as empty.
+    p = _index_path(library_dir)
+    tmp = p + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
         json.dump(index, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, p)
 
 
 def _add_local(records, library_dir):
     from PIL import Image
+    Image.MAX_IMAGE_PIXELS = 64_000_000
     index = _load_local_index(library_dir)
     existing = {(r.get('job'), r.get('image'), r.get('source')) for r in index}
+    lib_real = os.path.realpath(library_dir)
     added = 0
     for r in records:
         key = (r.get('job'), r.get('image'), r.get('source'))
         if key in existing:
             continue
         adir = os.path.join(library_dir, _safe(r['alloy']))
+        # Defence in depth: never let a crafted alloy escape the library dir.
+        if os.path.realpath(adir) != lib_real and \
+           not os.path.realpath(adir).startswith(lib_real + os.sep):
+            continue
         os.makedirs(adir, exist_ok=True)
-        name = f"{_safe(r.get('job', ''))}_{_safe(os.path.splitext(r['image'])[0])}.jpg"
-        out_path = os.path.join(adir, name)
+        out_path = os.path.join(adir, _stored_filename(r))
         try:
-            Image.open(io.BytesIO(r['bytes'])).convert('RGB').save(out_path, 'JPEG', quality=85)
+            im = Image.open(io.BytesIO(r['bytes']))
+            if im.width * im.height > _MAX_STORE_PIXELS:
+                continue                     # oversized image → skip (bomb guard)
+            im.convert('RGB').save(out_path, 'JPEG', quality=85)
         except Exception:
             continue
         rec = {k: v for k, v in r.items() if k != 'bytes'}
@@ -187,6 +223,11 @@ def _add_local(records, library_dir):
 
 # ── unified interface ─────────────────────────────────────────────────────
 def add_to_library(filename, data, parsed, rtype, library_dir=LIBRARY_DIR):
+    # Only file classified reports — an 'unknown' layout would otherwise dump its
+    # images under alloy 'Coating' with no metadata (the app UI gates on this;
+    # the CLI did not).
+    if rtype not in ('metallurgical', 'coating'):
+        return 0
     recs = _records(filename, data, parsed, rtype)
     if not recs:
         return 0

@@ -4,6 +4,7 @@ from unittest.mock import patch
 from openpyxl import Workbook
 
 from lab_review import (
+    _canon_machine,
     _comment,
     _formula_issues,
     _review_comment,
@@ -22,6 +23,7 @@ from lab_review import (
     _vote_job,
     add_version_findings,
     collect_highlights,
+    find_duplicate_compositions,
     picture_magnification_verdicts,
     review_filename,
 )
@@ -717,6 +719,193 @@ class LabReviewRegressionTests(unittest.TestCase):
             and item["severity"] == "warning"
             and "600x" in item["note"]
             for item in highlights
+        ))
+
+    # ── Recovered from claude/tool-error-detection-7vkrc9 (31 Jul 2026), a
+    # branch whose work was never merged. Each of these pins a defect found on
+    # a real report; the two marked "already correct in main" were re-fixed
+    # independently by the extraction rebuild and are kept as guards. ────────
+    def test_nominal_duplicate_header_is_flagged(self):
+        # _composition() already computed duplicate_headers/entries for the
+        # NOMINAL table (mirroring the Actual side), but _review_composition
+        # only ever read composition_meta['actual'] — a mislabeled/duplicated
+        # column in the spec itself was silently invisible, while the identical
+        # fault on the Actual side is a critical.
+        nominal = {"Al": 3.0, "Cr": 14.0}
+        actual = {"Al": 2.9, "Cr": 13.5}
+        meta = {
+            "nominal": {
+                "duplicate_headers": ["Cr"],
+                "entries": [
+                    {"element": "Al", "raw": "3.0", "value": 3.0, "row": 13, "col": 6},
+                    {"element": "Cr", "raw": "14.0", "value": 14.0, "row": 13, "col": 7},
+                    {"element": "Cr", "raw": "14.0", "value": 14.0, "row": 13, "col": 8},
+                ],
+            },
+            "actual": {"duplicate_headers": [], "entries": []},
+        }
+
+        findings = _review_composition(nominal, actual, meta)
+
+        self.assertTrue(any(
+            "Nominal composition table repeats element header" in message
+            for message in messages(findings, "critical")
+        ))
+
+    def test_nominal_duplicate_header_is_marked_on_its_cell(self):
+        parsed = {
+            "composition_meta": {
+                "nominal": {
+                    "duplicate_headers": ["Cr"],
+                    "entries": [
+                        {"element": "Cr", "raw": "14.0", "value": 14.0,
+                         "row": 13, "col": 8},
+                    ],
+                },
+                "actual": {"duplicate_headers": [], "entries": []},
+            },
+        }
+
+        highlights = collect_highlights(parsed)
+
+        self.assertTrue(any(
+            highlight["cell"] == (13, 8) and highlight["severity"] == "critical"
+            and "Nominal composition table repeats" in highlight["note"]
+            for highlight in highlights
+        ))
+
+    def test_hyphenated_unetched_caption_is_recognised(self):
+        # _UNETCHED_PAT required the contiguous word "unetched", so the
+        # hyphenated spelling used in real AEG captions ("Un-etched 25x") was
+        # never surfaced as an explicit unetched / as-polished caption.
+        parsed = {
+            "pictures": [
+                ("Picture 1:", "Micrograph- Shroud Tip Overview\nUn-etched 25x"),
+            ],
+            "comment": "",
+        }
+
+        findings = _review_captions(parsed)
+
+        self.assertTrue(any(
+            "states unetched / as-polished" in message
+            for message in messages(findings, "info")
+        ))
+
+    def test_frame_5_machine_alias_is_recognised(self):
+        # _canon_machine restricted the GE frame digit to [679]; a real report
+        # in a 27-report batch used "FS.5" (GE Frame 5 exists — MS5001), which
+        # failed to resolve at all, silently dropping the machine/set
+        # cross-check for that report instead of matching or flagging it.
+        self.assertEqual(_canon_machine("AEN Saudi FS.5 1st Stage Bucket"), "MS5001")
+        self.assertEqual(_canon_machine("MS 5001"), "MS5001")
+
+    def test_fs_dot_frame_variant_suffix_is_captured(self):
+        # A real report's title was "FS.7FA" — a fully correct, explicit match
+        # for an internal Machine Type of "MS7001FA". The FS.<frame> branch
+        # never captured a trailing suffix, so the title was truncated to
+        # "MS7001" and then reported as disagreeing with its own content.
+        self.assertEqual(_canon_machine("FS.7FA"), "7FA")
+        self.assertEqual(_canon_machine("MS7001FA"), "7FA")
+        self.assertEqual(_canon_machine("FS.7"), "MS7001")
+
+    def test_fs_dot_frame_variant_matches_internal_machine_type(self):
+        parsed = {
+            "header": {"job": "6579", "machine": "MS7001FA", "customer": "AEN Saudi"},
+            "sample": {"description": "3rd Stage Bucket"},
+        }
+
+        findings = review_filename(
+            "6579 AEN Saudi FS.7FA 3rd Stage Bucket Metallurgical Report.xlsx",
+            parsed,
+            "metallurgical",
+        )
+
+        self.assertFalse(any(
+            severity in ("critical", "warning") and category == "Title identity"
+            for severity, category, _message in findings
+        ))
+        self.assertTrue(any(
+            "machine/set" in message for message in messages(findings, "pass")
+        ))
+
+    def test_duplicate_actual_composition_across_different_jobs_is_flagged(self):
+        # Found on a real 27-report batch: two different AEG job numbers
+        # (different customer refs, serials, engineers, dates) carried a
+        # byte-identical Actual composition on every matched element — almost
+        # certainly a copy-paste, since independent EDS/ICP results are not
+        # expected to agree exactly. A single-report review can never see this.
+        actual = {
+            "Ni": 59.53, "Cr": 13.57, "Co": 9.14, "Mo": 1.46,
+            "W": 4.73, "Al": 2.49, "Ti": 4.81, "Ta": 3.05, "Fe": 0.08,
+        }
+        reports = [
+            ("6630.xlsx", {"header": {"job": "6630"}, "actual": dict(actual)}),
+            ("6991.xlsx", {"header": {"job": "6991"},
+                           "actual": dict(actual, Cu=0.07)}),
+            ("unrelated.xlsx", {"header": {"job": "7000"},
+                                "actual": {"Ni": 61.0, "Cr": 12.0, "Co": 9.0,
+                                           "Mo": 1.5, "W": 4.0}}),
+        ]
+
+        findings = find_duplicate_compositions(reports)
+
+        self.assertEqual(len(findings), 1)
+        severity, category, message = findings[0]
+        self.assertEqual(severity, "critical")
+        self.assertEqual(category, "Composition")
+        self.assertIn("6630.xlsx", message)
+        self.assertIn("6991.xlsx", message)
+        self.assertIn("9 matched element", message)
+
+    def test_same_job_number_is_not_a_duplicate_composition_signal(self):
+        # Two uploads of one job are a revision or a re-upload, which
+        # add_version_findings covers — not a copy-paste signal.
+        actual = {"Ni": 60.0, "Cr": 14.0, "Co": 9.5, "Mo": 1.5, "W": 3.8}
+        reports = [
+            ("a.xlsx", {"header": {"job": "7000"}, "actual": dict(actual)}),
+            ("b.xlsx", {"header": {"job": "7000"}, "actual": dict(actual)}),
+        ]
+
+        self.assertEqual(find_duplicate_compositions(reports), [])
+
+    def test_plural_pics_range_reference_is_parsed(self):
+        # Already correct in main (_picture_references), re-fixed independently
+        # by the rebuild. Kept as a guard: the original regex matched only the
+        # singular "Pic"/"Picture", so a real comment writing "Ref. pics. 9–10"
+        # could reference a picture that does not exist and slip through.
+        parsed = {
+            "pictures": [(f"Picture {n}:", "Etched 500x") for n in range(1, 5)],
+            "comment": "Solution HT was performed (Ref. pics. 9–10).",
+        }
+
+        findings = _review_captions(parsed)
+
+        self.assertTrue(any(
+            "Comment refers to Picture 10" in message
+            and "highest present caption is Picture 4" in message
+            for message in messages(findings, "warning")
+        ))
+
+    def test_underscore_separated_filename_matches_stage_and_component(self):
+        # Already correct in main (_component_identity normalises '_' and '-').
+        # Kept as a guard: regex '_' is a \w character, so \b-anchored
+        # component/stage patterns never matched across it and every
+        # underscore-joined filename looked like it disagreed with its content.
+        parsed = {
+            "header": {"job": "7398", "machine": "MS7001", "customer": "AEN SAUDI"},
+            "sample": {"description": "1st Stage Bucket"},
+        }
+
+        findings = review_filename(
+            "7398__AEN_Saudi_FS.7_1st_Stage_Bucket_Metallurgical_Report__AEG_final.xlsx",
+            parsed,
+            "metallurgical",
+        )
+
+        self.assertFalse(any(
+            severity in ("critical", "warning") and category == "Title identity"
+            for severity, category, _message in findings
         ))
 
 

@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import fitz
 import openpyxl
-from PIL import Image, ImageDraw
+from PIL import Image, ImageChops, ImageDraw
 from openpyxl.worksheet.pagebreak import Break
 
 from report_render import (
@@ -13,8 +13,12 @@ from report_render import (
     _download_issue_cards,
     _faithful_view,
     _pages_to_pdf,
+    _place_callout_cards,
     _trim_blank_trailing_pages,
     build_issue_index,
+    compose_shared_report,
+    crop_issue_detail,
+    normalize_comments,
 )
 
 
@@ -224,6 +228,147 @@ class ReportRenderTests(unittest.TestCase):
         document = fitz.open(stream=pdf, filetype="pdf")
         self.assertEqual(document.page_count, 1)
         document.close()
+
+
+def _one_page_view(issue_note="Duplicate serial/part number(s): C1ZP093046."):
+    """A rendered view of one page carrying one marked cell."""
+    page = Image.new("RGB", (700, 900), "white")
+    ImageDraw.Draw(page).rectangle((80, 300, 240, 340), outline="black")
+    buffer = io.BytesIO()
+    page.save(buffer, format="PNG")
+    return {
+        "filename": "report.xlsx",
+        "pages": [{
+            "number": 1,
+            "png": buffer.getvalue(),
+            "issue_nums": [1],
+            "size": [700, 900],
+            "placements": [{
+                "issue_nums": [1],
+                "severity": "critical",
+                "cell_bbox": [80, 300, 240, 340],
+                "badge_bbox": [225, 285, 265, 315],
+            }],
+        }],
+        "issues": [{
+            "num": 1,
+            "severity": "critical",
+            "category": "Traceability",
+            "note": issue_note,
+            "cells": [(9, 7)],
+            "refs": ["G9"],
+            "pages": [1],
+        }],
+        "extras": [],
+        "dpi": 150,
+    }
+
+
+class CalloutTests(unittest.TestCase):
+    """The sent report has to explain itself on the page."""
+
+    def test_reviewer_comments_reach_the_page_in_full(self):
+        view = _one_page_view()
+        comment = (
+            "Confirm with the workshop which bucket was actually sectioned. "
+            + " ".join(f"word{index}" for index in range(140))
+        )
+        package = compose_shared_report(
+            view,
+            comments=[{"text": comment, "author": "M. Eslam", "issue": 1},
+                      {"text": "  ", "author": "M. Eslam"}],
+            filename="report.xlsx",
+        )
+
+        self.assertEqual(len(package["pages"]), 1)
+        self.assertTrue(package["pdf"])
+
+        records = list(view["issues"]) + normalize_comments(
+            [{"text": comment, "author": "M. Eslam", "issue": 1}])
+        cards, _pad, _height = _download_issue_cards(
+            records, panel_width=500, panel_height=900, dpi=150)
+        embedded = " ".join(
+            line for card in cards for line in card["note_lines"]).split()
+        # Whole comment present, and continuation cards did not duplicate the
+        # leader line back to the same cell.
+        for word in comment.split():
+            self.assertIn(word, embedded)
+        leaders = [card for card in cards if card["anchor_nums"] == [1]]
+        self.assertEqual(len(leaders), 2)     # the finding, and its comment
+
+    def test_an_empty_comment_is_not_drawn(self):
+        self.assertEqual(normalize_comments([{"text": "   "}, ""]), [])
+        numbered = normalize_comments([
+            {"text": "first"}, {"text": " "}, {"text": "second", "issue": "3"}])
+        self.assertEqual([record["label"] for record in numbered], ["R1", "R2"])
+        self.assertEqual(numbered[1]["issue"], 3)
+
+    def test_a_dismissed_finding_keeps_its_callout_with_the_reason(self):
+        view = _one_page_view()
+        issues = [dict(view["issues"][0],
+                       state="dismissed",
+                       reason="Confirmed against the workshop record.")]
+        cards, _pad, _height = _download_issue_cards(
+            issues, panel_width=500, panel_height=900, dpi=150)
+
+        # A marker is drawn on the page for every finding, so every marker needs
+        # a callout — a dismissed one says so instead of vanishing.
+        self.assertTrue(cards[0]["title"].startswith("1. DISMISSED"))
+        body = " ".join(cards[0]["note_lines"])
+        self.assertIn("Confirmed against the workshop record.", body)
+
+        package = compose_shared_report(view, issues=issues, filename="report.xlsx")
+        self.assertEqual(len(package["pages"]), 1)
+
+    def test_a_callout_is_placed_beside_its_own_row(self):
+        tall = {"height": 300, "anchor_nums": [1]}
+        short = {"height": 60, "anchor_nums": [2]}
+        unanchored = {"height": 60, "anchor_nums": []}
+        columns = _place_callout_cards(
+            [dict(tall), dict(short), dict(unanchored)],
+            tops={1: 400, 2: 700},
+            card_top=100, card_bottom=900, gap=10)
+
+        self.assertEqual(len(columns), 1)
+        first, second, third = columns[0]
+        self.assertEqual(first[1], 400)          # level with its cell
+        self.assertEqual(second[1], 710)         # pushed past the card above it
+        self.assertEqual(third[1], 780)          # unanchored: next free slot
+
+    def test_callouts_that_do_not_fit_continue_in_another_column(self):
+        cards = [{"height": 300, "anchor_nums": [number]} for number in (1, 2, 3)]
+        columns = _place_callout_cards(
+            cards, tops={1: 100, 2: 400, 3: 700},
+            card_top=100, card_bottom=800, gap=10)
+
+        self.assertEqual([len(column) for column in columns], [2, 1])
+
+    def test_a_leader_line_runs_from_the_callout_onto_the_marked_cell(self):
+        view = _one_page_view()
+        page = view["pages"][0]
+        source = Image.open(io.BytesIO(page["png"])).convert("RGB")
+
+        composed = _compose_download_pages(
+            [source], [page], view["issues"], [], "report.xlsx", 150)[0]
+
+        # The band across the marked cell's row, right of the cell and left of
+        # the comment panel, is blank on the report and drawn on afterwards.
+        band = (260, 280, source.width, 330)
+        self.assertIsNone(source.crop(band).getbbox() and
+                          ImageChops.invert(source.crop(band)).getbbox())
+        drawn = ImageChops.invert(composed.crop(band)).getbbox()
+        self.assertIsNotNone(drawn, "no leader line drawn between cell and callout")
+
+    def test_locate_zooms_the_marked_cell_of_an_exact_page(self):
+        view = _one_page_view()
+        page = view["pages"][0]
+
+        crop = crop_issue_detail(page["png"], page["placements"], 1)
+        magnified = Image.open(io.BytesIO(crop))
+
+        self.assertGreater(magnified.width, 240 - 80)     # wider than the cell
+        self.assertIsNone(crop_issue_detail(page["png"], page["placements"], 9))
+        self.assertIsNone(crop_issue_detail(page["png"], [], 1))
 
 
 if __name__ == "__main__":

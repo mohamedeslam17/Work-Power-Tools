@@ -91,8 +91,19 @@ def _read_index():
     if r is None:
         return None, []                     # index absent — safe to create a new one
     j = r.json()
+    sha = j.get('sha')
     try:
-        return j.get('sha'), json.loads(base64.b64decode(j['content']).decode('utf-8'))
+        content = j.get('content') or ''
+        if content and j.get('encoding') == 'base64':
+            data = base64.b64decode(content)
+        else:
+            # The Contents API returns empty content with encoding 'none' once the
+            # file exceeds 1 MB — re-fetch the body with the raw media type (the
+            # sha still comes from the JSON response) so a large library stays
+            # readable instead of becoming a permanent outage.
+            rr = _get(f"{base()}/{_INDEX_NAME}", raw=True)
+            data = rr.content if rr is not None else b''
+        return sha, json.loads(data.decode('utf-8'))
     except Exception as e:
         # The index exists but couldn't be read/parsed. Do NOT return an empty
         # list — add_records would then commit it over the real index and wipe
@@ -106,6 +117,7 @@ def add_records(records):
     """Commit micrograph records (each with 'bytes') to the repo; return count added."""
     import requests
     from photo_lib import _safe
+    from photo_lib import _stored_filename
     sha, index = _read_index()
     existing = {(r.get('job'), r.get('image'), r.get('source')) for r in index}
     added = 0
@@ -113,14 +125,22 @@ def add_records(records):
         key = (r.get('job'), r.get('image'), r.get('source'))
         if key in existing:
             continue
-        name = f"{_safe(r.get('job', ''))}_{_safe(os.path.splitext(r['image'])[0])}.jpg"
-        rel = f"{_safe(r['alloy'])}/{name}"
+        rel = f"{_safe(r['alloy'])}/{_stored_filename(r)}"
         try:
             _put(f"{base()}/{rel}", r['bytes'], f"library: add {rel}")
         except requests.HTTPError as e:
             code = getattr(e.response, 'status_code', None)
-            if code == 422:                 # already in the repo — record it in the index
-                pass
+            if code == 422:
+                # Path already exists. With source-discriminated names this means
+                # the same file — but verify the bytes match; if they differ (a
+                # true collision), store under a content-hashed name instead of
+                # indexing a record that points at someone else's image.
+                existing_bytes = download(rel)
+                if existing_bytes is not None and existing_bytes != r['bytes']:
+                    import hashlib
+                    tag = hashlib.sha1(r['bytes']).hexdigest()[:8]
+                    rel = f"{os.path.splitext(rel)[0]}_{tag}.jpg"
+                    _put(f"{base()}/{rel}", r['bytes'], f"library: add {rel}")
             elif code in (401, 403):
                 raise RuntimeError('GitHub rejected the write (check the github_token '
                                    'has Contents: read & write on the repo).') from e

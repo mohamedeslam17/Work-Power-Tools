@@ -903,3 +903,217 @@ reports (the 4-report corpus plus job 5739, supplied by Mohamed).
 **Tests** `_vote_job` is covered by three new tests in `test_lab_review.py`
 pinning both fabrication modes (magnification-as-job, contested read) plus a
 guard that consensus still reports. Suite 71 tests, OK.
+
+---
+
+## 013 · Opus · 6 Aug 2026
+
+**Status:** Mohamed's four requests, all landed and driven end-to-end against a
+real report (6943, plus a compose pass over the other four corpus files):
+*"I can't zoom in the annotated report; I need callouts with comment; I need to
+send the report with the callouts to some people; and to write the comments in
+the comment section and share the report."*
+
+**What was actually wrong with zoom**
+Nothing was broken — there was no zoom at all. `st.image` scales to its column
+and offers nothing beyond that, so a 1240 px A4 page rendered into a ~900 px
+column at 0.73x and the values in it were a few pixels tall. Fixed on two
+levels: the page now sits in an `overflow:auto` viewport as an inlined `<img>`
+(Fit / 100 / 150 / 200 / 300%, panned by scrolling), and from 200% the workbook
+is re-rendered at 240 dpi instead of magnifying a 150 dpi raster — there was no
+detail to magnify. Measured in the browser: pane 828 px, image drawn 1648 px,
+scrollWidth 1652 — real zoom, not CSS wishful thinking. Two render resolutions
+only, since each is another LibreOffice pass.
+
+`Locate` also zooms on the **exact** pages now, not only on the fallback grid.
+It was fallback-only because `cell_pixel_rect` models the drawn grid's geometry;
+`_annotate_faithful_pages` knows where each marker actually landed, so
+`crop_issue_detail()` crops from that instead. (This is the "zoomed-crop is
+exact-mode-blind" gap noted in entry 009.)
+
+**Callouts — and why the leader lines are routed, not straight**
+The comment panel already existed in the download; it was a list beside the page,
+not callouts. Cards are now placed level with the row they describe and joined to
+their badge by a leader. First attempt drew straight lines: with 10 cards on a
+one-page report the lower ones could not be placed level with their cells, and
+the leaders fanned diagonally across all four micrographs. Now the vertical run
+is kept in a channel just inside the page's right edge — the sheet's own print
+margin — and the line terminates on the **badge**, not the cell's middle, so its
+horizontal run follows a row border instead of striking through the values. Same
+composite on screen and in the PDF: what the reviewer approves is what the
+recipient opens.
+
+**Badge-without-callout was a real inconsistency, and it is closed**
+Markers are drawn for *every* anchored finding, but the UI only ever listed the
+report-scoped, non-dismissed ones — on 6943, badges 1 and 4 (template-scoped)
+had no card anywhere. In a document that leaves the building that reads as a
+bug, so callouts are now generated for all three states: live, template-scoped
+("applies to every report on this template"), and dismissed (carrying the
+reviewer's reason). The latter two are grey, so they cannot be mistaken for live
+problems. The UI's own card list is unchanged in what it counts.
+
+Related: the on-screen card filter matched findings by the *full* message while
+triage state matches by stem. An anchored highlight's note is sometimes the
+leading clause of the longer finding message, so the two could classify the same
+finding differently. Both now go through one stem-keyed helper
+(`_presentation_states`).
+
+**Comments and sending**
+`share.py` is new and dependency-free: e-mail via stdlib `smtplib`, Drive via the
+photo library's existing OAuth (`drive_store.upload_file` / `grant_reader`, per
+named recipient — never "anyone with the link", these are customer documents).
+Verified end-to-end against a local SMTP sink driven through the browser: the
+mail arrives with the annotated PDF attached and the reviewer's comment in both
+the body and the page callouts.
+
+One Streamlit trap worth recording: the message body is generated from the
+review, but a `text_area` reads `value=` once, so a comment added after the panel
+first rendered never reached the message. Caught by reading the actual `.eml`,
+not by reading the code. Fixed by pushing the generated text into session state
+while it is untouched and leaving it alone once the reviewer types over it (with
+a rebuild button) — silently discarding what someone wrote would be worse than a
+stale summary.
+
+**Performance**
+`render_report_faithful_view(..., with_pdf=False)` skips the old comment-less PDF
+pass, and the callout composition sits in its own cache keyed on the triage state
+and the comment list. Writing a comment costs one Pillow pass (~1 s on 6943),
+never a LibreOffice render (~4 s).
+
+**Environment note for the next agent**
+`libreoffice-calc` was again missing in this sandbox and again fixed by
+`apt-get update && apt-get install -y libreoffice-calc`, exactly as PHASE-NEXT §3
+predicts. Do not conclude step 3 is blocked without running that.
+
+**Tests** 71 → 85, all passing: seven callout/zoom tests in
+`test_report_render.py` (comment text arrives complete, dismissed keeps its
+reason, placement is level with its row, overflow continues in another column, a
+leader line really is drawn between cell and callout, `crop_issue_detail`) and
+seven in the new `test_share.py` (recipient parsing, refusal when unconfigured,
+what the SMTP server actually receives, implicit TLS, per-recipient Drive
+grants).
+
+**Not done, deliberately**
+- Step 3 (text-anchored annotation, D6) is still open. This work sits on top of
+  the colour-probe render and does not make it harder to replace: the callout
+  layer consumes `placements` (page index + bbox per marker), which a
+  text-anchored implementation can produce just as well.
+- Comments live in `st.session_state`, so they are lost when the session ends —
+  the same limitation as accept/dismiss, and the same answer (step 4).
+
+---
+
+## 014 · Opus · 7 Aug 2026
+
+**Status:** Mohamed asked why we keep losing work. Audited all 24 remote
+branches, salvaged what was still good, and recorded what was rejected so this
+does not have to be re-litigated. Tests 85 → 118, corpus verdicts unchanged
+(6943 keeps its one critical; the other three metallurgical reports stay clean).
+
+**Why work was being lost — three separate mechanisms**
+
+1. **No pull request was ever opened.** `claude/tool-audit-improvements-v7bj10`
+   (6–7 Jul, ~1,000 lines across all four tools) and
+   `claude/tool-error-detection-7vkrc9` (31 Jul, ~1,100 lines incl. 460 of
+   tests) were pushed and then simply never proposed. Nothing in the repo
+   surfaces a branch that has no PR, so they went quiet and stayed quiet.
+2. **Squash merges hide what is already in.** Eleven branches are byte-identical
+   to main and seven more had their content squashed in as PRs #7–#11, which
+   leaves them permanently "ahead" in `git branch -v`. Real losses were buried
+   among 18 false alarms, so nobody could tell them apart by looking.
+3. **The Phase 1 rebuild rewrote the files the older branches were fixing.**
+   `lab_review.py` and `report_render.py` moved by ~1,000 lines on 2 Aug, so a
+   July fix to them no longer applies as a patch. Those had to be re-judged fix
+   by fix rather than cherry-picked — and half of them turned out to have been
+   re-fixed independently, which is the real cost: the same defect found twice.
+
+**Merged (each verified against the current parser, corpus, and tests)**
+
+From `claude/tool-error-detection-7vkrc9`:
+- `_canon_machine` resolved only frame sizes 6/7/9. A real report titled "FS.5"
+  (GE Frame 5 / MS5001 exists) silently failed to resolve, dropping the
+  machine/set cross-check for that report instead of matching or flagging it.
+- `_canon_machine`'s FS.<frame> branch captured no variant suffix, so a title
+  correctly stating "FS.7FA" was truncated to MS7001 and then reported as
+  disagreeing with its own, correct, "MS7001FA" header.
+- `_UNETCHED_PAT` required the contiguous word "unetched", missing the
+  hyphenated "Un-etched" that real captions use.
+- Nominal-side composition structure was unchecked: `_composition()` already
+  computed `duplicate_headers` for the spec table, but nothing read it, so a
+  duplicated/mislabeled *nominal* column passed silently while the identical
+  fault on the Actual side is a critical. Now a critical, anchored to its cell.
+- `find_duplicate_compositions()` — the cross-report copy-paste check — wired
+  into the app's batch path, `lab_review.py`'s CLI and `batch_review.py`.
+- `composition_store.py` + its 8 tests, giving that check cross-session memory.
+
+From `claude/tool-audit-improvements-v7bj10` (storage layer, applied as a
+three-way patch — main had not touched these files since the branch point):
+- `photo_lib._safe` kept leading dots, so an alloy value of `..` became a path
+  segment that walked out of the library directory.
+- Stored filenames were job + image stem only, so two reports sharing a job
+  number mapped to one file and the second silently replaced the first.
+  `_stored_filename` adds a short hash of the source report.
+- A corrupt local index returned `[]`, and the next save then wrote a fresh
+  index over the real one and orphaned the whole library. Now refuses, matching
+  what the two cloud backends already did. Index writes are atomic.
+- GitHub's Contents API stops inlining content past ~1 MB and returns encoding
+  `none`; decoding that as base64 made every read fail, i.e. a permanent outage
+  once the library grew. Now re-fetches with the raw media type.
+- Drive: a lock around the non-thread-safe service, resume semantics instead of
+  duplicate uploads, merge-before-write so a concurrent session's additions are
+  not clobbered, and a missing file rendering as "missing" instead of crashing
+  the gallery. `--migrate` honours `PHOTO_LIBRARY_DIR`.
+- `add_to_library` now ignores an unclassified layout (the UI gated on report
+  type; the CLI did not, and dumped images with no usable metadata).
+- IIR: row scans capped (one stray cell at Excel's last row pushed `max_row` to
+  ~1,048,576 and froze a worker), the section-based checks added to
+  `CHECK_CATALOG` so the severity settings can reach them, and `apply_overrides`
+  no longer erases a context-softened severity when the caller passes the
+  catalog defaults.
+
+Those two branches shipped their storage and IIR fixes with **no tests at all**,
+which is most of why they were easy to lose. New `tests/test_photo_lib.py` (9)
+and `tests/test_iir_review.py` (6, the first IIR tests in the repo) pin them.
+
+**Rejected, with reasons — do not re-merge these without a decision**
+
+- **7vkrc9's disposition work** (`_comment_disposition`, restore/recover
+  vocabulary, and a new "Result says See comment but there is no comment at all"
+  critical). Main *deliberately dropped* the "See comment" disposition critical
+  on 2 Aug (36e0f70), and `test_microstructure_does_not_prove_restored_
+  mechanical_properties` pins the opposite of the restore/recover reading. This
+  is a product decision that post-dates the branch.
+- **7vkrc9's nominal-total sanity band.** Main's rebuild has a better version
+  (99–101 % with balance/remainder awareness) than the branch's 95–105 %.
+- **7vkrc9's `comment_picture_refs` and `_component_identity` underscore fix.**
+  Both were re-fixed independently by the rebuild. Their tests were kept as
+  guards rather than the code.
+- **7vkrc9's "coating recorded but no comment" warning.** A new rule, not a bug
+  fix; severity on AEG process is Mohamed's call.
+- **v7bj10's `lab_review.py` / `report_render.py` / `app.py` hunks.** Superseded
+  — those files were rebuilt after the branch, and `app.py` is now a router.
+- **v7bj10's and QKUI5's `sem_convert.py` hunks** (~95 lines: caption cleaning,
+  figure layout, overflow). HANDOFF's "do not touch sem_convert.py" still
+  stands, and there is no vendor SEM PDF in the repo to verify a change against.
+  Worth a look when one is available.
+- **QKUI5's auto-generated conclusion** — it writes "considered suitable for
+  reconditioning" into a report when the source PDF states no conclusion. A tool
+  should not assert a disposition nobody wrote. Mohamed's call, flagged not
+  merged.
+- **`claude/lab-report-annotated-view-ijay74`** (captioned-but-not-embedded
+  micrographs) — already in main, and stricter there: it compares caption count
+  to embedded count in both directions.
+- **`audit-reports`** — an empty folder and a README.
+
+**Unverifiable, merged anyway, flagged here:** the IIR *parser* fixes (Total-row
+double counting, text-formatted position numbers, multi-sheet sum accumulation,
+page-footer false matches). They apply to exactly the code they were written
+against, and the bugs they describe are specific and plausible, but there is no
+IIR workbook in the repo to drive them. **Run one real IIR report through the
+reviewer before relying on it.** If it misbehaves, this entry is where to start.
+
+**How to stop this happening again** — the cheap version is a rule, not a tool:
+push a branch, open the PR the same session. Everything lost here was lost by a
+branch that never became a PR. `git branch -r --no-merged origin/main` plus a
+patch-content check (not `git cherry`, which squash merges defeat) is enough to
+audit it in one command; that is how this entry's list was produced.
