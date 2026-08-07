@@ -43,6 +43,10 @@ from openpyxl.utils import get_column_letter
 try:
     from PIL import Image, ImageFilter, ImageOps
     _PIL_AVAILABLE = True
+    # A crafted or simply enormous embedded image must not be decoded before we
+    # have looked at its dimensions — on a shared Streamlit worker that is an
+    # out-of-memory kill for every session, not just this review.
+    Image.MAX_IMAGE_PIXELS = 64_000_000
 except Exception:
     _PIL_AVAILABLE = False
 
@@ -275,6 +279,39 @@ def _cell_label_text(v):
     return t[:-1].rstrip() if t.endswith(':') else t
 
 
+# A single stray cell far down or far right of the data inflates ws.max_row to
+# ~1,048,576 and ws.max_column to 16,384, which turns every one of the scans
+# below into a minutes-long loop that freezes the worker for every session
+# sharing it. AEG report sheets are a hundred rows; these caps are generous by
+# two orders of magnitude and bound the damage.
+_SCAN_ROWS_CAP = 5000
+_SCAN_COLS_CAP = 200
+
+
+def _scan_rows(ws):
+    """`ws.iter_rows()` bounded to the region a report can plausibly occupy."""
+    return ws.iter_rows(max_row=min(ws.max_row, _SCAN_ROWS_CAP),
+                        max_col=min(ws.max_column, _SCAN_COLS_CAP))
+
+
+def _looks_like_point_header(values):
+    """True for a measurement-point index row like 1, 2, 3, … N.
+
+    Consecutive small integers starting at 0 or 1 are the table's own column
+    numbering, not thickness readings.
+    """
+    if len(values) < 3:
+        return False
+    try:
+        if any(not float(value).is_integer() for value in values):
+            return False
+    except (TypeError, ValueError):
+        return False
+    sequence = [int(value) for value in values]
+    return (sequence[0] in (0, 1)
+            and sequence == list(range(sequence[0], sequence[0] + len(sequence))))
+
+
 def _label_match(pattern, text):
     """Whether `text` (already colon-stripped) IS the label `pattern` names,
     not merely prose that mentions it — the pattern must consume the cell;
@@ -285,7 +322,7 @@ def _label_match(pattern, text):
 
 def _find_label(ws, pattern):
     """(row, col) of the first cell that IS the label `pattern` names."""
-    for row in ws.iter_rows():
+    for row in _scan_rows(ws):
         for cell in row:
             text = _cell_label_text(cell.value)
             if text and _label_match(pattern, text):
@@ -301,7 +338,7 @@ def _build_boundary_index(ws):
     loose = (list(_HARDNESS_LABELS.values()) + list(_COATING_LABELS.values())
              + list(_SIGNOFF_LABELS.values()) + list(_COMPOSITION_LABELS))
     boundary = set()
-    for row in ws.iter_rows():
+    for row in _scan_rows(ws):
         for cell in row:
             text = _cell_label_text(cell.value)
             if not text:
@@ -389,7 +426,7 @@ def _excel_errors(wb):
     """Visible Excel error values, including cached formula failures."""
     out = []
     for ws in wb.worksheets:
-        for row in ws.iter_rows():
+        for row in _scan_rows(ws):
             for cell in row:
                 value = _txt(cell.value).upper()
                 if value in _EXCEL_ERRORS:
@@ -407,7 +444,7 @@ def _formula_issues(wb):
     """Formula constructs that make a released workbook non-self-contained."""
     out = []
     for ws in wb.worksheets:
-        for row in ws.iter_rows():
+        for row in _scan_rows(ws):
             for cell in row:
                 formula = _txt(cell.value)
                 if cell.data_type == 'f' and re.search(r'\[[^\]]+\][^!]*!', formula):
@@ -463,7 +500,7 @@ def _workbook_text(wb):
     """
     values = []
     for ws in wb.worksheets:
-        for row in ws.iter_rows():
+        for row in _scan_rows(ws):
             for cell in row:
                 value = _txt(cell.value)
                 if value:
@@ -680,7 +717,7 @@ def _find_all(ws, pattern):
     report legitimately has more than one instance (composition tables, D4)."""
     rx = re.compile(pattern, re.I)
     hits = []
-    for row in ws.iter_rows():
+    for row in _scan_rows(ws):
         for cell in row:
             t = _txt(cell.value)
             if t and rx.search(t):
@@ -771,7 +808,7 @@ def _comment(ws, boundary=None):
 def _pictures(ws):
     rx = re.compile(r'Picture\s*\d+\s*:', re.I)
     pics, loc = [], []
-    for row in ws.iter_rows():
+    for row in _scan_rows(ws):
         for cell in row:
             if rx.search(_txt(cell.value)):
                 cap, vloc = _value_right_loc(ws, cell.row, cell.column)
@@ -1295,8 +1332,16 @@ def _review_comment(parsed):
     comment_types = _coating_types_in(comment)
 
     present = (coat.get('present') or '').strip().lower()
+    # "No coating" is only asserted when a coating cell was actually parsed.
+    # Without this, a layout the parser missed entirely (every coating field
+    # None) read as an explicit "no coating" and then contradicted a comment
+    # that correctly described one — the tool accusing the report of the
+    # parser's own gap, which is exactly what D1 set out to stop.
+    any_coat_cell = any(coat.get(key) is not None
+                        for key in ('present', 'type', 'received', 'outgoing'))
     cell_has  = present == 'yes' or bool(cell_types)
-    cell_none = present == 'no' or (not cell_types and _is_placeholder(coat.get('type')))
+    cell_none = present == 'no' or (any_coat_cell and not cell_types
+                                    and _is_placeholder(coat.get('type')))
 
     comment_has = bool(comment_types) or bool(re.search(
         r'received with[^.]{0,30}coating|coated with|coating (?:was |is )?(?:applied|present|intact)', cl))
@@ -1345,8 +1390,14 @@ def _review_comment(parsed):
                     r'beyond\s+repair|non[-\s]?conform|unacceptable', cl)
     pos = re.search(r'(?<!not )(?:\bsuitable for|\bacceptable|recommended for|'
                     r'reconditi|fit for service|return to service)', cl)
-    result_pos = bool(re.search(r'accept|suitable|conform|\bpass\b', rlow)) and 'see comment' not in rlow
-    result_neg = bool(re.search(r'reject|not\s+suitable|scrap|unacceptable', rlow))
+    # A negative Result cell ("Not acceptable", "Non conforming") must not also
+    # count as positive just because it contains "accept" / "conform" — it did,
+    # and a report whose cell and comment AGREED on a rejection was then warned
+    # about for contradicting itself. Grade negative first and short-circuit.
+    result_neg = bool(re.search(r'reject|not\s+suitable|unsuitable|scrap|unacceptable|'
+                                r'not\s+accept|non[-\s]?conform', rlow))
+    result_pos = (not result_neg) and 'see comment' not in rlow and bool(
+        re.search(r'accept|suitable|conform|\bpass\b', rlow))
     if result_pos and neg and not pos:
         findings.append(('warning', 'Comment',
                          f'Result cell says "{result}" but the comment indicates the part is NOT suitable.'))
@@ -1386,9 +1437,17 @@ def _review_hardness(hardness, material):
     is_hrc = (unit == 'HRC') or (unit is None and all(v <= 72 for v in vals))
     ustr = unit or ('HRC' if is_hrc else 'HV')
 
-    # Solution treatment should soften the material (post ≤ pre) — scale-agnostic.
-    # ±2 guard band so measurement scatter doesn't trip a false warning.
-    if pre is not None and post is not None and post > pre + 2:
+    # Solution treatment should soften the material (post ≤ pre), but only
+    # compare when the two readings share a scale, and scale the guard band to
+    # it: a fixed ±2 is right for HRC and far too tight for HV/HBW, where normal
+    # scatter is tens of points, and a 355 HV post against a 42 HRC pre is not a
+    # comparison at all.
+    pre_unit = hardness.get('pre', {}).get('unit')
+    post_unit = hardness.get('post', {}).get('unit')
+    mixed_units = bool(pre_unit and post_unit and pre_unit != post_unit)
+    band = 2 if is_hrc else 12
+    if (pre is not None and post is not None and not mixed_units
+            and post > pre + band):
         findings.append(('warning', 'Hardness',
                          f'Post-solution hardness ({post:g} {ustr}) exceeds pre-solution '
                          f'({pre:g} {ustr}) — solution treatment normally softens the material.'))
@@ -1831,7 +1890,9 @@ def parse_coating(wb, media=0):
     meas_cols = [c for c in range(meas_loc[1], right_bound) if c not in (min_col, max_col)]
 
     cur_min = cur_max = None
-    for r in range(hrow + 1, aws.max_row + 1):
+    blank_run = 0
+    last_row = min(aws.max_row, hrow + _SCAN_ROWS_CAP)
+    for r in range(hrow + 1, last_row + 1):
         m = _num(aws.cell(row=r, column=min_col).value)
         x = _num(aws.cell(row=r, column=max_col).value)
         if m is not None:
@@ -1841,6 +1902,20 @@ def parse_coating(wb, media=0):
         cells = [(c, _num(aws.cell(row=r, column=c).value)) for c in meas_cols]
         cells = [(c, v) for c, v in cells if v is not None]
         if not cells:
+            # A run of empty rows ends the table: without it the scan runs to
+            # ws.max_row (one stray cell puts that at ~1M) and picks up footer
+            # notes sitting below the table as if they were measurements.
+            blank_run += 1
+            if blank_run >= 12 and data['rows']:
+                break
+            continue
+        blank_run = 0
+        if _looks_like_point_header([v for _, v in cells]):
+            # A measurement-point index row ('1 2 3 … 10') is a sub-header, not
+            # thickness data. On this corpus it slipped by only because it sits
+            # above the first limits row; in a multi-block table it inherits the
+            # forward-filled MIN/MAX above it and every index is then reported
+            # as a thickness outside the design limits.
             continue
         data['rows'].append({'row': r, 'values': [v for _, v in cells],
                              'cells': cells, 'min': cur_min, 'max': cur_max})
@@ -1991,6 +2066,9 @@ def _binarize(im, thr, scale=4):
 
 
 _ETCH_THR = 0.05   # edge-density below this ⇒ image looks unetched / very low contrast
+# Largest image we will analyse: the edge map and the OCR upscale amplify memory
+# several times over, so an oversized image is skipped rather than processed.
+_MAX_ANALYZE_PIXELS = 40_000_000
 
 
 def _edge_density(im):
@@ -2000,10 +2078,15 @@ def _edge_density(im):
     w, h = im.size
     c = im.crop((int(w * 0.15), int(h * 0.15), int(w * 0.85), int(h * 0.80)))
     try:
-        px = list(c.filter(ImageFilter.FIND_EDGES).get_flattened_data())
+        # Count strong edges from the histogram rather than materialising every
+        # pixel into a Python list, which on a full-resolution micrograph costs
+        # tens of megabytes per image — several images in, that is the shared
+        # Streamlit worker's memory.
+        histogram = c.filter(ImageFilter.FIND_EDGES).histogram()
     except Exception:
         return None
-    return sum(1 for p in px if p > 40) / len(px) if px else None
+    total = sum(histogram[:256])
+    return (sum(histogram[41:256]) / total) if total else None
 
 
 # Legend OCR is a constrained problem — the burned-in caption is always a short
@@ -2312,6 +2395,11 @@ def analyze_images(data, want_bytes=False, max_images=40):
             continue
         w, h = im.size
         if w < 200 or h < 150:           # skip logos / thumbnails
+            continue
+        if w * h > _MAX_ANALYZE_PIXELS:
+            # The edge map and the OCR upscale each multiply this image's memory
+            # several times over; past this size the analysis is not worth the
+            # risk to the worker.
             continue
         strong = _edge_density(im)
         measurements, measurement_groups = _read_measurement_data_im(source_image)

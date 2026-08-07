@@ -1117,3 +1117,75 @@ push a branch, open the PR the same session. Everything lost here was lost by a
 branch that never became a PR. `git branch -r --no-merged origin/main` plus a
 patch-content check (not `git cherry`, which squash merges defeat) is enough to
 audit it in one command; that is how this entry's list was produced.
+
+---
+
+## 015 · Opus · 7 Aug 2026
+
+**Correcting entry 014.** That entry dismissed `tool-audit-improvements-v7bj10`'s
+`lab_review.py` hunks (+203 lines) as "superseded — those files were rebuilt
+after the branch". That was reasoning by proxy: the file *was* rewritten, but a
+rewritten file is not the same thing as a re-fixed defect, and it is the same
+assumption that let these branches go stale in the first place. Went back and
+checked all 203 lines against the current parser. **Six of them were still live
+defects.** Tests 118 → 125.
+
+**Still live, now fixed**
+
+1. **A rejected Result cell also graded as accepted.** `result_pos` matched
+   `accept` inside "Not acceptable", so the cell was simultaneously positive and
+   negative, and a report whose Result cell and comment *agreed* on a rejection
+   was warned for contradicting itself. Now graded negative first, short-circuit.
+2. **A coating layout the parser missed read as "no coating".** With every
+   coating field `None`, `cell_none` was True, so the reviewer told a report that
+   correctly described its MCrAlY coating that its cell said there was none —
+   the tool blaming the report for its own extraction gap, which is exactly what
+   D1 exists to prevent. Now requires that some coating cell was actually parsed.
+3. **Hardness compared across scales.** A 355 HV post-solution reading against a
+   42 HRC pre-solution reading was reported as hardness rising by 313. And the
+   ±2 guard band, correct for HRC, false-fires on routine HV scatter. Now
+   compares only within one scale, with the band scaled to it (2 HRC / 12 HV).
+4. **A measurement-point index row was parsed as thickness data.** Confirmed on
+   real corpus report 6983: its coating table's `1 2 3 4 5` header row is in
+   `parsed['rows']`. It has been harmless there only because it sits *above* the
+   first MIN/MAX row; in a multi-block table it inherits the forward-filled
+   limits and all five indices are then reported as thicknesses out of design
+   range. Now skipped, and a run of empty rows ends the table.
+5. **Seven unbounded sheet scans.** One stray cell far down a sheet inflates
+   `ws.max_row` to ~1,048,576 (and `max_column` to 16,384), turning every label
+   scan into a minutes-long loop — on Streamlit that freezes the worker for
+   every session sharing it, not just this review. All now go through
+   `_scan_rows(ws)`, capped at 5,000 × 200. The coating table scan was bounded
+   the same way.
+6. **Image memory.** `_edge_density` materialised every pixel of the edge map
+   into a Python list — tens of MB per micrograph, several images deep. Replaced
+   with the histogram; verified numerically identical on a real micrograph
+   (0.3378855444072835 both ways). Added `Image.MAX_IMAGE_PIXELS` and a
+   40 MP analysis ceiling, so a crafted or simply enormous embedded image is
+   skipped rather than decoded on a shared worker.
+
+Corpus verdicts are unchanged by all six, which is the point: these are
+false-positive and robustness fixes, not new rules.
+
+**Checked and genuinely superseded** (so entry 014 was right about the rest):
+the composition column-bounding, the consolidated multi-element FAIL, the
+`\bpic` word boundary, the colon-terminated label boundary, and the hardness
+band anchoring were all re-implemented by the rebuild, in most cases better.
+`app.py` and `report_render.py` on that branch are pre-router / pre-rebuild and
+have nothing left to give.
+
+**Also checked and empty:** `agent/report-centric-lab-review-20260730` holds the
+first draft of `_cached_annotated_report`, which main has long surpassed;
+`claude/nice-faraday-mrv1ih` holds the June two-tool monolithic `app.py`.
+
+**Branch cleanup.** All redundant branches were deleted after this pass. The
+three that still held *deliberately rejected* work — `tool-error-detection-
+7vkrc9` (disposition rules), `tool-audit-improvements-v7bj10` (sem_convert) and
+`remove-duplicate-caption-QKUI5` (sem_convert + the auto-written conclusion) —
+were tagged `salvaged/<branch>` before deletion, so those commits stay reachable
+if Mohamed ever wants that work. Nothing was discarded.
+
+**The lesson, stated plainly so the next agent inherits it rather than
+rediscovers it:** "the file was rewritten" is not evidence that a defect was
+re-fixed. Check the defect, not the file. Six live bugs were one lazy inference
+away from being deleted along with the branch.
