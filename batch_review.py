@@ -20,7 +20,8 @@ import glob
 import collections
 
 from lab_review import (review_report, HARDNESS_REF, _alloy_key,
-                        caption_etchant, _coating_types_in)
+                        caption_etchant, _coating_types_in,
+                        find_duplicate_compositions)
 
 
 def _present(v):
@@ -46,6 +47,9 @@ def audit(folder, ocr=False):
         'elements': collections.Counter(),
         'anomalies': collections.defaultdict(list),
         'errors': [],
+        # (name, parsed) for the cross-report checks, which by definition can
+        # only run once every report in the folder has been parsed.
+        'metallurgical': [],
     }
 
     for path in files:
@@ -59,6 +63,8 @@ def audit(folder, ocr=False):
             continue
 
         agg['types'][rtype] += 1
+        if rtype == 'metallurgical':
+            agg['metallurgical'].append((name, parsed))
         for sev, cat, _ in findings:
             agg['findings'][(sev, cat)] += 1
         crit = sum(1 for s, _, _ in findings if s == 'critical')
@@ -137,6 +143,12 @@ def _report(total, agg):
                 print(f'      {nm}')
             if len(names) > 8:
                 print(f'      … +{len(names) - 8} more')
+
+    cross = find_duplicate_compositions(agg['metallurgical'])
+    if cross:
+        print(f'\n⚠ CROSS-REPORT — {len(cross)} duplicated composition(s):')
+        for _sev, _cat, msg in cross:
+            print(f'  {msg}')
 
     if agg['errors']:
         print(f'\n✗ HARD ERRORS — {len(agg["errors"])} file(s):')

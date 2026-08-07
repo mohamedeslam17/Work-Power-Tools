@@ -10,9 +10,19 @@ emits a severity-tagged findings checklist (.xlsx).
 Usage: python3 iir_review.py report.xlsx [findings.xlsx]
 """
 import sys, os, re, zipfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+
+# Table data lives in the first few hundred rows; cap unbounded scans so a single
+# stray cell at Excel's max row (which pushes ws.max_row to ~1,048,576) can't turn
+# a per-row loop into a minutes-long, worker-freezing scan.
+_SCAN_ROWS_CAP = 5000
+
+
+def _max_row(ws):
+    return min(ws.max_row, _SCAN_ROWS_CAP)
 
 # ── severity model ─────────────────────────────────────────────────────────
 FAIL, WARN, INFO, PASS = "FAIL", "WARN", "INFO", "PASS"
@@ -69,6 +79,15 @@ CHECK_CATALOG = [
     ("Spares",       "Spare replacements identified",        INFO),
     ("Spares",       "Spare parts list present",             INFO),
     ("Spares",       "Spare quantities scale with the set",  INFO),
+    # Section-based (Family B) problem checks, so the UI severity settings — and
+    # OFF — cover every check the review can emit, not just the Family-A ones.
+    ("Identity",     "Material recorded",                    WARN),
+    ("Quantities",   "Serial-number list found",             FAIL),
+    ("Quantities",   "Serial count = stated Qty",            FAIL),
+    ("Integrity",    "Item numbering contiguous",            WARN),
+    ("Integrity",    "Item numbers unique",                  WARN),
+    ("Quantities",   "Overall Assessment tally",             WARN),
+    ("Completeness", "Incoming photos present",              WARN),
 ]
 DEFAULT_SEVERITY = {title: sev for _, title, sev in CHECK_CATALOG}
 
@@ -80,10 +99,18 @@ def apply_overrides(findings, overrides):
         return findings
     kept = []
     for f in findings:
-        if f['severity'] == PASS or f['check'] not in overrides:
+        chk = f['check']
+        if f['severity'] == PASS or chk not in overrides:
             kept.append(f)
             continue
-        sev = overrides[f['check']]
+        sev = overrides[chk]
+        # An override equal to the catalog default is a no-op: honour the severity
+        # the check logic emitted. Otherwise a caller that passes every default
+        # (e.g. the app's settings panel) would erase context-specific severities,
+        # such as the softened WARN a final-repair report gets for fewer positions.
+        if sev == DEFAULT_SEVERITY.get(chk):
+            kept.append(f)
+            continue
         if sev == OFF:
             continue
         kept.append(dict(f, severity=sev) if sev != f['severity'] else f)
@@ -106,6 +133,27 @@ def _num(v):
             return float(g) if '.' in g else int(g)
     return None
 
+def _is_scrap_mark(v):
+    """True for a genuine scrap mark. A cell holding 0 / False / '-' / 'no' is
+    NOT scrap — otherwise a 0/1-coded column flags every row as scrap."""
+    if v is None or isinstance(v, bool):
+        return bool(v)
+    if isinstance(v, (int, float)):
+        return v != 0
+    s = _norm(v).lower()
+    return bool(s) and s not in ('0', 'no', 'n', '-', '–', 'n/a', 'na', 'false')
+
+
+def _safe_cell(v):
+    """Neutralise spreadsheet formula/injection triggers in report-derived text
+    before writing it to an exported cell: openpyxl stores a leading '=' (or
+    +/-/@ or a control char) as a live formula, so a crafted vendor cell like
+    '=WEBSERVICE(...)' would auto-evaluate when the checklist is opened."""
+    if isinstance(v, str) and v[:1] in ('=', '+', '-', '@', '\t', '\r'):
+        return "'" + v
+    return v
+
+
 def _canon(s):
     """Canonicalise a defect/finding label for fuzzy comparison: lower-case,
     drop punctuation, singularise each word."""
@@ -114,7 +162,7 @@ def _canon(s):
     return ' '.join(re.sub(r's$', '', w) for w in s.split())
 
 def _cells(ws):
-    for row in ws.iter_rows():
+    for row in ws.iter_rows(max_row=_max_row(ws)):
         for c in row:
             if c.value is not None:
                 yield c
@@ -149,43 +197,49 @@ def _sheet_by(wb, *needles):
 def _image_anchors_per_sheet(path, sheetnames):
     """Map sheet name -> number of embedded <xdr:pic> drawings.
 
-    Walks workbook.xml + sheet rels + drawing rels straight from the .xlsx zip,
-    so it does not depend on Pillow being installed.
+    Walks workbook.xml + sheet rels + drawing rels straight from the .xlsx zip
+    with ElementTree, so it does not depend on Pillow, is independent of the rels
+    attribute order (openpyxl writes Target before Id, Excel the reverse), and
+    auto-unescapes sheet names containing '&' / quotes.
     """
     result = {n: 0 for n in sheetnames}
+
+    def _local(tag):
+        return tag.rsplit('}', 1)[-1]
+
     try:
         z = zipfile.ZipFile(path)
         names = set(z.namelist())
 
-        # sheetId/name (workbook order) -> sheetN.xml file via rels
-        wb_xml = z.read('xl/workbook.xml').decode('utf-8', 'ignore')
-        rels   = z.read('xl/_rels/workbook.xml.rels').decode('utf-8', 'ignore')
-        rid_to_target = dict(re.findall(r'Id="([^"]+)"[^>]*Target="([^"]+)"', rels))
-        ordered = []  # (name, sheetfile)
-        for m in re.finditer(r'<sheet[^>]*name="([^"]+)"[^>]*r:id="([^"]+)"', wb_xml):
-            name, rid = m.group(1), m.group(2)
-            tgt = rid_to_target.get(rid, '')
-            sf = 'xl/' + tgt.lstrip('/').replace('../', '')
-            ordered.append((name, sf))
+        def rels_map(relpath):
+            m = {}
+            if relpath in names:
+                for rel in ET.fromstring(z.read(relpath)):
+                    if _local(rel.tag) == 'Relationship' and rel.get('Id') and rel.get('Target'):
+                        m[rel.get('Id')] = rel.get('Target')
+            return m
 
-        for name, sf in ordered:
-            try:            # per-sheet — a single malformed drawing must not
-                            # abort the walk and leave every later sheet at 0
-                base = os.path.basename(sf)
-                relpath = f'xl/worksheets/_rels/{base}.rels'
-                if relpath not in names:
+        wb_rels = rels_map('xl/_rels/workbook.xml.rels')
+        for sh in ET.fromstring(z.read('xl/workbook.xml')).iter():
+            if _local(sh.tag) != 'sheet':
+                continue
+            name = sh.get('name')
+            rid = next((v for k, v in sh.attrib.items() if _local(k) == 'id'), None)
+            try:
+                tgt = wb_rels.get(rid, '')
+                sf = 'xl/' + tgt.lstrip('/').replace('../', '')
+                srel = rels_map(f'xl/worksheets/_rels/{os.path.basename(sf)}.rels')
+                draw_t = next((t for t in srel.values()
+                               if 'drawing' in t and t.endswith('.xml')), None)
+                if not draw_t:
                     continue
-                srel = z.read(relpath).decode('utf-8', 'ignore')
-                dm = re.search(r'Target="([^"]*drawing\d+\.xml)"', srel)
-                if not dm:
-                    continue
-                draw = 'xl/drawings/' + os.path.basename(dm.group(1))
+                draw = 'xl/drawings/' + os.path.basename(draw_t)
                 if draw not in names:
                     continue
-                dxml = z.read(draw).decode('utf-8', 'ignore')
-                result[name] = len(re.findall(r'<xdr:pic\b', dxml))
+                result[name] = sum(1 for e in ET.fromstring(z.read(draw)).iter()
+                                   if _local(e.tag) == 'pic')
             except Exception:
-                continue
+                continue        # one malformed sheet must not zero out the rest
         z.close()
     except Exception:
         pass
@@ -289,10 +343,10 @@ def _parse_family_b(wb, path, data):
                 continue
             for sc in sn_cols:
                 ic = max((c for c in item_cols if c < sc), default=None)
-                for rr in range(r + 1, ws.max_row + 1):
+                for rr in range(r + 1, _max_row(ws) + 1):
                     sv = _norm(ws.cell(rr, sc).value)
-                    iv = ws.cell(rr, ic).value if ic else None
-                    if isinstance(iv, (int, float)) and not isinstance(iv, bool) and sv:
+                    iv = _num(ws.cell(rr, ic).value) if ic else None
+                    if iv is not None and sv:
                         items.append(int(iv))
                         serials.append(sv)
             break  # first header row only
@@ -304,8 +358,9 @@ def _parse_family_b(wb, path, data):
     anchors = _image_anchors_per_sheet(path, wb.sheetnames)
     photos = []
     for name in wb.sheetnames:
-        low = name.lower()
-        if 'incoming photo' in low or 'receiving photo' in low or low.strip().startswith('photos'):
+        # Any 'photo' sheet (Incoming/Receiving/Damage Photos, …) — the same
+        # breadth as the common pass, so sheets it already found aren't lost here.
+        if 'photo' in name.lower():
             ws = wb[name]
             caps = [_norm(c.value) for c in _cells(ws)
                     if isinstance(c.value, str)
@@ -343,9 +398,10 @@ def parse_iir(path):
             elif 'approved by' in low:
                 ident['approver'] = _norm(re.sub(r'(?i)^approved by\s*:?', '', line))
             elif low.startswith('doc. no') or low.startswith('doc no'):
-                ident.setdefault('doc_no_cover', _norm(re.sub(r'(?i)^doc\.?\s*no\.?\s*', '', line)))
+                ident.setdefault('doc_no_cover', _norm(re.sub(r'(?i)^doc\.?\s*no\.?\s*:?\s*', '', line)))
             elif ' / ' in line and re.search(r'(?i)(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)', line) \
-                    and 'ansaldo' not in low and not low.startswith('doc'):
+                    and 'ansaldo' not in low and not low.startswith('doc') \
+                    and not low.startswith('rev'):     # 'Rev 0 / 21 May 2025' is not a preparer
                 parts = line.split('/')
                 ident.setdefault('preparer', _norm(parts[0]))
                 ident.setdefault('prep_date', _norm(parts[-1]))
@@ -371,7 +427,11 @@ def parse_iir(path):
     data['exec_received'] = int(m.group(1)) if m else None
     # scrap positions named in the narrative
     pos = []
-    for grp in re.findall(r'POS\s*#?\s*([\d ,and&]+)', es_text, re.I):
+    # Capture a position enumeration: a comma-run optionally closed by 'and N'.
+    # Anchoring the list end on the 'and' means a following counted-noun clause
+    # ('POS 3 and 4, 6 dents in total') doesn't pull the unrelated '6' in.
+    for grp in re.findall(r'POS\s*#?\s*(\d+(?:\s*,\s*\d+)*(?:\s*,?\s*(?:and|&)\s*\d+)?)',
+                          es_text, re.I):
         pos += [int(x) for x in re.findall(r'\d+', grp)]
     data['exec_scrap_pos'] = sorted(set(pos))
 
@@ -400,7 +460,9 @@ def parse_iir(path):
                  if k.startswith(('recondition', 'repairab', 'repaired')) and 'order' not in k), None)
             for r in range(hr + 1, hr + 30):
                 first = recv.cell(r, 1).value
-                if isinstance(first, str) and first.strip().lower().startswith('table'):
+                # Stop at a caption ('Table …') or a summary row ('Total'/'Sum') —
+                # otherwise a Total row is added in and doubles the tallies.
+                if isinstance(first, str) and first.strip().lower().startswith(('table', 'total', 'sum')):
                     break
                 rec = _num(recv.cell(r, idx['received']).value) if idx['received'] else None
                 if rec is None:
@@ -442,29 +504,35 @@ def parse_iir(path):
                                     'repair scope', 'repair scope5', 'scrap', 'adder')
                        and v not in (c_pos, c_pn, c_sn, c_scope, c_scrap)}
         if hr:
-            for r in range(hr + 1, ws.max_row + 1):
+            for r in range(hr + 1, _max_row(ws) + 1):
                 pv = ws.cell(r, c_pos).value if c_pos else None
-                if not isinstance(pv, (int, float)):
+                # Accept a text-formatted position ('1', '01') via _num, not just
+                # a numeric cell — otherwise a text column drops the whole protocol.
+                pos_num = _num(pv)
+                if pos_num is None:
                     continue
                 scope = _norm(ws.cell(r, c_scope).value) if c_scope else ''
-                scrap = bool(_norm(ws.cell(r, c_scrap).value)) if c_scrap else False
+                scrap = _is_scrap_mark(ws.cell(r, c_scrap).value) if c_scrap else False
                 defects = [name_ for name_, cc in defect_cols.items()
                            if _norm(ws.cell(r, cc).value)]
                 sn_rows.append({
-                    'pos': int(pv),
+                    'pos': int(pos_num),
                     'pn': _norm(ws.cell(r, c_pn).value) if c_pn else '',
                     'sn': _norm(ws.cell(r, c_sn).value) if c_sn else '',
                     'scope': scope.upper(), 'scrap': scrap,
                     'defects': defects, 'sheet': name,
                 })
-        # sum row anywhere on the sheet
-        for r in range(1, ws.max_row + 1):
+        # sum row anywhere on the sheet — accumulate across multiple
+        # 'Serial Number*' sheets (each part-number block has its own sum row) so
+        # the reconciliation compares workbook-wide totals, not just the last sheet.
+        for r in range(1, _max_row(ws) + 1):
             cells = [(c.column, c.value) for c in ws[r] if c.value is not None]
             for col_i, val in cells:
                 if isinstance(val, str) and re.match(r'(?i)(sum\s+\w+|total parts)', val.strip()):
                     for col_j, val_j in cells:
-                        if col_j > col_i and isinstance(val_j, (int, float)):
-                            sumrow[_norm(val).lower()] = val_j
+                        if col_j > col_i and isinstance(val_j, (int, float)) and not isinstance(val_j, bool):
+                            key = _norm(val).lower()
+                            sumrow[key] = sumrow.get(key, 0) + val_j
                             break
     data['sn_rows'] = sn_rows
     data['sn_sumrow'] = sumrow
@@ -477,10 +545,15 @@ def parse_iir(path):
             for r in range(hdr.row + 1, hdr.row + 25):
                 name_c = damages.cell(r, hdr.column).value
                 if isinstance(name_c, str) and name_c.strip() and 'table' not in name_c.lower():
+                    # First numeric cell to the RIGHT of the Finding column is the
+                    # count; a later numeric column (percentage, position ref) must
+                    # not replace it.
                     cnt = None
                     for c in damages[r]:
-                        if isinstance(c.value, (int, float)):
+                        if c.column > hdr.column and isinstance(c.value, (int, float)) \
+                                and not isinstance(c.value, bool):
                             cnt = c.value
+                            break
                     findings_tbl[_norm(name_c)] = cnt
                 elif isinstance(name_c, str) and 'table' in name_c.lower():
                     break
@@ -504,7 +577,10 @@ def parse_iir(path):
         ws = wb[name]
         for c in _cells(ws):
             if isinstance(c.value, str):
-                mm = re.search(r'Page\s+(\d+)(?:\s+of\s+(\d+))?', c.value, re.I)
+                # Only a cell that IS the footer ("Page 3 of 5") — not an in-text
+                # cross-reference ("shown on Page 4 of this report") that would
+                # shadow the real footer and trip false numbering warnings.
+                mm = re.fullmatch(r'\s*Page\s+(\d+)(?:\s+of\s+(\d+))?\s*', c.value, re.I)
                 if mm:
                     n = int(mm.group(2)) if mm.group(2) else None
                     footers.append((name, int(mm.group(1)), n))
@@ -518,7 +594,8 @@ def parse_iir(path):
             continue
         ws = wb[name]
         caps = [_norm(c.value) for c in _cells(ws)
-                if isinstance(c.value, str) and re.match(r'(?i)fig\.?\s*\d+', c.value.strip())]
+                if isinstance(c.value, str)
+                and re.match(r'(?i)(fig(?:ure)?|photo|pic(?:ture)?)\.?\s*:?\s*\d+', c.value.strip())]
         photos.append({'sheet': name, 'captions': caps, 'images': anchors.get(name, 0)})
     data['photos'] = photos
 
@@ -666,13 +743,14 @@ def _parse_spares(wb, data):
         for v in (hdr[c] for c in sorted(comp_cols)):
             if v not in comp_names:
                 comp_names.append(v)
-        for r in range(hr + 1, ws.max_row + 1):
+        for r in range(hr + 1, _max_row(ws) + 1):
             pv = ws.cell(r, c_pos).value if c_pos else None
-            if not isinstance(pv, (int, float)) or isinstance(pv, bool):
+            pos_num = _num(pv)
+            if pos_num is None:
                 continue
             comps = [hdr[col] for col in comp_cols if _norm(ws.cell(r, col).value)]
             rem = _norm(ws.cell(r, c_rem).value).lower() if c_rem else ''
-            matrix.append({'pos': int(pv), 'comps': comps, 'scrap': 'scrap' in rem})
+            matrix.append({'pos': int(pos_num), 'comps': comps, 'scrap': 'scrap' in rem})
     data['spares_matrix'] = matrix
     data['spares_components'] = comp_names
 
@@ -697,7 +775,7 @@ def _parse_spares(wb, data):
                       min(cmap.values()))
         c_pn = next((v for k, v in cmap.items() if 'part' in k and 'number' in k), None)
         c_qty = next((v for k, v in cmap.items() if 'quantity' in k or k == 'qty'), None)
-        for r in range(hr + 1, ws.max_row + 1):
+        for r in range(hr + 1, _max_row(ws) + 1):
             part = ws.cell(r, c_part).value
             if not (isinstance(part, str) and part.strip()):
                 if slist:
@@ -709,8 +787,10 @@ def _parse_spares(wb, data):
                 if slist:
                     break
                 continue
-            nums = re.findall(r'\d+', qv)
-            slist.append({'part': part.strip(), 'qty': sum(int(x) for x in nums) if nums else None})
+            # _num strips thousands separators and takes the first number, so
+            # '1,200' is 1200 — not 1+200 from summing every digit run.
+            qn = _num(qv)
+            slist.append({'part': part.strip(), 'qty': int(qn) if qn is not None else None})
         break
     data['spares_list'] = slist
     data['spares_replace_note'] = any(
@@ -869,6 +949,14 @@ def run_checks(d, overrides=None):
                           f"{npos} positions in protocol ≠ {rp['received']} received"
                           + (" — final-repair report, confirm" if recond_report else ""),
                           "Quantities"))
+    elif rp['found'] and rp['received'] and not npos:
+        # Parts were received but no protocol row parsed — don't silently pass.
+        has_sn_sheet = any(s.lower().startswith('serial number') for s in d['sheets'])
+        out.append(_f("Positions listed = Received", FAIL, "Serial Number",
+                      f"{rp['received']} parts received but the serial-number protocol "
+                      f"could not be read (0 positions parsed"
+                      + ("" if has_sn_sheet else "; no 'Serial Number' sheet found") + ")",
+                      "Quantities"))
 
     if positions:
         dupes = sorted({p for p in positions if positions.count(p) > 1})
@@ -1067,8 +1155,13 @@ def run_checks(d, overrides=None):
     if d['photos'] and not any(f['severity'] in (FAIL, WARN) and 'photo' in f['sheet'].lower()
                                for f in out):
         total_imgs = sum(p['images'] for p in d['photos'])
-        out.append(_f("Incoming photos present", PASS, "Incoming photos",
-                      f"{len(d['photos'])} photo sheet(s), {total_imgs} images embedded", "Completeness"))
+        if total_imgs:
+            out.append(_f("Incoming photos present", PASS, "Incoming photos",
+                          f"{len(d['photos'])} photo sheet(s), {total_imgs} images embedded", "Completeness"))
+        else:
+            out.append(_f("Incoming photos present", WARN, "Incoming photos",
+                          f"{len(d['photos'])} photo sheet(s) present but no embedded images found",
+                          "Completeness"))
 
     out += _spare_checks(d)
 
@@ -1145,7 +1238,7 @@ def build_checklist(data, findings, out_path):
     r = 4
     for label, val in rows:
         ws.cell(r, 1, label).font = label_font
-        ws.cell(r, 2, "" if val is None else str(val)).font = Font(name="Calibri", size=10)
+        ws.cell(r, 2, "" if val is None else _safe_cell(str(val))).font = Font(name="Calibri", size=10)
         if label == "Overall verdict":
             sev = FAIL if counts[FAIL] else (WARN if counts[WARN] else PASS)
             ws.cell(r, 2).fill = PatternFill("solid", fgColor=SEV_FILL[sev])
@@ -1167,7 +1260,7 @@ def build_checklist(data, findings, out_path):
         vals = [i, f"{SEV_ICON[f['severity']]} {f['severity']}", f['category'],
                 f['check'], f['sheet'], f['detail']]
         for j, v in enumerate(vals, start=1):
-            c = fs.cell(row, j, v)
+            c = fs.cell(row, j, _safe_cell(v))
             c.alignment = Alignment(vertical="top", wrap_text=(j == 6),
                                     horizontal="center" if j in (1, 2) else "left")
             c.font = Font(name="Calibri", size=10)
@@ -1191,7 +1284,7 @@ def build_checklist(data, findings, out_path):
         vals = [rr['pos'], rr['pn'], rr['sn'], rr['scope'], "X" if rr['scrap'] else "",
                 ", ".join(rr['defects']), rr['sheet']]
         for j, v in enumerate(vals, start=1):
-            c = ds.cell(i, j, v); c.font = Font(name="Calibri", size=9)
+            c = ds.cell(i, j, _safe_cell(v)); c.font = Font(name="Calibri", size=9)
             _set_border(c)
             if rr['scrap']:
                 c.fill = PatternFill("solid", fgColor="FCE4E4")
@@ -1250,7 +1343,7 @@ def build_batch_summary(records, out_path):
                 counts[INFO], counts[PASS], label.split(' — ')[0], top_issue(rec['findings'])]
         r = hrow + 1 + i
         for j, v in enumerate(vals, start=1):
-            c = ws.cell(r, j, v); c.font = Font(name="Calibri", size=10)
+            c = ws.cell(r, j, _safe_cell(v)); c.font = Font(name="Calibri", size=10)
             c.alignment = Alignment(vertical="top", wrap_text=(j == 14),
                                     horizontal="center" if 5 <= j <= 13 else "left")
             _set_border(c)
@@ -1287,7 +1380,7 @@ def build_batch_summary(records, out_path):
         vals = [fname, doc, f"{SEV_ICON[f['severity']]} {f['severity']}", f['category'],
                 f['check'], f['sheet'], f['detail']]
         for j, v in enumerate(vals, start=1):
-            c = fs.cell(i, j, v); c.font = Font(name="Calibri", size=9)
+            c = fs.cell(i, j, _safe_cell(v)); c.font = Font(name="Calibri", size=9)
             c.alignment = Alignment(vertical="top", wrap_text=(j == 7),
                                     horizontal="center" if j == 3 else "left")
             _set_border(c)
@@ -1334,7 +1427,11 @@ def main():
     records = []
     for src in inputs:
         out = explicit_out or f"IIR_Review_{Path(src).stem}.xlsx"
-        data, findings, out = review(src, out)
+        try:
+            data, findings, out = review(src, out)
+        except Exception as e:
+            print(f"\n⚠️  {os.path.basename(src)}: not a readable .xlsx workbook ({type(e).__name__})")
+            continue
         counts = count_severities(findings)
         sev, _ = verdict_of(counts)
         print(f"\n{SEV_ICON[sev]} {data['file']}")

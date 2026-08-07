@@ -9,7 +9,8 @@ import streamlit as st
 
 import report_render
 import share
-from lab_review import add_version_findings, finding_stem, partition_by_scope, review_report
+from lab_review import (add_duplicate_composition_findings, add_version_findings,
+                        finding_stem, partition_by_scope, review_report)
 from photo_lib import add_to_library
 
 try:
@@ -394,6 +395,10 @@ def render():
         })
 
     add_version_findings(reviewed)
+    # Cross-report: an Actual composition that is identical under two different
+    # job numbers. Only visible when more than one report is uploaded, which is
+    # why it sits here rather than inside review_report().
+    add_duplicate_composition_findings(reviewed)
     for report in reviewed:
         if 'error' in report:
             continue

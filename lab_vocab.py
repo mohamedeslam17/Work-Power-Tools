@@ -17,7 +17,10 @@ _ETCH_PAT = re.compile(r'etch|unetched|as[-\s]?polished|kalling|glyceregia|oxali
 # Captions that explicitly state the section was NOT etched (vs simply omitting
 # the etch status). 'etch' in _ETCH_PAT also matches 'unetched', so these are
 # recognised as *having* an etch status — they just need surfacing on their own.
-_UNETCHED_PAT = re.compile(r'\bunetched\b|as[-\s]?polished', re.I)
+# 'un[-\s]?etched' rather than a bare \bunetched\b: real AEG captions write the
+# hyphenated "Un-etched", which the tighter form missed entirely — the caption
+# then read as having no etch status at all.
+_UNETCHED_PAT = re.compile(r'\bun[-\s]?etched\b|as[-\s]?polished', re.I)
 _ALLOY_PAT = re.compile(
     r'\b(?:IN[-\s]?\d{3}(?:LC)?|GTD[-\s]?\d{3}|Ren[eé][-\s]?\d+|Nimonic[-\s]?\d+|'
     r'Inconel[-\s]?\d+|Hastelloy[-\s]?\w?|Waspaloy|Mar[-\s]?M[-\s]?\d+|'

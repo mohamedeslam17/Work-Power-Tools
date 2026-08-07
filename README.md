@@ -88,6 +88,28 @@ colour in the raster — so every numbered badge lands on the actual affected ce
 When several reports are uploaded, a compact report selector replaces the former
 batch table and keeps the review focused on one annotated report at a time.
 
+**Cross-report checks.** Two things are invisible to a single-report review and
+are therefore run across a batch: a revised upload that still carries the
+earlier version's blockers (`add_version_findings`), and an **Actual composition
+that is byte-identical under two different job numbers**
+(`find_duplicate_compositions`) — independent EDS/ICP results are not expected to
+agree to the reported decimal, so an exact match across five or more elements
+says the table was copied rather than measured. Found on a real 27-report batch.
+Same-job pairs are excluded: those are revisions, which the first check covers.
+
+[`composition_store.py`](composition_store.py) gives that check **memory across
+sessions** — it fingerprints each reviewed report (job, alloy, source, Actual
+composition) so a report reviewed today can be caught copying one reviewed weeks
+ago without uploading them side by side. Storage auto-selects like the photo
+library (GitHub → Drive → local `composition_store/`, gitignored) and it is
+opt-in: only the CLI records fingerprints.
+
+```bash
+python3 composition_store.py "path/to/report.xlsx" [more.xlsx ...]
+python3 lab_review.py report_a.xlsx report_b.xlsx     # cross-report section
+python3 batch_review.py folder/                       # whole-folder audit
+```
+
 #### Sending a reviewed report
 
 The annotated PDF can always be downloaded. Sending it from the app is optional

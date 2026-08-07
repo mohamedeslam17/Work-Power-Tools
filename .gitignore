@@ -15,3 +15,8 @@ photo_library/*
 
 # Recovered real-report corpus (customer documents) — see scripts/recover_corpus.py
 corpus/
+
+# Customer chemistry fingerprints (local composition-store backend) — same
+# rationale as photo_library/: keep the folder, never the customer-derived data
+composition_store/*
+!composition_store/.gitkeep
